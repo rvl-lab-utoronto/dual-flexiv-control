@@ -1,0 +1,22 @@
+defaults:
+  - base_arm
+  - _self_
+
+# Arm template, shared by arms.left and arms.right (serial is set per-arm in config.yaml).
+dof: 7
+wrench_frame: local        # local (TCP frame, == RDK tcp_wrench_local) | world (tcp_wrench)
+require_operational: false # read-only: do NOT enable / release brakes by default
+verbose_rdk: false
+rate_hz: 1000.0
+# `control` is a full sub-config composed from the `control` group, placed per arm
+# in config.yaml (e.g. `control@arms.left.control: qpos`) — not a string here.
+
+# One stream per proprio signal -> published as "<side>/<signal>".
+# Dims align with Flexiv RDK 2.x RobotStates: q/dq/tau=DoF, wrench=6, eef(pose)=7, eef_vel(twist)=6.
+streams:
+  q:       { dim: 7, dtype: float64, capacity: 4096, rate_hz: 1000.0 }
+  dq:      { dim: 7, dtype: float64, capacity: 4096, rate_hz: 1000.0 }
+  tau:     { dim: 7, dtype: float64, capacity: 4096, rate_hz: 1000.0 }
+  wrench:  { dim: 6, dtype: float64, capacity: 4096, rate_hz: 1000.0 }
+  eef:     { dim: 7, dtype: float64, capacity: 4096, rate_hz: 1000.0 }
+  eef_vel: { dim: 6, dtype: float64, capacity: 4096, rate_hz: 1000.0 }

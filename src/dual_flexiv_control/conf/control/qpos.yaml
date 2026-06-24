@@ -1,0 +1,18 @@
+defaults:
+  - base_control
+  - _self_
+
+# Joint position control. RDK: SwitchMode(RT_JOINT_POSITION) then StreamJointPosition
+# with RtJointPositionCmd{q_d, dq_d, ddq_d}, each R^DoF.
+kind: qpos
+mode: RT_JOINT_POSITION
+stream_fn: StreamJointPosition
+cmd_struct: RtJointPositionCmd
+command:                # command field -> dim (== arm DoF)
+  q_d: 7               # target joint positions   [rad]
+  dq_d: 7              # target joint velocities   [rad/s]
+  ddq_d: 7             # target joint accelerations [rad/s^2]
+# Used only if the arm runs the joint-impedance variant (SetJointImpedance).
+joint_impedance:
+  K_q: [3000.0, 3000.0, 800.0, 800.0, 200.0, 200.0, 200.0]   # [Nm/rad], <= RobotInfo.K_q_nom
+  Z_q: [0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7]                    # damping ratio [0.3, 0.8]

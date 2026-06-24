@@ -1,0 +1,7 @@
+defaults:
+  - base_brain
+  - _self_
+
+rate_hz: 100.0
+attach_timeout_s: 10.0
+subscribe: []          # empty => subscribe to both arms' proprio + all FACTR streams

@@ -1,0 +1,29 @@
+# Main composed configuration for the bimanual Flexiv brain.
+#
+# Override anything from the CLI, Hydra-style, e.g.:
+#   dual-flexiv-control runtime.sim=true runtime.duration_s=10
+#   dual-flexiv-control arms.left.serial=Rizon4-AAA arms.right.serial=Rizon4-BBB
+#   dual-flexiv-control control@arms.left.control=force brain.rate_hz=200
+defaults:
+  - base_config            # structured schema (ConfigStore) -> validates everything below
+  - runtime: default
+  - brain: default
+  - factr: bimanual
+  - arm@arms.left: flexiv   # the same arm template, placed at arms.left ...
+  - arm@arms.right: flexiv  # ... and arms.right
+  - control@arms.left.control: qpos    # each arm inherits its own, independently-tunable
+  - control@arms.right.control: qpos   # control schema (switch a mode here or via CLI)
+  - _self_                 # this file's values win over the groups above
+
+# Per-arm specifics (the template in arm/flexiv.yaml supplies everything else).
+arms:
+  left:
+    serial: Rizon4-LEFT
+  right:
+    serial: Rizon4-RIGHT
+
+hydra:
+  job:
+    chdir: false          # stay in the launch cwd so runtime_dir resolves predictably
+  run:
+    dir: outputs/${now:%Y-%m-%d_%H-%M-%S}

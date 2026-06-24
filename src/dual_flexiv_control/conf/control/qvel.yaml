@@ -1,0 +1,18 @@
+defaults:
+  - base_control
+  - _self_
+
+# Joint velocity control. RDK has no dedicated joint-velocity mode; velocity is
+# commanded as the dq_d feedforward of joint-position streaming (q_d integrated
+# from dq_d). Primary commanded quantity is dq_d.
+kind: qvel
+mode: RT_JOINT_POSITION
+stream_fn: StreamJointPosition
+cmd_struct: RtJointPositionCmd
+command:
+  dq_d: 7              # commanded joint velocities [rad/s]  (primary)
+  q_d: 7              # integrated target positions [rad]
+  ddq_d: 7            # feedforward joint accelerations [rad/s^2]
+joint_impedance:
+  K_q: [3000.0, 3000.0, 800.0, 800.0, 200.0, 200.0, 200.0]
+  Z_q: [0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7]

@@ -2,3 +2,20 @@ __pycache__/
 *.pyc
 .venv/
 .env
+
+# Build artifacts
+*.egg-info/
+build/
+dist/
+
+# Runtime: shared-memory stream manifests / pid files (per-run, ephemeral)
+runtime/
+
+# Hydra run outputs
+outputs/
+multirun/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store

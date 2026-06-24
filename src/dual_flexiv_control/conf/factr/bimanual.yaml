@@ -1,0 +1,11 @@
+defaults:
+  - base_factr
+  - _self_
+
+# One FACTR FastAPI server per leader arm, each on its own port. The brain holds
+# a FactrClient that queries every server on request; get_joint_positions()
+# returns {side: joint_positions} (dof joints per side). Each server's GET
+# returns that one leader's joint positions.
+servers:
+  left:  { host: localhost, port: 5000, endpoint: get_joint_positions, request_timeout_s: 0.5, dof: 7 }
+  right: { host: localhost, port: 5001, endpoint: get_joint_positions, request_timeout_s: 0.5, dof: 7 }
