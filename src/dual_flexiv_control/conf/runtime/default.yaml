@@ -1,0 +1,8 @@
+defaults:
+  - base_runtime
+  - _self_
+
+runtime_dir: runtime   # resolved to an absolute path against the launch cwd
+sim: false             # set true to run with simulated sources (no hardware)
+duration_s: null       # auto-stop after N seconds; null = run until Ctrl-C
+phase: collection      # collection | eval — selects which per-task coeffs the arms apply

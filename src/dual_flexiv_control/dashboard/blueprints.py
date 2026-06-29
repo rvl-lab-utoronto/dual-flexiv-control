@@ -1,22 +1,18 @@
-"""Rerun blueprints: the metric layout shown for each experiment phase.
+"""Rerun blueprints: the metric layout shown for a run.
 
-The blueprint is the right-hand side of the dashboard — a declarative layout of
-Rerun views over a fixed set of entity paths. The placeholder emitter in
-:mod:`~.runner` (and, later, the real eval/collection run) logs to exactly these
-paths, so adding a metric is: log it under one of the roots below, then drop a
-view here.
+A run (collection or eval) is **one episode** and its placeholder metrics are
+**proprioception** — the same per-arm signals the Flexiv interfaces stream
+(`q`, `dq`, `tau`, `wrench`, `eef`, `eef_vel`). The end-effector position (from
+`eef`) is shown as a 3D track; the rest are per-signal time series with both
+arms overlaid. The emitter in :mod:`~.runner` (and, later, the real run) logs to
+exactly these paths, so the layout never drifts from what's produced.
 
-Entity-path scheme (kept in one place so emitter and layout never drift):
+Entity-path scheme (kept in one place):
 
-* ``eef/{side}/{tip,path}``  — end-effector point + trailing path, per arm (3D).
-* ``metrics/eef_{side}/{x,y,z}`` — per-axis EEF position scalars (time series).
-* ``metrics/eval/*``        — eval episode scalars (reward, success, length …).
-* ``metrics/collection/*``  — collection progress scalars.
-* ``events``                — text-log of run lifecycle events.
-* ``readme``                — a markdown panel describing the active task.
-
-``eval`` centers on 3D EEF-position tracking (a Spatial3DView of both arms) with
-the per-axis series beside it; ``collection`` is a progress placeholder for now.
+* ``eef/{side}/{tip,path}``      — end-effector point + trailing path, per arm (3D).
+* ``proprio/{signal}/{side}``    — one time-series entity per signal, per arm.
+* ``events``                     — text-log of run lifecycle events.
+* ``readme``                     — markdown panel describing the active run.
 """
 
 from __future__ import annotations
@@ -28,11 +24,23 @@ SIDES = ("left", "right")
 # -- entity paths (the contract with the emitter) ---------------------------
 
 EEF_ROOT = "eef"
-METRICS_ROOT = "metrics"
-EVAL_METRICS = f"{METRICS_ROOT}/eval"
-COLLECTION_METRICS = f"{METRICS_ROOT}/collection"
+PROPRIO_ROOT = "proprio"
 EVENTS = "events"
 README = "readme"
+
+#: Proprio signals shown as time series (eef is shown in 3D, not as a series).
+PROPRIO_SERIES: tuple[str, ...] = ("q", "dq", "tau", "wrench", "eef_vel")
+
+#: Human titles + dimensionality for each proprio signal (matches the RDK mapping).
+PROPRIO_TITLES = {
+    "q": "Joint position q (rad)",
+    "dq": "Joint velocity dq (rad/s)",
+    "tau": "Joint torque τ (Nm)",
+    "wrench": "TCP wrench (N, Nm)",
+    "eef": "TCP pose",
+    "eef_vel": "TCP twist (m/s, rad/s)",
+}
+PROPRIO_DIMS = {"q": 7, "dq": 7, "tau": 7, "wrench": 6, "eef": 7, "eef_vel": 6}
 
 
 def eef_tip_path(side: str) -> str:
@@ -45,64 +53,41 @@ def eef_path_path(side: str) -> str:
     return f"{EEF_ROOT}/{side}/path"
 
 
-def eef_axis_root(side: str) -> str:
-    """Time-series root for one arm's per-axis (x/y/z) EEF position scalars."""
-    return f"{METRICS_ROOT}/eef_{side}"
+def proprio_path(signal: str, side: str) -> str:
+    """Time-series entity for one arm's signal, e.g. ``proprio/tau/left``."""
+    return f"{PROPRIO_ROOT}/{signal}/{side}"
+
+
+def proprio_group(signal: str) -> str:
+    """View origin spanning both arms for a signal, e.g. ``proprio/tau``."""
+    return f"{PROPRIO_ROOT}/{signal}"
 
 
 # -- layouts ----------------------------------------------------------------
 
 
 def for_phase(phase: str, task_name: str | None = None) -> rrb.Blueprint:
-    """The blueprint for an experiment ``phase`` ("eval" | "collection")."""
-    if phase == "eval":
-        return _eval_blueprint(task_name)
-    if phase == "collection":
-        return _collection_blueprint(task_name)
-    raise ValueError(f"unknown phase {phase!r} (expected 'eval' or 'collection')")
+    """Blueprint for a single-episode run; both phases show proprio."""
+    if phase not in ("eval", "collection"):
+        raise ValueError(f"unknown phase {phase!r} (expected 'eval' or 'collection')")
+    return _proprio_blueprint(phase, task_name)
 
 
-def _eval_blueprint(task_name: str | None) -> rrb.Blueprint:
-    """Eval: 3D end-effector tracking front-and-center, per-axis series beside it."""
-    title = "End-effector tracking (3D)"
+def _proprio_blueprint(phase: str, task_name: str | None) -> rrb.Blueprint:
+    """3D end-effector track beside per-signal proprio time series (both arms)."""
+    title = "End-effector position (3D)"
     if task_name:
-        title = f"{title} — {task_name}"
+        title = f"{title} — {task_name} · {phase}"
+    series = [
+        rrb.TimeSeriesView(origin=f"/{proprio_group(sig)}", name=PROPRIO_TITLES[sig])
+        for sig in PROPRIO_SERIES
+    ]
+    series.append(rrb.TextLogView(origin=f"/{EVENTS}", name="Events"))
     return rrb.Blueprint(
         rrb.Horizontal(
             rrb.Spatial3DView(origin=f"/{EEF_ROOT}", name=title),
-            rrb.Vertical(
-                rrb.TimeSeriesView(
-                    origin=f"/{eef_axis_root('left')}", name="Left EEF position (x/y/z)"
-                ),
-                rrb.TimeSeriesView(
-                    origin=f"/{eef_axis_root('right')}", name="Right EEF position (x/y/z)"
-                ),
-                rrb.TimeSeriesView(
-                    origin=f"/{EVAL_METRICS}", name="Episode metrics (placeholder)"
-                ),
-                rrb.TextLogView(origin=f"/{EVENTS}", name="Events"),
-                row_shares=[3, 3, 3, 1],
-            ),
-            column_shares=[3, 2],
-        ),
-        collapse_panels=True,
-    )
-
-
-def _collection_blueprint(task_name: str | None) -> rrb.Blueprint:
-    """Collection: teleop-demo progress placeholder + the task description."""
-    return rrb.Blueprint(
-        rrb.Horizontal(
-            rrb.Vertical(
-                rrb.TimeSeriesView(
-                    origin=f"/{COLLECTION_METRICS}",
-                    name="Collection progress (placeholder)",
-                ),
-                rrb.TextLogView(origin=f"/{EVENTS}", name="Events"),
-                row_shares=[3, 1],
-            ),
-            rrb.TextDocumentView(origin=f"/{README}", name="Task"),
-            column_shares=[3, 2],
+            rrb.Grid(*series, grid_columns=2),
+            column_shares=[2, 3],
         ),
         collapse_panels=True,
     )

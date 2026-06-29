@@ -47,15 +47,14 @@ def test_proprio_stream_schema_matches_rdk_dims():
 
 def test_all_control_schemas_present_and_shaped():
     # Each arm carries one ControlCfg, composed from the `control` group. Verified
-    # against flexivrdk 2.1.0: all NRT, brain-driven over IPC.
+    # against flexivrdk 1.8.0: all NRT, flat send API, brain-driven over IPC.
     def ctrl(kind: str):
         return _compose(f"control@arms.left.control={kind}").arms.left.control
 
-    # qpos -> NRT_JOINT_POSITION / SendJointPosition / NrtJointPositionCmd
+    # qpos -> NRT_JOINT_POSITION / SendJointPosition(q_d, dq_d, dq_max, ddq_max)
     qpos = ctrl("qpos")
     assert qpos.mode == "NRT_JOINT_POSITION"
     assert qpos.send_fn == "SendJointPosition"
-    assert qpos.cmd_struct == "NrtJointPositionCmd"
     assert dict(qpos.command) == {"q_d": 7, "dq_d": 7, "dq_max": 7, "ddq_max": 7}
     assert list(qpos.streamed) == ["q_d", "dq_d"]  # setpoint dim 14
 
@@ -64,11 +63,10 @@ def test_all_control_schemas_present_and_shaped():
     assert qvel.mode == "NRT_JOINT_POSITION"
     assert list(qvel.streamed) == ["dq_d"]
 
-    # end_effector -> NRT_CARTESIAN_MOTION_FORCE / SendCartesianMotionForce / NrtCartesianCmd
+    # end_effector -> NRT_CARTESIAN_MOTION_FORCE / SendCartesianMotionForce(pose, wrench, velocity, ...)
     eef = ctrl("end_effector")
     assert eef.mode == "NRT_CARTESIAN_MOTION_FORCE"
     assert eef.send_fn == "SendCartesianMotionForce"
-    assert eef.cmd_struct == "NrtCartesianCmd"
     assert dict(eef.command) == {"pose_d": 7, "twist_d": 6, "wrench_d": 6}
     assert list(eef.streamed) == ["pose_d", "twist_d"]
     assert list(eef.force_control_axes) == [False] * 6  # pure motion
@@ -94,7 +92,7 @@ def test_per_phase_control_coeffs_imported_into_task():
     # compliant < stiff on cartesian stiffness and joint velocity limits
     assert coll.cartesian_impedance.K_x[0] < ev.cartesian_impedance.K_x[0]
     assert coll.max_joint_vel < ev.max_joint_vel
-    # joint motion limits feed NrtJointPositionCmd dq_max/ddq_max
+    # joint motion limits feed SendJointPosition max_vel/max_acc args
     assert coll.max_joint_vel == pytest.approx(1.5)
     assert ev.max_joint_vel == pytest.approx(2.5)
 

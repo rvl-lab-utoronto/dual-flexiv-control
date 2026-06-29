@@ -9,7 +9,8 @@ build/
 dist/
 
 # Runtime: shared-memory stream manifests / pid files (per-run, ephemeral)
-runtime/
+# Anchored to repo root so it does NOT also ignore conf/runtime/ (Hydra config group).
+/runtime/
 
 # Hydra run outputs
 outputs/

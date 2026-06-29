@@ -2,13 +2,12 @@ defaults:
   - base_control
   - _self_
 
-# Joint velocity control. flexivrdk 2.1.0 has NO joint-velocity mode; velocity is
+# Joint velocity control. flexivrdk 1.8 has NO joint-velocity mode; velocity is
 # realized in NRT_JOINT_POSITION by integrating the commanded dq_d into q_d each
 # tick (the arm integrates, starting from its measured q). The brain posts dq_d only.
 kind: qvel
 mode: NRT_JOINT_POSITION
 send_fn: SendJointPosition
-cmd_struct: NrtJointPositionCmd
 command:
   q_d: 7               # integrated target positions [rad] (arm-integrated)
   dq_d: 7              # commanded joint velocities   [rad/s] (primary)

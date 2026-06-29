@@ -2,15 +2,14 @@ defaults:
   - base_control
   - _self_
 
-# Cartesian motion-force control. flexivrdk 2.1.0: SwitchMode(NRT_CARTESIAN_MOTION_FORCE),
-# SetForceControlAxis(group, enabled_axes, max_linear_vel), SetForceControlFrame(group,
-# coord, T), then SendCartesianMotionForce(NrtCartesianCmd). Force-controlled axes track
-# wrench_d; the rest track pose_d. Cartesian impedance + max contact wrench come from
-# the active phase's control_coeffs.
+# Cartesian motion-force control. flexivrdk 1.8: SwitchMode(NRT_CARTESIAN_MOTION_FORCE),
+# SetForceControlAxis(enabled_axes, max_linear_vel), SetForceControlFrame(root_coord, T),
+# then SendCartesianMotionForce(pose_d, wrench_d, twist_d, ...). Force-controlled axes
+# track wrench_d; the rest track pose_d. Cartesian impedance + max contact wrench come
+# from the active phase's control_coeffs.
 kind: force
 mode: NRT_CARTESIAN_MOTION_FORCE
 send_fn: SendCartesianMotionForce
-cmd_struct: NrtCartesianCmd
 command:
   pose_d: 7            # target pose on motion-controlled axes
   twist_d: 6           # target twist on motion-controlled axes (feedforward)
@@ -19,7 +18,7 @@ streamed: [wrench_d, pose_d]   # wrench on force axes + pose on motion axes (dim
 # SetForceControlAxis: which Cartesian axes are force-controlled [X,Y,Z,Rx,Ry,Rz].
 # Example: linear force control, rotational motion control.
 force_control_axes: [true, true, true, false, false, false]
-# SetForceControlFrame(group, root_coord, T_in_root): WORLD keeps force/motion axes orthogonal.
+# SetForceControlFrame(root_coord, T_in_root): WORLD keeps force/motion axes orthogonal.
 force_control_frame:
   root_coord: WORLD
   T_in_root: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]

@@ -1,6 +1,6 @@
 """Data sources for a single Flexiv arm.
 
-:class:`FlexivSource` wraps a real ``flexivrdk.Robot`` connection (RDK 2.x).
+:class:`FlexivSource` wraps a real ``flexivrdk.Robot`` connection (RDK 1.8).
 :class:`FakeFlexivSource` synthesises plausible states so the entire
 multiprocess + shared-memory pipeline can run with no hardware. Both expose the
 same tiny interface: ``open()`` then repeated ``read()`` returning an object
@@ -39,8 +39,8 @@ def _integrate_pose(pose: np.ndarray, twist: np.ndarray, dt: float) -> np.ndarra
 
     Linear: ``p += v·dt``. Angular: first-order quaternion integration
     ``q += 0.5·(ω⊗q)·dt`` (ω a world-frame angular velocity), renormalised. Used to
-    realise end-effector *velocity* control, for which flexivrdk 2.1.0 has no native
-    mode — the arm integrates the commanded twist into the ``pose_d`` it streams.
+    realise end-effector *velocity* control, for which flexivrdk 1.8 has no native
+    mode — the arm integrates the commanded twist into the ``pose_d`` it sends.
     """
     pose = np.asarray(pose, dtype=np.float64)
     pos = pose[:3] + np.asarray(twist[:3], dtype=np.float64) * dt
@@ -243,16 +243,14 @@ class FlexivSource:
         self, ctrl_cfg, coeffs, fields: dict, rs, dt: float,
         *, safety_check: bool = False, tolerance: float = 0.5,
     ) -> None:
-        """Build and send one command for the active kind (verified 2.1.0 forms).
+        """Build and send one command for the active kind (verified 1.8.0 flat forms).
 
         For joint kinds the L-inf safety gate is evaluated here, against the *effective*
         commanded ``q_d`` — including qvel's integrated target — and raises
         :class:`SafetyHalt` BEFORE committing the integrator or sending, so a tripped
         gate never advances qvel's open-loop integrator.
         """
-        import flexivrdk
-
-        robot, group = self._robot, self._group
+        robot = self._robot
         kind = ctrl_cfg.kind
 
         if kind in ("qpos", "qvel"):
@@ -273,9 +271,8 @@ class FlexivSource:
                 self._control_target = q_d  # commit now that it passed
             dq_max = [float(coeffs.max_joint_vel)] * dof
             ddq_max = [float(coeffs.max_joint_acc)] * dof
-            robot.SendJointPosition(
-                {group: flexivrdk.NrtJointPositionCmd(q_d.tolist(), dq_d.tolist(), dq_max, ddq_max)}
-            )
+            # 1.8 flat form: SendJointPosition(positions, velocities, max_vel, max_acc).
+            robot.SendJointPosition(q_d.tolist(), dq_d.tolist(), dq_max, ddq_max)
         else:  # cartesian kinds
             if kind == "eef_vel":
                 twist = np.asarray(fields["twist_d"], dtype=np.float64)
@@ -291,19 +288,18 @@ class FlexivSource:
                 pose_d = np.asarray(fields.get("pose_d", self._control_target), dtype=np.float64)
                 wrench_d = np.asarray(fields["wrench_d"], dtype=np.float64)
                 twist_d = np.zeros(6)
+            # 1.8 flat form: SendCartesianMotionForce(pose, wrench, velocity,
+            # max_linear_vel, max_angular_vel, max_linear_acc, max_angular_acc).
             robot.SendCartesianMotionForce(
-                {group: flexivrdk.NrtCartesianCmd(
-                    pose_d.tolist(), wrench_d.tolist(), twist_d.tolist(),
-                    float(coeffs.max_linear_vel), float(coeffs.max_angular_vel),
-                    float(coeffs.max_linear_acc), float(coeffs.max_angular_acc),
-                )}
+                pose_d.tolist(), wrench_d.tolist(), twist_d.tolist(),
+                float(coeffs.max_linear_vel), float(coeffs.max_angular_vel),
+                float(coeffs.max_linear_acc), float(coeffs.max_angular_acc),
             )
 
     def close(self) -> None:
         # We never took control, so there is nothing to stop. Drop the handle;
         # the RDK client shuts down its services when garbage collected.
         self._robot = None
-        self._group = None
         self._control_target = None
 
 
@@ -340,11 +336,11 @@ class FakeFlexivSource:
                 if self._tracked_pose is not None
                 else np.array([0.5, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0])
             )
-            tcp_twist = np.zeros(6)
+            tcp_vel = np.zeros(6)
             wrench = np.zeros(6)
             return SimpleNamespace(
-                q=q, dq=dq, tau=tau, tcp_pose=tcp_pose, tcp_twist=tcp_twist,
-                tcp_wrench=wrench, tcp_wrench_local=wrench,
+                q=q, dq=dq, tau=tau, tcp_pose=tcp_pose, tcp_vel=tcp_vel,
+                ext_wrench_in_tcp=wrench, ext_wrench_in_world=wrench,
             )
         q = 0.5 * np.sin(t + self._phase)
         dq = 0.5 * np.cos(t + self._phase)
@@ -353,7 +349,7 @@ class FakeFlexivSource:
         pos = np.array([0.5 + 0.05 * math.sin(t), 0.05 * math.cos(t), 0.4])
         quat = np.array([1.0, 0.0, 0.0, 0.0])
         tcp_pose = np.concatenate([pos, quat])
-        tcp_twist = np.array(
+        tcp_vel = np.array(
             [0.05 * math.cos(t), -0.05 * math.sin(t), 0.0, 0.0, 0.0, 0.0]
         )
         wrench = np.concatenate(
@@ -364,9 +360,9 @@ class FakeFlexivSource:
             dq=dq,
             tau=tau,
             tcp_pose=tcp_pose,
-            tcp_twist=tcp_twist,
-            tcp_wrench=wrench,
-            tcp_wrench_local=wrench,
+            tcp_vel=tcp_vel,
+            ext_wrench_in_tcp=wrench,
+            ext_wrench_in_world=wrench,
         )
 
     # -- control half (no hardware; mirrors FlexivSource's contract) ----------

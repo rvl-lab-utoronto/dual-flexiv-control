@@ -20,8 +20,16 @@ def main() -> None:
 
     app_path = str(Path(__file__).resolve().parent / "app.py")
     # --server.headless skips the first-run email prompt and browser auto-open;
-    # Streamlit still prints the local URL to open.
-    sys.argv = ["streamlit", "run", app_path, "--server.headless=true", *sys.argv[1:]]
+    # --theme.base=dark forces the dark theme for everyone (overridable by the
+    # caller, since user args are appended last). Streamlit still prints the URL.
+    sys.argv = [
+        "streamlit", "run", app_path,
+        "--server.headless=true",
+        "--theme.base=dark",
+        # Hide the Deploy button and the three-dot toolbar menu.
+        "--client.toolbarMode=minimal",
+        *sys.argv[1:],
+    ]
     raise SystemExit(stcli.main())
 
 

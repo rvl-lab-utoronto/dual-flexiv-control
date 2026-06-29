@@ -81,3 +81,27 @@ def test_editor_discovery_helpers_return_str_or_none():
     assert code is None or isinstance(code, str)
     socket = editor._ipc_socket()
     assert socket is None or isinstance(socket, str)
+
+
+def test_discover_camera_views_from_config():
+    from dual_flexiv_control.dashboard.cameras import CameraView
+    from dual_flexiv_control.dashboard.cameras import discover_camera_views
+
+    views = discover_camera_views()
+    keys = {v.key for v in views}
+    assert {"cam/wrist_left/left", "cam/static/left", "cam/static/right"} <= keys
+    assert all(isinstance(v, CameraView) for v in views)
+
+
+def test_get_frame_falls_back_to_placeholder(tmp_path):
+    # Empty runtime dir -> no live producer -> synthetic uint8 RGB frame.
+    import numpy as np
+
+    from dual_flexiv_control.dashboard.cameras import discover_camera_views
+    from dual_flexiv_control.dashboard.cameras import get_frame
+
+    rgb_view = next(v for v in discover_camera_views() if v.channels == 3)
+    frame, source = get_frame(rgb_view, runtime_dir=str(tmp_path))
+    assert source == "placeholder"
+    assert frame.dtype == np.uint8
+    assert frame.ndim == 3 and frame.shape[2] == 3

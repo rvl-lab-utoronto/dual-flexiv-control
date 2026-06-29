@@ -7,7 +7,7 @@ own process at its own rate:
 1. **The brain** (`brain/`) — the main processing pipeline. Subscribes to data
    streams, observes them, and pulls the last `k` elements of any signal.
 2. **The Flexiv interface** (`interfaces/flexiv/`) — wraps **real `flexivrdk`**
-   (RDK 2.1.0), one process per arm. Read-only by default (proprio streams only);
+   (RDK 1.8), one process per arm. Read-only by default (proprio streams only);
    with `arm.control_enabled=true` the same process also **consumes the brain's
    control channel and actuates** (the single robot connection per arm forces the
    control loop to live here).
@@ -51,16 +51,16 @@ own process at its own rate:
   forking would corrupt them, so every node is a fresh interpreter that opens its
   own connection. Discovery is a directory of tiny JSON manifests per run.
 
-### Proprio → Flexiv RDK 2.x mapping
+### Proprio → Flexiv RDK 1.8 mapping
 
-| Stream            | dim | RDK 2.x `RobotStates` field            |
+| Stream            | dim | RDK 1.8 `RobotStates` field            |
 |-------------------|-----|----------------------------------------|
 | `<side>/q`        | 7   | `q` (link-side joint positions)        |
 | `<side>/dq`       | 7   | `dq` (link-side joint velocities)      |
 | `<side>/tau`      | 7   | `tau` (measured joint torques)         |
-| `<side>/wrench`   | 6   | `tcp_wrench_local` (TCP frame) — or `tcp_wrench` (world) via `--wrench-frame` |
+| `<side>/wrench`   | 6   | `ext_wrench_in_tcp` (TCP frame) — or `ext_wrench_in_world` (world) via `--wrench-frame` |
 | `<side>/eef`      | 7   | `tcp_pose` `[x,y,z,qw,qx,qy,qz]`       |
-| `<side>/eef_vel`  | 6   | `tcp_twist` `[v(3), ω(3)]`             |
+| `<side>/eef_vel`  | 6   | `tcp_vel` `[v(3), ω(3)]`               |
 
 ### Cameras → ZED SDK mapping
 
@@ -133,17 +133,16 @@ Each stream's schema (`dim`, `dtype`, `capacity`, `rate_hz`) lives under its pat
 e.g. `arms.left.streams.tau` → stream `left/tau`. The **control configs** lay out
 each control kind's command schema; `streamed` lists which fields the brain posts
 per tick (the rest are static limits from the coeffs). All paths are **NRT**
-(verified against flexivrdk 2.1.0) — the brain posts setpoints over IPC at
-~50-200 Hz, so the hard-1 kHz RT path is not used (an `*_rt` variant can be added
-for a future colocated `Scheduler` loop):
+(verified against flexivrdk 1.8) — the brain posts setpoints over IPC at
+~50-200 Hz (RDK 1.8 is NRT-only — no hard-1 kHz RT modes, no `Stream*` methods):
 
-| Controller | RDK mode | send fn / struct | streamed (per-tick) |
+| Controller | RDK mode | send fn | streamed (per-tick) |
 |---|---|---|---|
-| `qpos` | `NRT_JOINT_POSITION` | `SendJointPosition` / `NrtJointPositionCmd` | `q_d`, `dq_d` |
-| `qvel` | `NRT_JOINT_POSITION` | `SendJointPosition` / `NrtJointPositionCmd` | `dq_d` (arm integrates `q_d`) |
-| `end_effector` | `NRT_CARTESIAN_MOTION_FORCE` | `SendCartesianMotionForce` / `NrtCartesianCmd` | `pose_d`, `twist_d` |
-| `eef_vel` | `NRT_CARTESIAN_MOTION_FORCE` | `SendCartesianMotionForce` / `NrtCartesianCmd` | `twist_d` (arm integrates `pose_d`) |
-| `force` | `NRT_CARTESIAN_MOTION_FORCE` | `SendCartesianMotionForce` / `NrtCartesianCmd` | `wrench_d`, `pose_d` |
+| `qpos` | `NRT_JOINT_POSITION` | `SendJointPosition` | `q_d`, `dq_d` |
+| `qvel` | `NRT_JOINT_POSITION` | `SendJointPosition` | `dq_d` (arm integrates `q_d`) |
+| `end_effector` | `NRT_CARTESIAN_MOTION_FORCE` | `SendCartesianMotionForce` | `pose_d`, `twist_d` |
+| `eef_vel` | `NRT_CARTESIAN_MOTION_FORCE` | `SendCartesianMotionForce` | `twist_d` (arm integrates `pose_d`) |
+| `force` | `NRT_CARTESIAN_MOTION_FORCE` | `SendCartesianMotionForce` | `wrench_d`, `pose_d` |
 
 **Controller coefficients** (impedances + motion limits) are a *separate* importable
 group, `conf/control_coeffs/` (`default`/`compliant`/`stiff`), pulled into each task
@@ -192,10 +191,14 @@ dual-flexiv-control --cfg job        # print the fully composed config and exit
 
 ## Dashboard
 
-A [Rerun](https://rerun.io)-backed experiment dashboard. The **left column** drives
-experiments — pick a task from the `conf/task` group, then launch **Collection**
-(teleop demos) or **Eval** (policy rollouts); the **right area** embeds a live
-Rerun web viewer holding that run's metrics.
+A dark-mode [Rerun](https://rerun.io)-backed experiment dashboard. The **left
+column** drives experiments — pick a task from the `conf/task` group, ✏️ open its
+YAML in VSCode, then launch **Collection** (teleop demos) or **Eval** (policy
+rollouts). The **right area** is tabbed: **📊 Metrics** embeds a live Rerun web
+viewer holding the run's metrics; **📷 Camera** shows a live view of any camera
+stream (`cam/<camera>/<view>`, selected from a dropdown), reading frames from
+shared memory when the system is running and falling back to an animated
+placeholder otherwise.
 
 ```bash
 pip install -e ".[dashboard]"     # adds rerun-sdk + streamlit
@@ -210,12 +213,12 @@ viewer streams live over gRPC, so metrics update in the browser without a
 Streamlit rerun.
 
 ```
- ┌──────────────┬──────────────────────────────────┐
- │ Run a task   │   Metrics — live Rerun viewer     │
+ ┌──────────────┬─[ 📊 Metrics ]─[ 📷 Camera ]──────┐
  │  Task: [▼]   │   ┌────────────┬───────────────┐  │
- │  ▶ Collection│   │  EEF 3D    │ x/y/z series  │  │   eval → 3D EEF tracking
- │  ▶ Eval      │   │  tracking  │ reward/success│  │   collection → progress
- │  Running ▣   │   └────────────┴───────────────┘  │
+ │  ✏️ Edit YAML│   │  EEF 3D    │ x/y/z series  │  │   Metrics → eval: 3D EEF
+ │  ▶ Collection│   │  tracking  │ reward/success│  │             collection: progress
+ │  ▶ Eval      │   └────────────┴───────────────┘  │   Camera  → live cam/<cam>/<view>
+ │  Running ▣   │   (cam tab: dropdown + live image) │
  └──────────────┴──────────────────────────────────┘
 ```
 
@@ -273,7 +276,7 @@ src/dual_flexiv_control/
   endpoints/streams when needed (`interfaces/factr/backend.py`).
 * **Control is implemented** over the control channel (`control/`). `qpos` FACTR
   teleop is verified end-to-end in sim; `qvel`/`end_effector`/`eef_vel`/`force` send
-  paths are wired and verified against the flexivrdk 2.1.0 docs but **not yet
+  paths are wired and verified against the flexivrdk 1.8 docs but **not yet
   hardware-tested**. The brain's `process()` runs FACTR→follower teleop by default;
   override it to post policy setpoints (`pack_streamed` + `Brain.command`).
 * Only the **left** arm's `JointConventionCfg` is known (from the test); the right

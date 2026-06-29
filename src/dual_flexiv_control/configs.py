@@ -14,10 +14,10 @@ The hierarchy mirrors the stream paths discussed for the system:
                                                           (qpos|qvel|end_effector|force)
     task.{language_instruction, collection, eval}      -> active task + per-phase templates
 
-Control configs lay out the *command schema* (RDK command-struct field -> dim)
-plus the controller setters, aligned with flexivrdk 2.x (verified by API
-introspection). They describe the SHAPE of control for the future control
-implementation; no control is executed yet.
+Control configs lay out the *command schema* (command field -> dim) plus the
+controller setters, aligned with the flexivrdk 1.8 flat send API (verified by API
+introspection). They describe the SHAPE of control the arm controller fills and
+sends each tick.
 """
 
 from __future__ import annotations
@@ -54,13 +54,13 @@ class StreamCfg:
 
 
 # ---------------------------------------------------------------------------
-# Control schemas — aligned with flexivrdk 2.x command structs
+# Control schemas — aligned with the flexivrdk 1.8 flat send API
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class JointImpedanceCfg:
-    """``SetJointImpedance(K_q, Z_q)`` — used by RT/NRT_JOINT_IMPEDANCE."""
+    """``SetJointImpedance(K_q, Z_q)`` — used by NRT_JOINT_IMPEDANCE (1.8 is NRT-only)."""
 
     K_q: List[float] = field(default_factory=list)   # [DoF] stiffness [Nm/rad], <= K_q_nom
     Z_q: List[float] = field(default_factory=list)   # [DoF] damping ratio, [0.3, 0.8]
@@ -125,24 +125,24 @@ class ControlCoeffsCfg:
     A separate importable config group (``control_coeffs``) so each task can give
     different coefficients to collection (training) vs eval. The arm controller
     applies, AFTER ``SwitchMode``, only the subset its mode accepts (verified
-    against flexivrdk 2.1.0):
+    against flexivrdk 1.8.0):
 
     * NRT_JOINT_POSITION (qpos/qvel): uses ``max_joint_vel``/``max_joint_acc`` as
-      the ``NrtJointPositionCmd`` ``dq_max``/``ddq_max``. ``joint_impedance`` is
-      NOT settable in this mode (only the JOINT_IMPEDANCE modes) and is ignored.
+      the ``max_vel``/``max_acc`` args of ``SendJointPosition``. ``joint_impedance``
+      is NOT settable in this mode (only the JOINT_IMPEDANCE modes) and is ignored.
     * NRT_CARTESIAN_MOTION_FORCE (end_effector/eef_vel/force): SetCartesianImpedance,
       SetMaxContactWrench, SetNullSpacePosture apply; ``max_{linear,angular}_*``
-      feed the scalar limit fields of ``NrtCartesianCmd``.
+      feed the scalar limit args of ``SendCartesianMotionForce``.
     """
 
-    joint_impedance: Optional[JointImpedanceCfg] = None         # SetJointImpedance(group,K_q,Z_q) — impedance modes only
-    cartesian_impedance: Optional[CartesianImpedanceCfg] = None # SetCartesianImpedance(group,K_x,Z_x) — cartesian modes
+    joint_impedance: Optional[JointImpedanceCfg] = None         # SetJointImpedance(K_q,Z_q) — impedance modes only
+    cartesian_impedance: Optional[CartesianImpedanceCfg] = None # SetCartesianImpedance(K_x,Z_x) — cartesian modes
     max_contact_wrench: Optional[List[float]] = None            # [6] SetMaxContactWrench [N,Nm]
     null_space_posture: Optional[List[float]] = None            # [DoF] SetNullSpacePosture [rad]
-    # NRT joint motion limits -> NrtJointPositionCmd(dq_max, ddq_max):
+    # NRT joint motion limits -> SendJointPosition(..., max_vel, max_acc):
     max_joint_vel: float = 2.0       # [rad/s]
     max_joint_acc: float = 3.0       # [rad/s^2]
-    # NRT cartesian motion limits -> NrtCartesianCmd scalar caps:
+    # NRT cartesian motion limits -> SendCartesianMotionForce scalar caps:
     max_linear_vel: float = 0.5      # [m/s]
     max_angular_vel: float = 1.0     # [rad/s]
     max_linear_acc: float = 2.0      # [m/s^2]
@@ -153,24 +153,24 @@ class ControlCoeffsCfg:
 class ControlCfg:
     """A control type: which RDK mode/method to use and the command schema.
 
-    ``command`` maps each command-struct field to its dim; ``streamed`` lists which
-    of those fields the brain posts per tick on the setpoint channel (the rest are
+    ``command`` maps each command field to its dim; ``streamed`` lists which of
+    those fields the brain posts per tick on the setpoint channel (the rest are
     static limits drawn from the per-phase :class:`ControlCoeffsCfg`). The
     coefficients live in the ``control_coeffs`` group, imported per task phase —
-    NOT here. Verified against flexivrdk 2.1.0 (all NRT, brain-driven over IPC)::
+    NOT here. Verified against flexivrdk 1.8.0 (all NRT, flat send API — the
+    command fields are the positional args of ``send_fn``, brain-driven over IPC)::
 
-      qpos          NRT_JOINT_POSITION         SendJointPosition         NrtJointPositionCmd  (q_d primary)
-      qvel          NRT_JOINT_POSITION         SendJointPosition         NrtJointPositionCmd  (dq_d primary; q_d integrated)
-      end_effector  NRT_CARTESIAN_MOTION_FORCE SendCartesianMotionForce  NrtCartesianCmd      (pose_d primary)
-      eef_vel       NRT_CARTESIAN_MOTION_FORCE SendCartesianMotionForce  NrtCartesianCmd      (twist_d primary; pose_d integrated)
-      force         NRT_CARTESIAN_MOTION_FORCE SendCartesianMotionForce  NrtCartesianCmd      (wrench_d primary)
+      qpos          NRT_JOINT_POSITION         SendJointPosition         (q_d primary)
+      qvel          NRT_JOINT_POSITION         SendJointPosition         (dq_d primary; q_d integrated)
+      end_effector  NRT_CARTESIAN_MOTION_FORCE SendCartesianMotionForce  (pose_d primary)
+      eef_vel       NRT_CARTESIAN_MOTION_FORCE SendCartesianMotionForce  (twist_d primary; pose_d integrated)
+      force         NRT_CARTESIAN_MOTION_FORCE SendCartesianMotionForce  (wrench_d primary)
     """
 
     kind: str = MISSING          # qpos | qvel | end_effector | eef_vel | force
     mode: str = MISSING          # flexivrdk.Mode name, e.g. NRT_JOINT_POSITION
     send_fn: str = MISSING       # Robot send method, e.g. SendJointPosition
-    cmd_struct: str = MISSING    # RDK command struct, e.g. NrtJointPositionCmd
-    command: Dict[str, int] = MISSING   # struct field -> dim (full command schema)
+    command: Dict[str, int] = MISSING   # command field -> dim (full command schema)
     streamed: List[str] = field(default_factory=list)   # fields posted per tick on the setpoint channel
 
     channel: ControlChannelCfg = field(default_factory=ControlChannelCfg)

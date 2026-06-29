@@ -2,15 +2,14 @@ defaults:
   - base_control
   - _self_
 
-# Joint position control (async setpoints posted by the brain). flexivrdk 2.1.0:
-# SwitchMode(NRT_JOINT_POSITION) then SendJointPosition({group: NrtJointPositionCmd(
-# q_d, dq_d, dq_max, ddq_max)}). The brain posts q_d (+ dq_d feedforward); dq_max/
-# ddq_max are static, taken from the active phase's control_coeffs (max_joint_vel/acc).
+# Joint position control (async setpoints posted by the brain). flexivrdk 1.8:
+# SwitchMode(NRT_JOINT_POSITION) then SendJointPosition(q_d, dq_d, dq_max, ddq_max).
+# The brain posts q_d (+ dq_d feedforward); dq_max/ddq_max are static, taken from
+# the active phase's control_coeffs (max_joint_vel/acc).
 kind: qpos
 mode: NRT_JOINT_POSITION
 send_fn: SendJointPosition
-cmd_struct: NrtJointPositionCmd
-command:                # NrtJointPositionCmd fields -> dim (== arm DoF)
+command:                # SendJointPosition args -> dim (== arm DoF)
   q_d: 7               # target joint positions    [rad]
   dq_d: 7              # target joint velocities    [rad/s] (feedforward)
   dq_max: 7            # max joint velocity         [rad/s]   (static, from coeffs)

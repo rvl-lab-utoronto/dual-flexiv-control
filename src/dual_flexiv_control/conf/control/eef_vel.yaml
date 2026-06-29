@@ -2,13 +2,12 @@ defaults:
   - base_control
   - _self_
 
-# End-effector velocity control. flexivrdk 2.1.0 has NO velocity-only Cartesian mode;
+# End-effector velocity control. flexivrdk 1.8 has NO velocity-only Cartesian mode;
 # the arm integrates the commanded twist_d into pose_d each tick (starting from the
 # measured TCP pose) and passes twist_d as the feedforward term. The brain posts twist_d.
 kind: eef_vel
 mode: NRT_CARTESIAN_MOTION_FORCE
 send_fn: SendCartesianMotionForce
-cmd_struct: NrtCartesianCmd
 command:
   pose_d: 7            # integrated target pose (arm-integrated)
   twist_d: 6           # commanded TCP twist [v(3), w(3)] (primary) [m/s]:[rad/s]

@@ -2,15 +2,14 @@ defaults:
   - base_control
   - _self_
 
-# End-effector (Cartesian pose) control. flexivrdk 2.1.0: SwitchMode(NRT_CARTESIAN_MOTION_FORCE)
-# then SendCartesianMotionForce({group: NrtCartesianCmd(pose_d, wrench_d, twist_d,
-# max_linear_vel, max_angular_vel, max_linear_acc, max_angular_acc)}). Pure motion:
-# all force-control axes disabled (wrench_d is feedforward only). Cartesian impedance +
-# scalar motion limits come from the active phase's control_coeffs.
+# End-effector (Cartesian pose) control. flexivrdk 1.8: SwitchMode(NRT_CARTESIAN_MOTION_FORCE)
+# then SendCartesianMotionForce(pose_d, wrench_d, twist_d, max_linear_vel,
+# max_angular_vel, max_linear_acc, max_angular_acc). Pure motion: all force-control
+# axes disabled (wrench_d is feedforward only). Cartesian impedance + scalar motion
+# limits come from the active phase's control_coeffs.
 kind: end_effector
 mode: NRT_CARTESIAN_MOTION_FORCE
 send_fn: SendCartesianMotionForce
-cmd_struct: NrtCartesianCmd
 command:
   pose_d: 7            # target TCP pose [x,y,z, qw,qx,qy,qz] [m]:[]
   twist_d: 6           # target TCP twist [v(3), w(3)] (feedforward) [m/s]:[rad/s]

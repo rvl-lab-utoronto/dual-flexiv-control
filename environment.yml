@@ -3,10 +3,10 @@
 #   Update:  conda env update -f environment.yml --prune
 #   Then:    conda run -n dual-flexiv-control pip install -e .
 #
-# Python is pinned to 3.12 because that is the newest CPython with a published
-# flexivrdk manylinux_2_35 x86_64 wheel (cp310/cp312/cp314 exist; 3.12 has the
-# most mature scientific-Python ecosystem and full multiprocessing.shared_memory
-# support, which is the backbone of this project).
+# Python is pinned to 3.12: flexivrdk 1.8.0 publishes a manylinux_2_31 x86_64
+# wheel for it (cp38/cp310/cp312 exist), and 3.12 has the most mature
+# scientific-Python ecosystem and full multiprocessing.shared_memory support,
+# which is the backbone of this project.
 name: dual-flexiv-control
 channels:
   - defaults
@@ -15,5 +15,5 @@ dependencies:
   - pip
   - pip:
       - numpy>=2.0
-      - flexivrdk>=2.1.0
+      - flexivrdk==1.8.0
       - -e .

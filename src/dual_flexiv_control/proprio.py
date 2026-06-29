@@ -1,7 +1,7 @@
 """Canonical proprioception signal definitions for a Flexiv arm.
 
 These are the six per-arm signals the brain observes, mapped one-to-one onto
-Flexiv RDK 2.x ``RobotStates`` fields (see ``interfaces.flexiv.states``). Each
+Flexiv RDK 1.8 ``RobotStates`` fields (see ``interfaces.flexiv.states``). Each
 becomes its own stream, named ``"<side>/<signal>"`` (e.g. ``"right/tau"``).
 
 Stream *dimensions* are no longer hard-coded here — they come from the Hydra

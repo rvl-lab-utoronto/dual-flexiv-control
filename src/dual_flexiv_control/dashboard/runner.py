@@ -2,14 +2,17 @@
 
 **Stub launch.** Pressing *Collection* / *Eval* does not yet spawn the real
 system (eval/collection land with the control path). Instead :meth:`RunRegistry.launch`
-records the run, switches the viewer to the phase's blueprint, and starts a
-placeholder emitter thread that streams synthetic metrics so the dashboard is
-live end-to-end. The seam for the real launch is marked in :meth:`RunRegistry.launch`.
+records the run, switches the viewer to the run's blueprint, and starts a
+placeholder emitter thread that streams synthetic **proprioception** so the
+dashboard is live end-to-end. The seam for the real launch is marked in
+:meth:`RunRegistry.launch`.
+
+A run is **one episode** (collection = one teleop demo, eval = one policy
+rollout); launch one at a time, matching the single bimanual rig.
 
 Everything logs to the process-global Rerun recording created by
 :func:`~.viewer.start_servers`, so a background emitter thread (and, later, a
 real run process connecting back over gRPC) shows up in the same embedded viewer.
-One run is active at a time, matching the single bimanual rig.
 """
 
 from __future__ import annotations
@@ -101,12 +104,11 @@ class RunRegistry:
             #   ])
             #
             # The run process would `rr.init(...); rr.connect_grpc(grpc_uri)` and
-            # log real per-arm EEF poses / eval metrics to the same entity paths
-            # this emitter uses (see dashboard.blueprints), so the embedded viewer
-            # needs no change. Until then we stream synthetic data:
-            emitter = _EMITTERS[phase]
+            # log real per-arm proprio to the same entity paths this emitter uses
+            # (see dashboard.blueprints), so the embedded viewer needs no change.
+            # Until then we stream synthetic proprio for both phases:
             run._thread = threading.Thread(
-                target=emitter,
+                target=_emit_proprio,
                 args=(run._stop, task),
                 name=f"dfc-emit-{run.run_id}",
                 daemon=True,
@@ -144,31 +146,28 @@ def log_welcome() -> None:
     """Idle README shown before the first launch (paired with the welcome blueprint)."""
     md = (
         "# dual-flexiv experiments\n\n"
-        "Pick a **task** on the left, then launch **Collection** (teleop demos) "
-        "or **Eval** (policy rollouts).\n\n"
-        "Metrics for the active run stream into this viewer live. Launching is a "
-        "stub for now — synthetic placeholder metrics until the eval/collection "
-        "runners land with the control path."
+        "Pick a **task** on the left, then launch **Collection** (one teleop demo) "
+        "or **Eval** (one policy rollout). Each launch runs a **single episode**.\n\n"
+        "Metrics stream into this viewer live. Launching is a stub for now — the "
+        "placeholder metrics are synthetic **proprioception** until the real "
+        "eval/collection runners land with the control path."
     )
     rr.log(blueprints.README, rr.TextDocument(md, media_type=rr.MediaType.MARKDOWN), static=True)
 
 
 def _log_readme(task: TaskInfo, phase: str) -> None:
-    lines = [
-        f"# {task.name}",
-        f"**Phase:** {phase}",
-        f"**Instruction:** {task.language_instruction}",
-    ]
-    if phase == "collection" and task.num_episodes is not None:
-        lines.append(f"Target: **{task.num_episodes}** demonstration episodes.")
-    if phase == "eval" and task.num_timesteps is not None:
-        lines.append(f"Rollout horizon: **{task.num_timesteps}** timesteps.")
-    lines.append(
-        "_Placeholder metrics — real eval/collection telemetry lands with the control path._"
+    md = "\n\n".join(
+        [
+            f"# {task.name}",
+            f"**Phase:** {phase} · single episode",
+            f"**Instruction:** {task.language_instruction}",
+            "_Placeholder metrics — synthetic proprioception. Real telemetry lands "
+            "with the control path._",
+        ]
     )
     rr.log(
         blueprints.README,
-        rr.TextDocument("\n\n".join(lines), media_type=rr.MediaType.MARKDOWN),
+        rr.TextDocument(md, media_type=rr.MediaType.MARKDOWN),
         static=True,
     )
 
@@ -178,9 +177,14 @@ def _log_event(message: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Placeholder emitters (SYNTHETIC — swap for real telemetry; see launch())
+# Placeholder emitter (SYNTHETIC PROPRIO — swap for real telemetry; see launch())
 # ---------------------------------------------------------------------------
 
+#: Per-arm home posture (rad) the synthetic joints oscillate around.
+_HOME_Q = {
+    "left": np.array([0.0, -0.70, 0.0, 1.55, 0.0, 0.80, 0.0]),
+    "right": np.array([0.0, -0.70, 0.0, 1.55, 0.0, 0.80, 0.0]),
+}
 _EEF_CENTER = {
     "left": np.array([0.45, 0.20, 0.35]),
     "right": np.array([0.45, -0.20, 0.35]),
@@ -188,24 +192,60 @@ _EEF_CENTER = {
 _EEF_COLOR = {"left": [80, 160, 255], "right": [255, 140, 80]}
 
 
-def _emit_eval(stop: threading.Event, task: TaskInfo) -> None:
-    """Stream synthetic per-arm EEF tracks + placeholder eval scalars."""
+def _emit_proprio(stop: threading.Event, task: TaskInfo) -> None:
+    """Stream synthetic per-arm proprioception for one episode until stopped.
+
+    Mirrors the real proprio streams (``q``, ``dq``, ``tau``, ``wrench``,
+    ``eef``, ``eef_vel``): joint signals oscillate around a home posture, the TCP
+    pose traces a small path (shown in 3D), and the rest are smooth placeholders.
+    No reward/success/episode-count — just proprio.
+    """
     dt = 1.0 / _EMIT_HZ
     trails = {s: deque(maxlen=256) for s in blueprints.SIDES}
+    joints = np.arange(7)
     step = 0
     while not stop.is_set():
         t = step * dt
         rr.set_time("elapsed", duration=t)
         for side in blueprints.SIDES:
-            phase = 0.0 if side == "left" else 1.5
-            sign = 1.0 if side == "left" else -1.0
+            ph = 0.0 if side == "left" else 1.5
+            sgn = 1.0 if side == "left" else -1.0
+
+            q = _HOME_Q[side] + 0.15 * np.sin(0.5 * t + 0.6 * joints + ph)
+            dq = 0.15 * 0.5 * np.cos(0.5 * t + 0.6 * joints + ph)
+            tau = 3.0 * np.sin(0.3 * t + 0.5 * joints + ph)
+            wrench = np.concatenate(
+                [
+                    4.0 * np.sin(0.4 * t + np.arange(3) + ph),  # force (N)
+                    0.6 * np.sin(0.4 * t + np.arange(3) + ph + 1.0),  # torque (Nm)
+                ]
+            )
             pos = _EEF_CENTER[side] + np.array(
                 [
                     0.10 * np.sin(0.7 * t),
-                    0.08 * sign * np.cos(0.9 * t),
-                    0.06 * np.sin(1.3 * t + phase),
+                    0.08 * sgn * np.cos(0.9 * t),
+                    0.06 * np.sin(1.3 * t + ph),
                 ]
             )
+            eef_vel = np.concatenate(
+                [
+                    np.array(
+                        [
+                            0.070 * np.cos(0.7 * t),
+                            -0.072 * sgn * np.sin(0.9 * t),
+                            0.078 * np.cos(1.3 * t + ph),
+                        ]
+                    ),  # linear (m/s)
+                    0.2 * np.sin(0.5 * t + np.arange(3) + ph),  # angular (rad/s)
+                ]
+            )
+
+            rr.log(blueprints.proprio_path("q", side), rr.Scalars(q.tolist()))
+            rr.log(blueprints.proprio_path("dq", side), rr.Scalars(dq.tolist()))
+            rr.log(blueprints.proprio_path("tau", side), rr.Scalars(tau.tolist()))
+            rr.log(blueprints.proprio_path("wrench", side), rr.Scalars(wrench.tolist()))
+            rr.log(blueprints.proprio_path("eef_vel", side), rr.Scalars(eef_vel.tolist()))
+
             trails[side].append(pos.tolist())
             rr.log(
                 blueprints.eef_tip_path(side),
@@ -216,44 +256,5 @@ def _emit_eval(stop: threading.Event, task: TaskInfo) -> None:
                     blueprints.eef_path_path(side),
                     rr.LineStrips3D([list(trails[side])], colors=[_EEF_COLOR[side]]),
                 )
-            root = blueprints.eef_axis_root(side)
-            rr.log(f"{root}/x", rr.Scalars(float(pos[0])))
-            rr.log(f"{root}/y", rr.Scalars(float(pos[1])))
-            rr.log(f"{root}/z", rr.Scalars(float(pos[2])))
-
-        rr.log(
-            f"{blueprints.EVAL_METRICS}/reward",
-            rr.Scalars(float(np.tanh(0.05 * t) + 0.05 * np.sin(2.0 * t))),
-        )
-        rr.log(
-            f"{blueprints.EVAL_METRICS}/success_rate",
-            rr.Scalars(float(min(1.0, 0.02 * t))),
-        )
         step += 1
         stop.wait(dt)
-
-
-def _emit_collection(stop: threading.Event, task: TaskInfo) -> None:
-    """Stream synthetic teleop-collection progress (episodes / samples)."""
-    dt = 0.25
-    target = task.num_episodes or 0
-    episodes = 0
-    samples = 0
-    step = 0
-    while not stop.is_set():
-        rr.set_time("elapsed", duration=step * dt)
-        if step > 0 and step % 12 == 0 and (target == 0 or episodes < target):
-            episodes += 1
-            suffix = f"/{target}" if target else ""
-            _log_event(f"recorded episode {episodes}{suffix}")
-        samples += 7
-        rr.log(
-            f"{blueprints.COLLECTION_METRICS}/episodes_recorded",
-            rr.Scalars(float(episodes)),
-        )
-        rr.log(f"{blueprints.COLLECTION_METRICS}/samples", rr.Scalars(float(samples)))
-        step += 1
-        stop.wait(dt)
-
-
-_EMITTERS = {"eval": _emit_eval, "collection": _emit_collection}
