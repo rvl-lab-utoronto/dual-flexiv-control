@@ -25,6 +25,9 @@ def test_spec_validation():
         StreamSpec(name="x", dim=0, capacity=8)
     with pytest.raises(ValueError):
         StreamSpec(name="x", dim=3, capacity=8, dtype="int32")
+    # Image dtypes are allowed (camera frames flatten to uint8 vectors).
+    StreamSpec(name="x", dim=3, capacity=8, dtype="uint8")
+    StreamSpec(name="x", dim=3, capacity=8, dtype="uint16")
 
 
 def test_shm_name_sanitisation():
@@ -54,6 +57,32 @@ def test_writer_reader_roundtrip(tmp_path):
             assert reader.capacity == 64
             # timestamps auto-stamped, monotonic non-decreasing
             assert np.all(np.diff(s.t_ns) >= 0)
+        finally:
+            reader.close()
+    finally:
+        writer.close()
+        writer.unlink()
+
+
+def test_uint8_image_stream_roundtrip(tmp_path):
+    """A flattened uint8 frame survives the ring exactly and reshapes back."""
+    run_id = _run_id()
+    reg = StreamRegistry(tmp_path, run_id)
+    h, w, c = 4, 5, 3
+    spec = StreamSpec(name="cam/test/left", dim=h * w * c, capacity=8, dtype="uint8", rate_hz=30)
+    writer = StreamWriter.create(spec, run_id, reg)
+    try:
+        frame = (np.arange(h * w * c) % 256).astype(np.uint8)
+        writer.write(frame)
+
+        reader = StreamReader.attach(reg.get("cam/test/left"))
+        try:
+            s = reader.latest()
+            assert s.n == 1
+            assert s.data.dtype == np.uint8
+            assert reader.dim == h * w * c
+            np.testing.assert_array_equal(s.newest, frame)
+            np.testing.assert_array_equal(s.newest.reshape(h, w, c), frame.reshape(h, w, c))
         finally:
             reader.close()
     finally:

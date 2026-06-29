@@ -4,15 +4,20 @@
 #   dual-flexiv-control runtime.sim=true runtime.duration_s=10
 #   dual-flexiv-control arms.left.serial=Rizon4-AAA arms.right.serial=Rizon4-BBB
 #   dual-flexiv-control control@arms.left.control=force brain.rate_hz=200
+#   dual-flexiv-control task=handover task.eval.num_timesteps=800
 defaults:
   - base_config            # structured schema (ConfigStore) -> validates everything below
   - runtime: default
   - brain: default
   - factr: bimanual
+  - task: default          # active manipulation task (switch with `task=<name>`)
   - arm@arms.left: flexiv   # the same arm template, placed at arms.left ...
   - arm@arms.right: flexiv  # ... and arms.right
   - control@arms.left.control: qpos    # each arm inherits its own, independently-tunable
   - control@arms.right.control: qpos   # control schema (switch a mode here or via CLI)
+  - camera@cameras.wrist_left: zedx_wrist    # a ZED X Nano on each arm's wrist ...
+  - camera@cameras.wrist_right: zedx_wrist
+  - camera@cameras.static: zed2_static       # ... plus one static external ZED 2
   - _self_                 # this file's values win over the groups above
 
 # Per-arm specifics (the template in arm/flexiv.yaml supplies everything else).
@@ -21,6 +26,21 @@ arms:
     serial: Rizon4-LEFT
   right:
     serial: Rizon4-RIGHT
+
+# Per-camera specifics (templates in camera/*.yaml supply the rest). Set `serial`
+# to each camera's real (numeric) ZED serial number to bind a process to a
+# specific device; "" opens the first available camera (fine for a single cam /
+# for sim, where serials are ignored).
+cameras:
+  wrist_left:
+    placement: wrist_left
+    serial: ""
+  wrist_right:
+    placement: wrist_right
+    serial: ""
+  static:
+    placement: static
+    serial: ""
 
 hydra:
   job:

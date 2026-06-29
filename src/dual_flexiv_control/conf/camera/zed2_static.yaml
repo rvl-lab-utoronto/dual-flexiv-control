@@ -1,0 +1,19 @@
+defaults:
+  - base_camera
+  - _self_
+
+# Static external ZED 2 stereo camera. Publishes left + right RGB. To add metric
+# depth: set `depth_mode` (e.g. PERFORMANCE or NEURAL — needs a CUDA host) and
+# append `depth` to `views`.
+#
+# NOTE: ZED 2 resolutions are HD2K(2208x1242) / HD1080(1920x1080) /
+# HD720(1280x720) / VGA(672x376). `width`/`height` MUST match `resolution` (the
+# real source validates this at open). Confirm exact enums/fps against your SDK.
+model: zed2
+resolution: HD720
+width: 1280
+height: 720
+fps: 30.0
+depth_mode: NONE
+capacity: 16
+views: [left, right]

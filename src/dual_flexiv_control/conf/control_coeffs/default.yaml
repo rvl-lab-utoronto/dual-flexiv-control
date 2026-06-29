@@ -1,0 +1,21 @@
+defaults:
+  - base_control_coeffs
+  - _self_
+
+# Moderate controller coefficients. Imported per task phase, e.g.
+#   control_coeffs@collection.coeffs: default
+# joint_impedance is RESERVED and intentionally unset: SetJointImpedance is only valid
+# in the JOINT_IMPEDANCE modes, but all shipped kinds (qpos/qvel) use NRT_JOINT_POSITION
+# (fixed internal impedance), so a value here would never reach the robot. Add a
+# JOINT_IMPEDANCE control kind to consume it.
+# null_space_posture: [...]  # [DoF] optional; unset => SetNullSpacePosture not called
+cartesian_impedance:    # SetCartesianImpedance(group, K_x, Z_x) — cartesian modes
+  K_x: [2000.0, 2000.0, 2000.0, 200.0, 200.0, 200.0]        # [N/m]:[Nm/rad]
+  Z_x: [0.7, 0.7, 0.7, 0.7, 0.7, 0.7]
+max_contact_wrench: [50.0, 50.0, 50.0, 15.0, 15.0, 15.0]    # [N]:[Nm]
+max_joint_vel: 2.0      # -> NrtJointPositionCmd dq_max  [rad/s]
+max_joint_acc: 3.0      # -> NrtJointPositionCmd ddq_max [rad/s^2]
+max_linear_vel: 0.5     # -> NrtCartesianCmd scalar caps
+max_angular_vel: 1.0
+max_linear_acc: 2.0
+max_angular_acc: 5.0

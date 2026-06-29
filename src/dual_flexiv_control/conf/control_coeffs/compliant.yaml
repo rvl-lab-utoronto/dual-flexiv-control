@@ -1,0 +1,18 @@
+defaults:
+  - base_control_coeffs
+  - _self_
+
+# Compliant: low stiffness + gentle motion limits, for safe teleoperated data
+# collection (the operator feels less resistance; contacts are softer).
+# joint_impedance reserved (unset): only valid in JOINT_IMPEDANCE modes; shipped
+# qpos/qvel use NRT_JOINT_POSITION, so per-phase joint stiffness is via motion limits.
+cartesian_impedance:
+  K_x: [1200.0, 1200.0, 1200.0, 120.0, 120.0, 120.0]
+  Z_x: [0.7, 0.7, 0.7, 0.7, 0.7, 0.7]
+max_contact_wrench: [40.0, 40.0, 40.0, 12.0, 12.0, 12.0]
+max_joint_vel: 1.5
+max_joint_acc: 2.0
+max_linear_vel: 0.3
+max_angular_vel: 0.8
+max_linear_acc: 1.5
+max_angular_acc: 4.0

@@ -1,10 +1,15 @@
 """Single-producer / multi-consumer shared-memory ring buffer.
 
 This is the keystone of the whole system: every data stream (proprioception
-from each Flexiv arm, FACTR teleop samples) is one of these rings, living in a
-POSIX shared-memory segment so that the producing process and any number of
-consuming processes (the brain) see the same bytes with no copy and no IPC
-round-trip.
+from each Flexiv arm, ZED camera frames, FACTR teleop samples) is one of these
+rings, living in a POSIX shared-memory segment so that the producing process and
+any number of consuming processes (the brain) see the same bytes with no copy
+and no IPC round-trip.
+
+The payload dtype is parametric (float32/float64 for proprioception, uint8/
+uint16 for flattened image frames); it is *orthogonal* to the seqlock, whose
+coordination fields (write count, per-slot sequence stamps) are always int64, so
+the concurrency argument below holds regardless of what the samples contain.
 
 Concurrency model
 -----------------
@@ -63,8 +68,16 @@ _H_WRITE_COUNT = 5  # monotonically increasing count of published samples
 _MAGIC = 0x44464252_52494E47 & 0x7FFFFFFFFFFFFFFF  # "DFBRRING" folded into int64 range
 _VERSION = 1
 
-_DTYPE_TO_CODE = {np.dtype("float32"): 0, np.dtype("float64"): 1}
-_CODE_TO_DTYPE = {0: np.dtype("float32"), 1: np.dtype("float64")}
+# Payload dtype <-> stable integer code persisted in the header. Codes are
+# append-only: never renumber an existing entry or old segments would misdecode.
+# Floats serve proprioception; uint8/uint16 serve flattened camera frames.
+_DTYPE_TO_CODE = {
+    np.dtype("float32"): 0,
+    np.dtype("float64"): 1,
+    np.dtype("uint8"): 2,
+    np.dtype("uint16"): 3,
+}
+_CODE_TO_DTYPE = {code: dt for dt, code in _DTYPE_TO_CODE.items()}
 
 #: Number of times :meth:`SharedRingBuffer.last` re-snapshots before giving up
 #: and returning the validated newest-contiguous suffix with ``overrun=True``.
@@ -106,7 +119,10 @@ def _shm_size(capacity: int, dim: int, itemsize: int) -> int:
 
 
 class SharedRingBuffer:
-    """A shared-memory ring buffer over a fixed-dimension float stream.
+    """A shared-memory ring buffer over a fixed-dimension stream.
+
+    Samples are fixed-dimension vectors of one dtype (float32/float64 for
+    proprioception, or uint8/uint16 for a flattened ``H*W*C`` image frame).
 
     Construct with :meth:`create` (producer; allocates the segment) or
     :meth:`attach` (consumer; maps an existing segment by name).

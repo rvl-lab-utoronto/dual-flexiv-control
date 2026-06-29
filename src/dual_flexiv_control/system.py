@@ -2,11 +2,15 @@ r"""System orchestrator (Hydra entry point): spawn and supervise every node.
 
 Topology for the bimanual setup::
 
-    FlexivInterface(left)  --\  shared-memory streams   /-- BrainNode (reads all)
-    FlexivInterface(right) ---/                         \-- (+ on-request FACTR client)
+    FlexivInterface(left)   --\
+    FlexivInterface(right)  ---\  shared-memory streams   /-- BrainNode (reads all)
+    ZedInterface(wrist_left) --->                         \-- (+ on-request FACTR client)
+    ZedInterface(wrist_right) -/
+    ZedInterface(static)    --/
 
-FACTR is not a spawned node: the brain holds a ``FactrClient`` and queries the
-FACTR server's joint-position endpoint on demand.
+One process per arm (proprio) and one per ZED camera (frames). FACTR is not a
+spawned node: the brain holds a ``FactrClient`` and queries the FACTR server's
+joint-position endpoint on demand.
 
 All nodes run as **spawned** processes sharing a single stop ``Event``. The
 parent supervises: if any node dies, it signals the rest to unwind, joins them,
@@ -35,6 +39,7 @@ from .brain import default_stream_names
 from .configs import Config
 from .configs import register_configs
 from .interfaces.flexiv import FlexivInterface
+from .interfaces.zed import ZedInterface
 from .process import ProcessNode
 from .process import run_node
 from .streams.registry import cleanup_run
@@ -53,17 +58,34 @@ def make_run_id() -> str:
 
 
 def build_nodes(config: Config, run_id: str) -> list[ProcessNode]:
-    """The set of spawned nodes for a run: one process per arm + the brain.
+    """The set of spawned nodes for a run: one process per arm, one per camera, + the brain.
 
-    FACTR is not a node — it is an on-request HTTP client the brain holds.
+    FACTR is not a node — it is an on-request HTTP client the brain holds. Camera
+    streams are produced unconditionally but are not in the brain's default
+    subscription (proprio only); subscribe to them via ``brain.subscribe`` (see
+    :func:`dual_flexiv_control.cameras.camera_stream_names`).
     """
+    # Active-phase controller coefficients (collection vs eval) applied by every
+    # control-enabled arm; the brain posts setpoints, the arms apply these coeffs.
+    if config.runtime.phase not in ("collection", "eval"):
+        raise ValueError(
+            f"runtime.phase must be 'collection' or 'eval', got {config.runtime.phase!r}"
+        )
+    active_coeffs = getattr(config.task, config.runtime.phase).coeffs
+
     nodes: list[ProcessNode] = [
-        FlexivInterface(side, arm, config.runtime, run_id)
+        FlexivInterface(side, arm, config.runtime, run_id, coeffs=active_coeffs)
         for side, arm in config.arms.items()
+    ]
+    nodes += [
+        ZedInterface(name, cam, config.runtime, run_id)
+        for name, cam in config.cameras.items()
     ]
     stream_names = config.brain.subscribe or default_stream_names(config.arms)
     nodes.append(
-        BrainNode(config.brain, config.runtime, config.factr, run_id, stream_names)
+        BrainNode(
+            config.brain, config.runtime, config.factr, run_id, stream_names, config.arms
+        )
     )
     return nodes
 

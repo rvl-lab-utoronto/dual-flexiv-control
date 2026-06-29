@@ -35,7 +35,8 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 #: Keys under which a flat joint-position list may be nested in a JSON object.
-_POSITION_KEYS = ("positions", "q", "joint_positions", "joints", "data")
+#: ``joint_pos`` is what the real FACTR FastAPI server returns (see rizon_tests).
+_POSITION_KEYS = ("joint_pos", "positions", "q", "joint_positions", "joints", "data")
 
 
 class FactrError(RuntimeError):

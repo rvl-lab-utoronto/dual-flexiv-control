@@ -1,0 +1,13 @@
+defaults:
+  - base_task
+  - /control_coeffs@collection.coeffs: compliant
+  - /control_coeffs@eval.coeffs: stiff
+  - _self_
+
+# Example task. Select with `task=handover`. The instruction is shared by both
+# phases; collection/eval carry only their phase-unique counts + coefficients.
+language_instruction: "Pick up the object with the left arm and hand it to the right arm."
+collection:
+  num_episodes: 100
+eval:
+  num_timesteps: 600

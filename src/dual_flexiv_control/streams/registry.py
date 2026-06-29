@@ -81,10 +81,22 @@ class RegistryEntry:
 class StreamRegistry:
     """Publish/discover stream manifests for a single run."""
 
-    def __init__(self, runtime_dir: str | os.PathLike[str], run_id: str) -> None:
+    def __init__(
+        self,
+        runtime_dir: str | os.PathLike[str],
+        run_id: str,
+        sub: str = "streams",
+    ) -> None:
+        """Discover/publish manifests under ``<runtime_dir>/<run_id>/<sub>/``.
+
+        ``sub`` namespaces the manifest category: telemetry streams use the default
+        ``"streams"``; the brain→arm control channels use ``"control"`` so the two
+        never collide during discovery (a control channel is never picked up as a
+        telemetry stream and vice versa).
+        """
         self.run_id = run_id
         self.root = Path(runtime_dir) / run_id
-        self.dir = self.root / "streams"
+        self.dir = self.root / sub
 
     # -- producer side --------------------------------------------------------
 
@@ -174,17 +186,24 @@ def cleanup_run(runtime_dir: str | os.PathLike[str], run_id: str) -> int:
     from multiprocessing import shared_memory
 
     registry = StreamRegistry(runtime_dir, run_id)
-    unlinked = 0
-    for entry in registry.discover().values():
-        try:
-            shm = shared_memory.SharedMemory(name=entry.shm_name, create=False)
-            shm.close()
-            shm.unlink()
-            unlinked += 1
-        except FileNotFoundError:
-            pass
-    # Remove the manifest directory tree.
     root = registry.root
+    unlinked = 0
+    # Sweep EVERY manifest subdir under the run root (streams/, control/, …), so
+    # control-channel segments are reclaimed alongside telemetry ones.
+    if root.is_dir():
+        for path in root.rglob("*.json"):
+            try:
+                entry = RegistryEntry.from_json(json.loads(path.read_text()))
+            except (json.JSONDecodeError, KeyError, OSError):
+                continue
+            try:
+                shm = shared_memory.SharedMemory(name=entry.shm_name, create=False)
+                shm.close()
+                shm.unlink()
+                unlinked += 1
+            except FileNotFoundError:
+                pass
+    # Remove the manifest directory tree.
     if root.is_dir():
         for path in sorted(root.rglob("*"), reverse=True):
             try:

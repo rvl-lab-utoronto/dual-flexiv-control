@@ -1,0 +1,17 @@
+defaults:
+  - base_control_coeffs
+  - _self_
+
+# Stiff: high stiffness + faster motion limits, for precise policy eval / tracking.
+# joint_impedance reserved (unset): only valid in JOINT_IMPEDANCE modes; shipped
+# qpos/qvel use NRT_JOINT_POSITION, so per-phase joint aggressiveness is via motion limits.
+cartesian_impedance:
+  K_x: [2500.0, 2500.0, 2500.0, 250.0, 250.0, 250.0]
+  Z_x: [0.7, 0.7, 0.7, 0.7, 0.7, 0.7]
+max_contact_wrench: [60.0, 60.0, 60.0, 18.0, 18.0, 18.0]
+max_joint_vel: 2.5
+max_joint_acc: 3.5
+max_linear_vel: 0.6
+max_angular_vel: 1.2
+max_linear_acc: 2.5
+max_angular_acc: 6.0

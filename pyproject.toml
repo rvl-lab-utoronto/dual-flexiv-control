@@ -20,10 +20,18 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+# Experiment dashboard (Streamlit control panel + embedded Rerun web viewer).
+# Rerun pins to the 0.33 line because serve_grpc/serve_web_viewer are version-
+# matched to the bundled web viewer and the serve API still moves between minors.
+dashboard = [
+    "rerun-sdk>=0.33,<0.34",
+    "streamlit>=1.40",
+]
 
 [project.scripts]
 dual-flexiv-control = "dual_flexiv_control.system:main"
 dfc-cleanup-shm = "dual_flexiv_control.streams.registry:cleanup_cli"
+dfc-dashboard = "dual_flexiv_control.dashboard.launch:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dual_flexiv_control"]

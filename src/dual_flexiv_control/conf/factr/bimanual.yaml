@@ -4,8 +4,13 @@ defaults:
 
 # One FACTR FastAPI server per leader arm, each on its own port. The brain holds
 # a FactrClient that queries every server on request; get_joint_positions()
-# returns {side: joint_positions} (dof joints per side). Each server's GET
-# returns that one leader's joint positions.
+# returns {side: joint_positions}. The real server returns DoF+1 values (arm joints
+# + a trailing gripper) under the `joint_pos` key, so dof is 8 here; the brain's
+# JointConventionCfg drops the trailing gripper before posting joint setpoints.
+#
+# NOTE: the hardware test reached a SINGLE host on :5000 with per-side endpoint
+# suffixes (get_joint_positions_left / _right). Confirm the real topology (one
+# server with per-side endpoints vs one server per port) for your deployment.
 servers:
-  left:  { host: localhost, port: 5000, endpoint: get_joint_positions, request_timeout_s: 0.5, dof: 7 }
-  right: { host: localhost, port: 5001, endpoint: get_joint_positions, request_timeout_s: 0.5, dof: 7 }
+  left:  { host: localhost, port: 5000, endpoint: get_joint_positions_left,  request_timeout_s: 0.5, dof: 8 }
+  right: { host: localhost, port: 5001, endpoint: get_joint_positions_right, request_timeout_s: 0.5, dof: 8 }

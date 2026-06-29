@@ -2,20 +2,18 @@ defaults:
   - base_control
   - _self_
 
-# End-effector (Cartesian motion) control. RDK: SwitchMode(RT_CARTESIAN_MOTION_FORCE)
-# then StreamCartesianMotionForce with RtCartesianCmd{pose_d, twist_d, acc_d, wrench_d}.
-# Pure motion: all force-control axes disabled (wrench_d acts as feedforward only).
+# End-effector (Cartesian pose) control. flexivrdk 2.1.0: SwitchMode(NRT_CARTESIAN_MOTION_FORCE)
+# then SendCartesianMotionForce({group: NrtCartesianCmd(pose_d, wrench_d, twist_d,
+# max_linear_vel, max_angular_vel, max_linear_acc, max_angular_acc)}). Pure motion:
+# all force-control axes disabled (wrench_d is feedforward only). Cartesian impedance +
+# scalar motion limits come from the active phase's control_coeffs.
 kind: end_effector
-mode: RT_CARTESIAN_MOTION_FORCE
-stream_fn: StreamCartesianMotionForce
-cmd_struct: RtCartesianCmd
+mode: NRT_CARTESIAN_MOTION_FORCE
+send_fn: SendCartesianMotionForce
+cmd_struct: NrtCartesianCmd
 command:
-  pose_d: 7            # target TCP pose [x,y,z, qw,qx,qy,qz]  [m]:[]
-  twist_d: 6           # target TCP twist [v(3), w(3)]         [m/s]:[rad/s]
-  acc_d: 6             # target TCP acceleration
-  wrench_d: 6          # feedforward wrench [f(3), m(3)]       [N]:[Nm]
-cartesian_impedance:   # SetCartesianImpedance(K_x, Z_x)
-  K_x: [2000.0, 2000.0, 2000.0, 200.0, 200.0, 200.0]   # [N/m]:[Nm/rad]
-  Z_x: [0.7, 0.7, 0.7, 0.7, 0.7, 0.7]
+  pose_d: 7            # target TCP pose [x,y,z, qw,qx,qy,qz] [m]:[]
+  twist_d: 6           # target TCP twist [v(3), w(3)] (feedforward) [m/s]:[rad/s]
+  wrench_d: 6          # feedforward wrench [f(3), m(3)] [N]:[Nm]
+streamed: [pose_d, twist_d]   # dim 13
 force_control_axes: [false, false, false, false, false, false]   # pure motion
-max_contact_wrench: [50.0, 50.0, 50.0, 15.0, 15.0, 15.0]         # SetMaxContactWrench [N]:[Nm]

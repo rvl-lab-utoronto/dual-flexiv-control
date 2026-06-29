@@ -2,17 +2,16 @@ defaults:
   - base_control
   - _self_
 
-# Joint velocity control. RDK has no dedicated joint-velocity mode; velocity is
-# commanded as the dq_d feedforward of joint-position streaming (q_d integrated
-# from dq_d). Primary commanded quantity is dq_d.
+# Joint velocity control. flexivrdk 2.1.0 has NO joint-velocity mode; velocity is
+# realized in NRT_JOINT_POSITION by integrating the commanded dq_d into q_d each
+# tick (the arm integrates, starting from its measured q). The brain posts dq_d only.
 kind: qvel
-mode: RT_JOINT_POSITION
-stream_fn: StreamJointPosition
-cmd_struct: RtJointPositionCmd
+mode: NRT_JOINT_POSITION
+send_fn: SendJointPosition
+cmd_struct: NrtJointPositionCmd
 command:
-  dq_d: 7              # commanded joint velocities [rad/s]  (primary)
-  q_d: 7              # integrated target positions [rad]
-  ddq_d: 7            # feedforward joint accelerations [rad/s^2]
-joint_impedance:
-  K_q: [3000.0, 3000.0, 800.0, 800.0, 200.0, 200.0, 200.0]
-  Z_q: [0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7]
+  q_d: 7               # integrated target positions [rad] (arm-integrated)
+  dq_d: 7              # commanded joint velocities   [rad/s] (primary)
+  dq_max: 7
+  ddq_max: 7
+streamed: [dq_d]       # brain posts velocity; arm integrates to q_d (dim 7)

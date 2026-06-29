@@ -1,0 +1,19 @@
+defaults:
+  - base_camera
+  - _self_
+
+# ZED X Nano wrist-camera template (one per arm; `serial` and `placement` are set
+# per-camera in config.yaml). Publishes the left RGB view only — a wrist view for
+# the policy/teleop; add `right` for stereo, or `depth` (+ a depth_mode) if needed.
+#
+# NOTE: ZED X (Nano) resolutions are SVGA(960x600) / HD1080(1920x1080) /
+# HD1200(1920x1200). `width`/`height` MUST match `resolution` (the real source
+# validates this at open). Confirm exact enums/fps against your installed ZED SDK.
+model: zedx_nano
+resolution: SVGA
+width: 960
+height: 600
+fps: 30.0
+depth_mode: NONE
+capacity: 16
+views: [left]

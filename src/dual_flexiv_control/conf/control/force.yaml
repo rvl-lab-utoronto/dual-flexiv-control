@@ -2,26 +2,25 @@ defaults:
   - base_control
   - _self_
 
-# Force control. RDK: SwitchMode(RT_CARTESIAN_MOTION_FORCE), SetForceControlAxis(enabled),
-# SetForceControlFrame(frame), SetMaxContactWrench(...), then StreamCartesianMotionForce
-# with RtCartesianCmd. Force-controlled axes track wrench_d; the rest track pose_d.
+# Cartesian motion-force control. flexivrdk 2.1.0: SwitchMode(NRT_CARTESIAN_MOTION_FORCE),
+# SetForceControlAxis(group, enabled_axes, max_linear_vel), SetForceControlFrame(group,
+# coord, T), then SendCartesianMotionForce(NrtCartesianCmd). Force-controlled axes track
+# wrench_d; the rest track pose_d. Cartesian impedance + max contact wrench come from
+# the active phase's control_coeffs.
 kind: force
-mode: RT_CARTESIAN_MOTION_FORCE
-stream_fn: StreamCartesianMotionForce
-cmd_struct: RtCartesianCmd
+mode: NRT_CARTESIAN_MOTION_FORCE
+send_fn: SendCartesianMotionForce
+cmd_struct: NrtCartesianCmd
 command:
-  wrench_d: 6          # target wrench on force-controlled axes [f(3), m(3)]  (primary)
   pose_d: 7            # target pose on motion-controlled axes
-  twist_d: 6           # target twist on motion-controlled axes
+  twist_d: 6           # target twist on motion-controlled axes (feedforward)
+  wrench_d: 6          # target wrench on force-controlled axes [f(3), m(3)] (primary)
+streamed: [wrench_d, pose_d]   # wrench on force axes + pose on motion axes (dim 13)
 # SetForceControlAxis: which Cartesian axes are force-controlled [X,Y,Z,Rx,Ry,Rz].
 # Example: linear force control, rotational motion control.
 force_control_axes: [true, true, true, false, false, false]
-# SetForceControlFrame(root_coord, T_in_root): WORLD keeps force/motion axes orthogonal.
+# SetForceControlFrame(group, root_coord, T_in_root): WORLD keeps force/motion axes orthogonal.
 force_control_frame:
   root_coord: WORLD
   T_in_root: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
-max_linear_vel: [0.5, 0.5, 0.5]                          # [m/s] force-axis vel cap (contact-loss guard)
-max_contact_wrench: [50.0, 50.0, 50.0, 15.0, 15.0, 15.0] # [N]:[Nm]
-cartesian_impedance:
-  K_x: [2000.0, 2000.0, 2000.0, 200.0, 200.0, 200.0]
-  Z_x: [0.7, 0.7, 0.7, 0.7, 0.7, 0.7]
+force_axis_max_linear_vel: [0.5, 0.5, 0.5]   # SetForceControlAxis vel cap [m/s] (contact-loss guard)

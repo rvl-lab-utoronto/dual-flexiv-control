@@ -13,10 +13,12 @@ from dataclasses import dataclass
 
 import numpy as np
 
-#: dtypes we allow streams to use. Fixed-width floats only: proprioception is
-#: always a fixed-dimension float vector, and restricting the set keeps the
-#: shared-memory header self-describing with a tiny integer code.
-ALLOWED_DTYPES: tuple[str, ...] = ("float32", "float64")
+#: dtypes a stream may use. Floats carry proprioception (a fixed-dimension float
+#: vector); ``uint8``/``uint16`` carry camera imagery (an HxWxC frame flattened to
+#: a fixed-dimension vector — see :mod:`dual_flexiv_control.cameras`). The set is
+#: deliberately small so the shared-memory header stays self-describing with a
+#: tiny integer dtype code (see ``ring._DTYPE_TO_CODE``).
+ALLOWED_DTYPES: tuple[str, ...] = ("float32", "float64", "uint8", "uint16")
 
 
 @dataclass(frozen=True, slots=True)

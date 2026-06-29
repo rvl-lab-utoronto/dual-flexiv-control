@@ -19,3 +19,6 @@ multirun/
 .idea/
 .vscode/
 .DS_Store
+
+# Large test fixtures (do not commit)
+rizon_tests.zip
