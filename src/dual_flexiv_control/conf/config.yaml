@@ -24,10 +24,10 @@ defaults:
 arms:
   left:
     name: "Lauer"          # display name (dashboard); customize freely
-    serial: Rizon-4s-062841
+    serial: Rizon4s-062841
   right:
     name: "Rogers"
-    serial: Rizon-4s-062837
+    serial: Rizon4s-062837
 
 # Per-camera specifics (templates in camera/*.yaml supply the rest). Set `serial`
 # to each camera's real (numeric) ZED serial number to bind a process to a

@@ -35,7 +35,7 @@ from dual_flexiv_control.dashboard.viewer import RerunServers
 from dual_flexiv_control.dashboard.viewer import ports_from_env
 from dual_flexiv_control.dashboard.viewer import start_servers
 
-VIEWER_HEIGHT_PX = 560
+VIEWER_HEIGHT_PX = 1400
 #: Camera-tab refresh cadence (placeholder feed; real shm reads pace themselves).
 CAMERA_REFRESH = "0.15s"
 
