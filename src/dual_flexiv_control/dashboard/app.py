@@ -22,6 +22,9 @@ import streamlit as st
 # so its submodules resolve normally.
 from dual_flexiv_control.dashboard import blueprints
 from dual_flexiv_control.dashboard import runner as _runner
+from dual_flexiv_control.dashboard.arms import ArmStatus
+from dual_flexiv_control.dashboard.arms import discover_arms
+from dual_flexiv_control.dashboard.arms import read_arm_status
 from dual_flexiv_control.dashboard.cameras import CameraView
 from dual_flexiv_control.dashboard.cameras import discover_camera_views
 from dual_flexiv_control.dashboard.cameras import get_frame
@@ -125,8 +128,30 @@ def _render_controls(tasks: list[TaskInfo], registry: _runner.RunRegistry) -> No
     _render_status(registry)
 
 
+def _render_arm_row(s: ArmStatus) -> None:
+    connected = s.source == "live"
+    dot = "🟢" if connected else "⚫"
+    mode = s.mode if connected else f":gray[{s.mode}]"
+    if s.estop_pressed:
+        estop = ":red[🛑 **E-STOP PRESSED**]"
+    elif s.estop_pressed is False:
+        estop = ":green[clear]"
+    else:
+        estop = ":gray[—]"
+    st.markdown(f"{dot} **{s.info.name}** · {mode}  \nE-stop: {estop}")
+
+
+@st.fragment(run_every="2s")
+def _arm_status_rows() -> None:
+    """Two read-only per-arm rows (operation mode + E-stop), refreshed periodically."""
+    for arm in discover_arms():
+        _render_arm_row(read_arm_status(arm))
+
+
 def _render_status(registry: _runner.RunRegistry) -> None:
     st.subheader("Status")
+    _arm_status_rows()
+    st.divider()
     active = registry.active()
     if active is None:
         st.info("No run active. Pick a task and launch.")

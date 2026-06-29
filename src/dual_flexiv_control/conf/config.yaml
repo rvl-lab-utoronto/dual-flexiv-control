@@ -23,9 +23,11 @@ defaults:
 # Per-arm specifics (the template in arm/flexiv.yaml supplies everything else).
 arms:
   left:
-    serial: Rizon4-LEFT
+    name: "Lauer"          # display name (dashboard); customize freely
+    serial: Rizon-4s-062841
   right:
-    serial: Rizon4-RIGHT
+    name: "Rogers"
+    serial: Rizon-4s-062837
 
 # Per-camera specifics (templates in camera/*.yaml supply the rest). Set `serial`
 # to each camera's real (numeric) ZED serial number to bind a process to a

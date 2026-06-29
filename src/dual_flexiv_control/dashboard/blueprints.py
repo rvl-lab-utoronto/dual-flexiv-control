@@ -93,6 +93,28 @@ def _proprio_blueprint(phase: str, task_name: str | None) -> rrb.Blueprint:
     )
 
 
+def qvel_test_blueprint(task_name: str | None = None) -> rrb.Blueprint:
+    """Eval no-motion connectivity test: live joint velocity ``dq`` for both arms.
+
+    The eval launch currently runs a read-only hardware probe (see
+    :mod:`~.runner`) that logs **only** ``proprio/dq/{side}``. This focuses the
+    viewer on that one signal (plus the event log) so it is immediately obvious
+    whether live dq is arriving from the robot — rather than the full proprio
+    grid with every other panel left empty.
+    """
+    name = PROPRIO_TITLES["dq"]
+    if task_name:
+        name = f"{name} — {task_name} · eval (no-motion test)"
+    return rrb.Blueprint(
+        rrb.Vertical(
+            rrb.TimeSeriesView(origin=f"/{proprio_group('dq')}", name=name),
+            rrb.TextLogView(origin=f"/{EVENTS}", name="Events"),
+            row_shares=[3, 1],
+        ),
+        collapse_panels=True,
+    )
+
+
 def welcome_blueprint() -> rrb.Blueprint:
     """Idle layout shown before any run is launched."""
     return rrb.Blueprint(

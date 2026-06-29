@@ -24,4 +24,4 @@ hood); see :mod:`~.launch`.
 
 from __future__ import annotations
 
-__all__ = ["tasks", "blueprints", "viewer", "runner", "cameras", "editor"]
+__all__ = ["tasks", "blueprints", "viewer", "runner", "cameras", "editor", "arms"]

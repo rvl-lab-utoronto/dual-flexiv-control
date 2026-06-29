@@ -1,11 +1,12 @@
 """Launch experiments from the dashboard and feed the embedded Rerun viewer.
 
-**Stub launch.** Pressing *Collection* / *Eval* does not yet spawn the real
-system (eval/collection land with the control path). Instead :meth:`RunRegistry.launch`
-records the run, switches the viewer to the run's blueprint, and starts a
-placeholder emitter thread that streams synthetic **proprioception** so the
-dashboard is live end-to-end. The seam for the real launch is marked in
-:meth:`RunRegistry.launch`.
+**Partial launch.** Pressing *Collection* still streams synthetic
+**proprioception** (the full teleop/policy runners land with the control path).
+Pressing *Eval* now runs a small **real** check: it opens a read-only
+``flexivrdk`` connection per arm and streams live joint velocity (``dq``) into the
+viewer **with no motion** — a connectivity probe for the read → Rerun path.
+:meth:`RunRegistry.launch` records the run, switches the viewer to the phase
+blueprint, and starts the matching emitter thread.
 
 A run is **one episode** (collection = one teleop demo, eval = one policy
 rollout); launch one at a time, matching the single bimanual rig.
@@ -89,13 +90,20 @@ class RunRegistry:
             )
 
             # --- visualization: switch the viewer to this phase's layout -------
-            rr.send_blueprint(blueprints.for_phase(phase, task.name))
+            #     Eval gets a focused dq-only view (the read-only probe logs just
+            #     dq); collection keeps the full proprio grid.
+            if phase == "eval":
+                rr.send_blueprint(blueprints.qvel_test_blueprint(task.name))
+            else:
+                rr.send_blueprint(blueprints.for_phase(phase, task.name))
             _log_readme(task, phase)
             _log_event(f"launch {phase} · task={task.name} · run={run.run_id}")
 
-            # --- STUB LAUNCH ---------------------------------------------------
-            # Real eval/collection lands with the control path. Replace the
-            # placeholder emitter below with a spawn of the actual system, e.g.:
+            # --- LAUNCH (partial) ----------------------------------------------
+            # Collection still streams synthetic proprio; eval runs a real,
+            # read-only dq probe (see _emit_eval_qvel) — no motion. The full
+            # eval/collection runners land with the control path; they will spawn
+            # the real system, e.g.:
             #
             #   subprocess.Popen([
             #       "dual-flexiv-control",
@@ -103,12 +111,12 @@ class RunRegistry:
             #       f"runtime.rerun_uri={servers.grpc_uri}",   # run connects back
             #   ])
             #
-            # The run process would `rr.init(...); rr.connect_grpc(grpc_uri)` and
-            # log real per-arm proprio to the same entity paths this emitter uses
-            # (see dashboard.blueprints), so the embedded viewer needs no change.
-            # Until then we stream synthetic proprio for both phases:
+            # That process would `rr.init(...); rr.connect_grpc(grpc_uri)` and log
+            # real per-arm proprio to the same entity paths used here (see
+            # dashboard.blueprints), so the embedded viewer needs no change.
+            target = _emit_eval_qvel if phase == "eval" else _emit_proprio
             run._thread = threading.Thread(
-                target=_emit_proprio,
+                target=target,
                 args=(run._stop, task),
                 name=f"dfc-emit-{run.run_id}",
                 daemon=True,
@@ -258,3 +266,72 @@ def _emit_proprio(stop: threading.Event, task: TaskInfo) -> None:
                 )
         step += 1
         stop.wait(dt)
+
+
+# ---------------------------------------------------------------------------
+# Eval probe (REAL, read-only dq -> Rerun; NO MOTION)
+# ---------------------------------------------------------------------------
+
+
+def _emit_eval_qvel(stop: threading.Event, task: TaskInfo) -> None:
+    """Eval launch (for now): stream each arm's live joint velocity ``dq``.
+
+    A no-motion hardware check. Open a **read-only** ``flexivrdk`` connection per
+    arm — ``require_operational`` stays false, so brakes are never released and the
+    arm is never commanded — read ``RobotStates.dq`` each tick, and log it to
+    ``proprio/dq/{side}`` (the path the dq time-series view watches). A robot at
+    rest reads ~0; the point is to confirm the real read → Rerun path end to end
+    before the full eval runner lands. Honours ``runtime.sim`` (a
+    :class:`FakeFlexivSource` stands in with no hardware), and never raises out —
+    an unreachable arm is reported to the event log and skipped.
+    """
+    from ..interfaces.flexiv.source import FakeFlexivSource
+    from ..interfaces.flexiv.source import FlexivSource
+    from .arms import discover_arms
+    from .arms import runtime_is_sim
+
+    sim = runtime_is_sim()
+    arms = discover_arms()
+    if not arms:
+        _log_event("eval qvel probe: no arms configured")
+        return
+
+    sources: dict[str, object] = {}
+    for arm in arms:
+        try:
+            if sim:
+                src: object = FakeFlexivSource(arm.serial, dof=arm.dof)
+            else:
+                # require_operational stays false -> connect & read only, no Enable().
+                src = FlexivSource(arm.serial, dof=arm.dof, connect_timeout_s=8.0)
+            src.open()
+        except Exception as exc:  # noqa: BLE001 - unreachable arm -> report, skip
+            _log_event(f"eval qvel probe: {arm.name} ({arm.serial}) connect failed: {exc}")
+            continue
+        sources[arm.side] = src
+        _log_event(f"eval qvel probe: {arm.name} ({arm.serial}) connected — streaming dq")
+
+    if not sources:
+        _log_event("eval qvel probe: no arms reachable; nothing to stream")
+        return
+
+    dt = 1.0 / _EMIT_HZ
+    step = 0
+    try:
+        while not stop.is_set():
+            rr.set_time("elapsed", duration=step * dt)
+            for side, src in sources.items():
+                try:
+                    dq = np.asarray(src.read().dq, dtype=np.float64)
+                except Exception as exc:  # noqa: BLE001 - transient read error -> skip tick
+                    _log_event(f"eval qvel probe: {side} read error: {exc}")
+                    continue
+                rr.log(blueprints.proprio_path("dq", side), rr.Scalars(dq.tolist()))
+            step += 1
+            stop.wait(dt)
+    finally:
+        for src in sources.values():
+            try:
+                src.close()  # read-only handle: close just drops it (no Stop needed)
+            except Exception:  # noqa: BLE001 - teardown must not raise
+                pass

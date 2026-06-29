@@ -258,6 +258,7 @@ class ArmCfg:
     """One Flexiv arm: connection, read settings, stream schemas, default controller."""
 
     serial: str = MISSING
+    name: str = ""                       # display name (e.g. dashboard); "" => the side
     dof: int = 7
     wrench_frame: str = "local"          # local (TCP) | world
     require_operational: bool = False
