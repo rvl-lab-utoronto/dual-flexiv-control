@@ -11,6 +11,7 @@ import importlib.util
 import pytest
 
 from dual_flexiv_control.dashboard.tasks import TaskInfo
+from dual_flexiv_control.dashboard.tasks import discover_rigs
 from dual_flexiv_control.dashboard.tasks import discover_tasks
 
 _HAVE_RERUN = importlib.util.find_spec("rerun") is not None
@@ -33,6 +34,15 @@ def test_discover_tasks_reads_phase_fields():
 def test_discover_tasks_every_entry_has_an_instruction():
     # The dropdown filters to real tasks: each must carry a language_instruction.
     assert all(t.language_instruction for t in discover_tasks())
+
+
+def test_discover_rigs_finds_shipped_rigs_with_descriptions():
+    rigs = {r.name: r for r in discover_rigs()}
+    assert {"bimanual", "bench", "left_only"} <= set(rigs)
+    # Each rig file leads with a one-line hardware summary (after @package).
+    assert all(r.description for r in rigs.values())
+    assert "@package" not in rigs["bench"].description
+    assert "dummy" in rigs["bench"].description.lower()
 
 
 @_needs_rerun
@@ -154,34 +164,52 @@ def test_editor_discovery_helpers_return_str_or_none():
 
 
 def test_discover_camera_views_from_config():
+    from dual_flexiv_control.dashboard import cameras as cam_mod
+    from dual_flexiv_control.dashboard.arms import set_active_rig
     from dual_flexiv_control.dashboard.cameras import CameraView
     from dual_flexiv_control.dashboard.cameras import discover_camera_views
 
-    views = discover_camera_views()
-    keys = {v.key for v in views}
-    assert {"cam/wrist_left/left", "cam/static/left", "cam/static/right"} <= keys
-    assert all(isinstance(v, CameraView) for v in views)
+    set_active_rig("bimanual")  # full camera set (default rig is now left_only)
+    cam_mod.reset()
+    try:
+        views = discover_camera_views()
+        keys = {v.key for v in views}
+        assert {"cam/wrist_left/left", "cam/static/left", "cam/static/right"} <= keys
+        assert all(isinstance(v, CameraView) for v in views)
+    finally:
+        set_active_rig(None)
+        cam_mod.reset()
 
 
 def test_discover_arms_uses_config_names():
     from dual_flexiv_control.dashboard.arms import ArmInfo
     from dual_flexiv_control.dashboard.arms import discover_arms
+    from dual_flexiv_control.dashboard.arms import set_active_rig
 
-    by_side = {a.side: a for a in discover_arms()}
-    assert {"left", "right"} <= set(by_side)
-    assert all(isinstance(a, ArmInfo) for a in by_side.values())
-    assert by_side["left"].name == "Lauer"
-    assert by_side["right"].name == "Rogers"
+    set_active_rig("bimanual")  # two-arm rig (shipped default is now left_only)
+    try:
+        by_side = {a.side: a for a in discover_arms()}
+        assert {"left", "right"} <= set(by_side)
+        assert all(isinstance(a, ArmInfo) for a in by_side.values())
+        assert by_side["left"].name == "Lauer"
+        assert by_side["right"].name == "Rogers"
+    finally:
+        set_active_rig(None)
 
 
 def test_discover_arms_carries_serials_for_the_probe():
     # The eval dq probe hands these serials straight to flexivrdk.
     from dual_flexiv_control.dashboard.arms import discover_arms
+    from dual_flexiv_control.dashboard.arms import set_active_rig
 
-    by_side = {a.side: a for a in discover_arms()}
-    assert by_side["left"].serial == "Rizon4s-062841"
-    assert by_side["right"].serial == "Rizon4s-062837"
-    assert all(a.dof == 7 for a in by_side.values())
+    set_active_rig("bimanual")  # two-arm rig (shipped default is now left_only)
+    try:
+        by_side = {a.side: a for a in discover_arms()}
+        assert by_side["left"].serial == "Rizon4s-062841"
+        assert by_side["right"].serial == "Rizon4s-062837"
+        assert all(a.dof == 7 for a in by_side.values())
+    finally:
+        set_active_rig(None)
 
 
 def test_runtime_is_sim_returns_bool():
@@ -352,15 +380,59 @@ def test_read_live_horizon_q_none_without_eval_run(tmp_path):
     assert read_live_horizon_q("left", runtime_dir=str(tmp_path)) is None
 
 
-def test_get_frame_falls_back_to_placeholder(tmp_path):
-    # Empty runtime dir -> no live producer -> synthetic uint8 RGB frame.
-    import numpy as np
-
+def test_get_frame_missing_when_no_live_producer(tmp_path):
+    # Empty runtime dir -> no live producer -> the frame reads as MISSING (no
+    # fabricated placeholder), so the dashboard can surface it as an error.
     from dual_flexiv_control.dashboard.cameras import discover_camera_views
     from dual_flexiv_control.dashboard.cameras import get_frame
 
     rgb_view = next(v for v in discover_camera_views() if v.channels == 3)
     frame, source = get_frame(rgb_view, runtime_dir=str(tmp_path))
-    assert source == "placeholder"
-    assert frame.dtype == np.uint8
-    assert frame.ndim == 3 and frame.shape[2] == 3
+    assert source == "missing"
+    assert frame is None
+
+
+def test_discover_logs_orders_newest_first(tmp_path):
+    # Each Hydra run dir holds a system.log; discovery lists them newest-first so the
+    # Logs tab defaults to the most recent run.
+    import os
+
+    from dual_flexiv_control.dashboard import logs
+
+    for name, mtime in (("2026-01-01_00-00-00", 1_000), ("2026-01-02_00-00-00", 2_000)):
+        run_dir = tmp_path / name
+        run_dir.mkdir()
+        p = run_dir / "system.log"
+        p.write_text("hello\n")
+        os.utime(p, (mtime, mtime))
+
+    found = logs.discover_logs(tmp_path)
+    assert [f.name for f in found] == ["2026-01-02_00-00-00", "2026-01-01_00-00-00"]
+    assert all(f.size_bytes > 0 for f in found)
+
+
+def test_discover_logs_empty_when_no_outputs(tmp_path):
+    from dual_flexiv_control.dashboard import logs
+
+    assert logs.discover_logs(tmp_path) == []
+
+
+def test_read_tail_truncates_large_logs(tmp_path):
+    from dual_flexiv_control.dashboard import logs
+
+    p = tmp_path / "system.log"
+    p.write_text("".join(f"line {i}\n" for i in range(100_000)))
+    tail = logs.read_tail(p, max_bytes=1024)
+    # Bounded read + a truncation marker; the final line is always intact, and
+    # every line in the window is kept (no line cap — the box scrolls).
+    assert len(tail) < 2048
+    assert tail.startswith("… (showing last")
+    assert tail.rstrip().endswith("line 99999")
+
+
+def test_read_tail_returns_whole_small_log(tmp_path):
+    from dual_flexiv_control.dashboard import logs
+
+    p = tmp_path / "system.log"
+    p.write_text("only line\n")
+    assert logs.read_tail(p) == "only line\n"

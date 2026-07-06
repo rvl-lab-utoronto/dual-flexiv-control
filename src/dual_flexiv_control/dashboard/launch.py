@@ -41,33 +41,32 @@ def _prebind_rerun_servers() -> None:
     Binding them here means those (Streamlit + metrics 9090/9876) listen
     immediately — friendlier for port-forwarding, and the viewer shows its idle
     screen before anyone connects. Streamlit runs the app in **this** process, so
-    its first session reuses these very servers (each ``start_*`` is idempotent per
-    process).
+    its first session reuses these very servers (``start_servers`` is idempotent).
 
-    The **replay** viewer (9094/9880) is intentionally NOT pre-bound: it starts
-    lazily on the first ▶ click (``app._replay_viewer``). Binding a second Rerun
-    web viewer here can block on a rapid dashboard restart (the prior instance's
-    port not yet released), which would stall Streamlit's own startup — not worth
-    it for a viewer that isn't needed until someone replays an episode.
+    The **replay** gRPC data server (9880) is intentionally NOT pre-bound: it starts
+    lazily on the first ▶ click (``app._replay_viewer``) and is embedded in this same
+    web viewer (no separate web port).
+
+    Failures here are **not** swallowed: if the ports can't bind (e.g. a stale
+    dashboard still holding :9090), this raises and aborts startup so the operator
+    sees it immediately, instead of leaving a silently-black viewer that only a full
+    restart clears.
     """
-    try:
-        import rerun as rr
+    import rerun as rr
 
-        from dual_flexiv_control.dashboard import blueprints
-        from dual_flexiv_control.dashboard import robot_view
-        from dual_flexiv_control.dashboard import runner
-        from dual_flexiv_control.dashboard.viewer import ports_from_env
-        from dual_flexiv_control.dashboard.viewer import start_servers
+    from dual_flexiv_control.dashboard import blueprints
+    from dual_flexiv_control.dashboard import robot_view
+    from dual_flexiv_control.dashboard import runner
+    from dual_flexiv_control.dashboard.viewer import ports_from_env
+    from dual_flexiv_control.dashboard.viewer import start_servers
 
-        grpc_port, web_port = ports_from_env()
-        start_servers(grpc_port=grpc_port, web_port=web_port)
-        # Log the robot scene into the metrics recording (it now shares the metrics
-        # viewer's 3D panel), then send the idle blueprint that shows it + the README.
-        robot_view.attach()
-        rr.send_blueprint(blueprints.welcome_blueprint())
-        runner.log_welcome()
-    except Exception as exc:  # noqa: BLE001 - non-fatal; app starts them on demand
-        print(f"[dfc-dashboard] deferred Rerun server start ({exc!r})", file=sys.stderr)
+    grpc_port, web_port = ports_from_env()
+    start_servers(grpc_port=grpc_port, web_port=web_port)
+    # Log the robot scene into the metrics recording (it now shares the metrics
+    # viewer's 3D panel), then send the idle blueprint that shows it + the README.
+    robot_view.attach()
+    rr.send_blueprint(blueprints.welcome_blueprint())
+    runner.log_welcome()
 
 
 if __name__ == "__main__":

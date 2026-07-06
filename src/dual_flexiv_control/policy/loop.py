@@ -345,4 +345,7 @@ class EvalNode(ProcessNode):
                 except Exception:  # noqa: BLE001 - teardown must not raise
                     log.exception("error releasing horizon stream for %s", side)
                 registry.remove(horizon_stream_name(side))
+            # Hand control back cleanly: STOP the arms (they exit their control
+            # session at once instead of riding the deadman), then unlink channels.
+            brain.stop_arms()
             brain.close()

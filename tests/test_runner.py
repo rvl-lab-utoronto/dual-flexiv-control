@@ -1,17 +1,16 @@
-"""Dashboard run registry: async collection stop, outcome alerts, error surfacing.
+"""Dashboard run registry: session-backed launches, outcome alerts, status mapping.
 
-The registry drives real subprocesses; here the collection system is stood in by
-small ``bash`` scripts (crash with output / save-on-SIGINT) so the monitor, alert,
-and stop paths are exercised end-to-end without hardware. The Rerun calls inside
-the registry are no-ops without an active recording, so no viewer is needed.
+The registry is now a thin client over the session daemon (see
+:mod:`dual_flexiv_control.session`); here the daemon is stood in by a scripted
+:class:`FakeManager` so the launch gating, one-shot alert, status panel, and
+history paths are exercised without processes. The Rerun calls inside the
+registry are no-ops without an active recording, so no viewer is needed. The
+real daemon protocol is covered end-to-end in ``test_session.py``.
 """
 
 from __future__ import annotations
 
 import importlib.util
-import subprocess
-import time
-from pathlib import Path
 
 import pytest
 
@@ -26,8 +25,8 @@ pytestmark = pytest.mark.skipif(
 def _rerun_recording():
     """A sink-less Rerun recording: the registry's viewer calls become no-ops.
 
-    ``rr.send_blueprint`` raises without an active recording (production always
-    has one, created by the dashboard's viewer startup).
+    ``rr.log`` raises without an active recording (production always has one,
+    created by the dashboard's viewer startup).
     """
     import rerun as rr
 
@@ -36,6 +35,8 @@ def _rerun_recording():
 
 
 def _task():
+    from pathlib import Path
+
     from dual_flexiv_control.dashboard.tasks import TaskInfo
 
     return TaskInfo(
@@ -47,110 +48,171 @@ def _task():
     )
 
 
-def _registry_with_fake_proc(monkeypatch, tmp_path, script: str):
-    """A RunRegistry whose collection subprocess is ``bash -c script``."""
+class FakeManager:
+    """Scripted stand-in for :class:`~dual_flexiv_control.dashboard.session.SessionManager`."""
+
+    def __init__(self, **view_kwargs):
+        from dual_flexiv_control.dashboard.session import SessionView
+
+        self._view = SessionView(state="viewing", rig="bimanual", sim=True,
+                                 run_id="abc123", **view_kwargs)
+        self.commands: list = []
+        self.tail = "boom traceback"
+
+    def set_view(self, **changes):
+        from dataclasses import replace
+
+        self._view = replace(self._view, **changes)
+
+    def view(self):
+        return self._view
+
+    def ensure(self, rig, sim):
+        return False
+
+    def start_run(self, phase, task):
+        self.commands.append(("start", phase, task))
+        return True
+
+    def stop_run(self):
+        self.commands.append(("stop",))
+        return True
+
+    def log_tail(self, n=25):
+        return self.tail
+
+
+def _registry(**view_kwargs):
     from dual_flexiv_control.dashboard import runner
 
-    log_path = str(tmp_path / "collection.log")
-
-    def fake_launch(task, run_id):
-        logf = open(log_path, "w")
-        try:
-            proc = subprocess.Popen(
-                ["bash", "-c", script],
-                start_new_session=True,
-                stdout=logf,
-                stderr=subprocess.STDOUT,
-            )
-        finally:
-            logf.close()
-        return proc, log_path
-
-    monkeypatch.setattr(runner, "_launch_collection", fake_launch)
-    # The live view reads FACTR/shm/robot scene — irrelevant here.
-    monkeypatch.setattr(runner, "_emit_collection_view", lambda stop, task: None)
-    return runner.RunRegistry()
+    mgr = FakeManager(**view_kwargs)
+    return runner.RunRegistry(manager=mgr), mgr
 
 
-def _wait_alert(registry, timeout_s: float = 10.0):
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        alert = registry.take_alert()
-        if alert is not None:
-            return alert
-        time.sleep(0.05)
-    raise AssertionError("no alert within timeout")
+def test_launch_sends_start_command_from_viewing():
+    registry, mgr = _registry()
+    registry.launch(_task(), "collection", rig="bimanual")
+    assert mgr.commands == [("start", "collection", "fake")]
 
 
-def test_crash_surfaces_error_alert_with_log_tail(monkeypatch, tmp_path):
-    """A collection subprocess that dies on its own raises an error alert + log tail."""
-    registry = _registry_with_fake_proc(
-        monkeypatch, tmp_path,
-        "echo 'RuntimeError: camera static has auto_serial=true but no ZED'; exit 3",
-    )
-    registry.launch(_task(), "collection")
-    alert = _wait_alert(registry)
-    assert alert["kind"] == "error"
-    assert "exit code 3" in alert["detail"]
-    assert "no ZED" in (alert["tail"] or "")
-    assert registry.active() is None            # monitor cleared the active slot
-    (run,) = registry.history()
-    assert run.outcome == "crashed"
-    assert registry.take_alert() is None        # one-shot: taken exactly once
-
-
-def test_stop_is_async_and_reports_saved(monkeypatch, tmp_path):
-    """Stop returns immediately ("saving"), SIGINT saves, then an info alert lands."""
-    registry = _registry_with_fake_proc(
-        monkeypatch, tmp_path,
-        # Stand-in for the orchestrator: on SIGINT, "save" briefly then exit 0.
-        'trap "sleep 0.4; exit 0" INT; sleep 30 & wait $!',
-    )
-    registry.launch(_task(), "collection")
-    time.sleep(0.3)  # let bash install its trap
-    t0 = time.monotonic()
-    registry.stop_active()
-    assert time.monotonic() - t0 < 1.0, "stop must not block on the save"
-    active = registry.active()
-    assert active is not None and active.status == "stopping"
-    cs = registry.collection_status()
-    assert cs is not None and cs.state == "saving"
-
-    alert = _wait_alert(registry)
-    assert alert["kind"] == "info"
-    assert "saved" in alert["detail"]
-    assert registry.active() is None
-    (run,) = registry.history()
-    assert run.outcome == "saved"
-
-
-def test_launch_refused_while_collection_active(monkeypatch, tmp_path):
-    """Overlapping collection launches are refused (cameras/dataset conflict)."""
-    registry = _registry_with_fake_proc(
-        monkeypatch, tmp_path, 'trap "exit 0" INT; sleep 30 & wait $!'
-    )
-    registry.launch(_task(), "collection")
+def test_launch_refused_while_run_active():
+    registry, mgr = _registry()
+    mgr.set_view(state="collection", task="fake", phase="collection")
     with pytest.raises(RuntimeError, match="still active"):
         registry.launch(_task(), "collection")
-    registry.stop_active()
-    _wait_alert(registry)  # let it unwind before the tmpdir vanishes
+    mgr.set_view(state="saving")  # saving counts as active too
+    with pytest.raises(RuntimeError, match="still active"):
+        registry.launch(_task(), "eval")
+    assert mgr.commands == []
 
 
-def test_running_status_surfaces_collection_heartbeat(monkeypatch, tmp_path):
-    """While recording, the status panel shows the loop's own heartbeat line."""
-    registry = _registry_with_fake_proc(
-        monkeypatch, tmp_path,
-        "echo '2026-01-01 INFO collection dual_flexiv_control.collection.loop: "
-        "collection: recording (42 frames this episode, 42 total)'; "
-        'trap "exit 0" INT; sleep 30 & wait $!',
-    )
-    registry.launch(_task(), "collection")
-    time.sleep(0.4)  # give bash time to write the heartbeat
+def test_launch_refused_when_session_down_or_starting():
+    registry, mgr = _registry()
+    mgr.set_view(state="down")
+    with pytest.raises(RuntimeError, match="not running"):
+        registry.launch(_task(), "collection")
+    mgr.set_view(state="starting")
+    with pytest.raises(RuntimeError, match="starting"):
+        registry.launch(_task(), "collection")
+    assert mgr.commands == []
+
+
+def test_launch_refused_on_rig_mismatch():
+    registry, mgr = _registry()
+    with pytest.raises(RuntimeError, match="rig"):
+        registry.launch(_task(), "collection", rig="bench")
+    assert mgr.commands == []
+
+
+def test_launch_rejects_unknown_phase():
+    registry, _ = _registry()
+    with pytest.raises(ValueError, match="unknown phase"):
+        registry.launch(_task(), "bogus")
+
+
+def test_active_and_status_follow_the_session_state():
+    registry, mgr = _registry()
+    assert registry.active() is None
+    assert registry.collection_status() is None
+
+    mgr.set_view(state="collection", task="fake", phase="collection",
+                 run_seq=1, run_started_ts=1e9)
+    active = registry.active()
+    assert active is not None
+    assert (active.phase, active.task, active.status) == ("collection", "fake", "running")
     cs = registry.collection_status()
     assert cs is not None and cs.state == "running"
-    assert "42 frames" in cs.detail
+
+    mgr.set_view(state="saving")
+    assert registry.active().status == "stopping"
+    assert registry.collection_status().state == "saving"
+
+    mgr.set_view(state="eval", phase="eval")
+    cs = registry.collection_status()
+    assert cs is not None and cs.state == "running" and "rollout" in cs.detail
+
+
+def test_stop_active_sends_stop():
+    registry, mgr = _registry()
+    mgr.set_view(state="collection", task="fake", phase="collection")
     registry.stop_active()
-    _wait_alert(registry)
+    assert ("stop",) in mgr.commands
+
+
+def test_outcome_surfaces_one_alert_and_lands_in_history():
+    registry, mgr = _registry()
+    mgr.set_view(last_outcome={
+        "run_seq": 1, "phase": "collection", "task": "fake",
+        "outcome": "saved", "exitcode": 0,
+        "detail": "collection stopped — episode saved to the dataset.",
+    })
+    alert = registry.take_alert()
+    assert alert is not None and alert["kind"] == "info"
+    assert "saved" in alert["detail"]
+    assert alert["tail"] is None
+    assert registry.take_alert() is None        # one-shot: taken exactly once
+    (run,) = registry.history()
+    assert run.status == "saved" and run.task == "fake"
+
+
+def test_crash_outcome_alerts_with_log_tail():
+    registry, mgr = _registry()
+    mgr.set_view(last_outcome={
+        "run_seq": 1, "phase": "collection", "task": "fake",
+        "outcome": "crashed", "exitcode": 3,
+        "detail": "run stopped on its own (exit code 3) — a source likely failed.",
+    })
+    alert = registry.take_alert()
+    assert alert is not None and alert["kind"] == "error"
+    assert "exit code 3" in alert["detail"]
+    assert alert["tail"] == mgr.tail
+    (run,) = registry.history()
+    assert run.status == "crashed"
+
+
+def test_new_outcome_seq_raises_a_new_alert():
+    registry, mgr = _registry()
+    mgr.set_view(last_outcome={"run_seq": 1, "phase": "collection", "task": "fake",
+                               "outcome": "saved", "exitcode": 0, "detail": "d1"})
+    assert registry.take_alert() is not None
+    mgr.set_view(last_outcome={"run_seq": 2, "phase": "eval", "task": "fake",
+                               "outcome": "finished", "exitcode": 0, "detail": "d2"})
+    alert = registry.take_alert()
+    assert alert is not None and alert["detail"] == "d2"
+    assert registry.take_alert() is None
+    assert len(registry.history()) == 2
+
+
+def test_reset_stops_run_and_clears_history():
+    registry, mgr = _registry()
+    mgr.set_view(last_outcome={"run_seq": 1, "phase": "collection", "task": "fake",
+                               "outcome": "saved", "exitcode": 0, "detail": "d"})
+    registry.take_alert()
+    assert registry.history()
+    mgr.set_view(state="collection", task="fake", phase="collection")
+    registry.reset()
+    assert ("stop",) in mgr.commands
+    assert registry.history() == []
 
 
 def test_log_tail_and_heartbeat_helpers(tmp_path):
@@ -170,3 +232,19 @@ def test_log_tail_and_heartbeat_helpers(tmp_path):
     assert beat is not None and beat.startswith("NO frames recorded")
     assert _log_tail(str(tmp_path / "missing.txt")) is None
     assert _last_heartbeat(None) is None
+
+
+def test_running_status_surfaces_collection_heartbeat(tmp_path):
+    """While recording, the status panel shows the loop's own heartbeat line
+    (taken from the session daemon's log, where the consumer's output lands)."""
+    registry, mgr = _registry()
+    log = tmp_path / "daemon.log"
+    log.write_text(
+        "2026-01-01 INFO collection dual_flexiv_control.collection.loop: "
+        "collection: recording (42 frames this episode, 42 total)\n"
+    )
+    mgr.set_view(state="collection", task="fake", phase="collection",
+                 log_path=str(log))
+    cs = registry.collection_status()
+    assert cs is not None and cs.state == "running"
+    assert "42 frames" in cs.detail

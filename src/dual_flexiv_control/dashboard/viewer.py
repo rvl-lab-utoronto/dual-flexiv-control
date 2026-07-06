@@ -32,11 +32,22 @@ DEFAULT_WEB_PORT = 9090
 #: gRPC server memory cap; oldest non-static data is dropped past this.
 DEFAULT_MEMORY_LIMIT = "2GiB"
 
-# Process-global singleton: the servers bind exactly once per process, whether
-# first touched by the launcher (eager, pre-Streamlit) or by the app's first
-# session. Both paths funnel through start_servers().
+# Process-global singletons, with two deliberately-split lifetimes:
+#
+# * the **web-viewer HTTP host** binds exactly once per process and is NEVER torn
+#   down — rerun 0.33 offers no way to stop or rebind it in-process
+#   (``rerun_shutdown()`` releases the gRPC server but leaves the web port bound).
+#   That is fine: the web viewer is stateless — it serves the viewer app, which
+#   connects to whichever gRPC ``?url=`` an iframe asks for — so it never needs a
+#   restart.
+# * the **gRPC data server + recording** hold all the state and CAN be torn down
+#   (:func:`teardown`) and re-served (a fresh :func:`start_servers`), which is what
+#   the dashboard's *Reset services* action does without killing the process.
 _LOCK = threading.Lock()
 _SERVERS: "RerunServers | None" = None
+#: The port the web viewer bound on (set once, on the first ``serve_web_viewer``);
+#: never cleared, so teardown + restart reuses the same host instead of re-binding.
+_WEB_VIEWER_PORT: int | None = None
 
 
 def ports_from_env() -> tuple[int, int]:
@@ -85,15 +96,22 @@ def start_servers(
     web_port: int = DEFAULT_WEB_PORT,
     memory_limit: str = DEFAULT_MEMORY_LIMIT,
 ) -> RerunServers:
-    """Initialise the recording and bring up the gRPC + web-viewer servers.
+    """Initialise the recording and bring up the gRPC data server + web viewer.
 
-    Idempotent per process: the first call binds the ports; later calls (e.g. the
-    Streamlit app reusing what the launcher already started) return the same
-    handle without re-binding. ``rr.init`` installs the process-global recording,
-    so anything that later calls ``rr.log`` / ``rr.send_blueprint`` (including the
-    emitter thread in :mod:`~.runner`) feeds this same recording and viewer.
+    Idempotent while up: repeated calls return the live handle. The gRPC data
+    server + recording are (re)created on each fresh start — so after
+    :func:`teardown` releases them, a new call re-serves the gRPC server (its port
+    was freed) and re-installs the recording. The web-viewer HTTP host is bound
+    **once** for the process lifetime and reused thereafter (it cannot be rebound
+    in-process; see the module note). ``rr.init`` installs the process-global
+    recording, so anything that later calls ``rr.log`` / ``rr.send_blueprint``
+    (including the emitter thread in :mod:`~.runner`) feeds this same recording.
+
+    A bind failure here (e.g. a stale dashboard still holding the port) raises —
+    it is not swallowed — so the problem surfaces immediately instead of leaving a
+    silently-black viewer.
     """
-    global _SERVERS
+    global _SERVERS, _WEB_VIEWER_PORT
     with _LOCK:
         if _SERVERS is not None:
             return _SERVERS
@@ -105,8 +123,31 @@ def start_servers(
             server_memory_limit=memory_limit,
             cors_allow_origin=["*"],
         )
-        rr.serve_web_viewer(web_port=web_port, open_browser=False, connect_to=grpc_uri)
+        if _WEB_VIEWER_PORT is None:
+            rr.serve_web_viewer(web_port=web_port, open_browser=False, connect_to=grpc_uri)
+            _WEB_VIEWER_PORT = web_port
         _SERVERS = RerunServers(
-            app_id=app_id, grpc_uri=grpc_uri, grpc_port=grpc_port, web_port=web_port
+            app_id=app_id, grpc_uri=grpc_uri, grpc_port=grpc_port, web_port=_WEB_VIEWER_PORT
         )
         return _SERVERS
+
+
+def teardown() -> None:
+    """Tear down the gRPC data server + every recording (releasing the gRPC port).
+
+    ``rr.rerun_shutdown()`` is global: it stops **all** served gRPC servers (the
+    metrics server here *and* the replay server in :mod:`~.replay`) and drops their
+    in-memory recordings, freeing those ports for a clean re-serve. The web-viewer
+    HTTP host is intentionally left running (it cannot be stopped in-process and is
+    stateless), so a subsequent :func:`start_servers` reuses it.
+
+    This only releases the servers. Callers that cached the now-dead recording — the
+    robot scene (:func:`~.robot_view.reset`) and the replay viewer
+    (:func:`~.replay.reset`) — must be reset alongside, and the metrics servers
+    re-started, before logging resumes. The dashboard's *Reset services* action does
+    exactly this.
+    """
+    global _SERVERS
+    with _LOCK:
+        rr.rerun_shutdown()
+        _SERVERS = None

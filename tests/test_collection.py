@@ -22,9 +22,11 @@ from dual_flexiv_control.streams.ring import Samples
 
 
 def _config(*overrides: str):
+    # These fixtures exercise the full two-arm setup, so pin the bimanual rig (the
+    # shipped default is now the single-arm left_only — see conf/config.yaml).
     register_configs()
     with initialize_config_module(config_module="dual_flexiv_control.conf", version_base=None):
-        cfg = compose(config_name="config", overrides=list(overrides))
+        cfg = compose(config_name="config", overrides=["rig=bimanual", *overrides])
     return OmegaConf.to_object(cfg)
 
 
@@ -45,8 +47,8 @@ def _empty_samples(dtype=np.float64) -> Samples:
 def _builder(cfg, teleop_sides=("left",)):
     return FrameBuilder(
         cfg.arms, list(teleop_sides), cfg.cameras,
-        cfg.task.language_instruction, cfg.task.collection.state_signals,
-        video=cfg.task.collection.video,
+        cfg.task.language_instruction, cfg.task.state_signals,
+        video=cfg.recording.video,
     )
 
 

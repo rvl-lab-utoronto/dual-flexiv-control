@@ -23,6 +23,7 @@ import streamlit as st
 from dual_flexiv_control.dashboard import arms as _arms
 from dual_flexiv_control.dashboard import blueprints
 from dual_flexiv_control.dashboard import cameras as _cameras
+from dual_flexiv_control.dashboard import logs as _logs
 from dual_flexiv_control.dashboard import replay as _replay
 from dual_flexiv_control.dashboard import robot_view as _robot
 from dual_flexiv_control.dashboard import runner as _runner
@@ -30,19 +31,26 @@ from dual_flexiv_control.dashboard import storage as _storage
 from dual_flexiv_control.dashboard.arms import ArmStatus
 from dual_flexiv_control.dashboard.arms import discover_arms
 from dual_flexiv_control.dashboard.arms import read_arm_status
+from dual_flexiv_control.dashboard.cameras import CameraStatus
 from dual_flexiv_control.dashboard.cameras import CameraView
 from dual_flexiv_control.dashboard.cameras import discover_camera_views
 from dual_flexiv_control.dashboard.cameras import get_frame
+from dual_flexiv_control.dashboard.cameras import read_camera_statuses
 from dual_flexiv_control.dashboard.editor import open_in_vscode
+from dual_flexiv_control.dashboard.tasks import RigInfo
 from dual_flexiv_control.dashboard.tasks import TaskInfo
-from dual_flexiv_control.dashboard.tasks import discover_launchables
+from dual_flexiv_control.dashboard.tasks import discover_rigs
+from dual_flexiv_control.dashboard.tasks import discover_tasks
 from dual_flexiv_control.dashboard.viewer import RerunServers
 from dual_flexiv_control.dashboard.viewer import ports_from_env
 from dual_flexiv_control.dashboard.viewer import start_servers
+from dual_flexiv_control.dashboard.viewer import teardown as _teardown_servers
 
 VIEWER_HEIGHT_PX = 1400
-#: Camera-tab refresh cadence (placeholder feed; real shm reads pace themselves).
+#: Camera-tab refresh cadence (live shm reads pace themselves; missing → error tile).
 CAMERA_REFRESH = "0.15s"
+#: Logs-tab tail cadence while "Follow" is on (a running system logs a beat every ~2s).
+LOG_REFRESH = "2s"
 
 #: Trim the default top padding and enlarge the tab buttons.
 _PAGE_CSS = """
@@ -96,8 +104,12 @@ def _servers() -> RerunServers:
 
 @st.cache_resource
 def _replay_viewer() -> _replay.ReplayViewer:
-    """Start (once) the dedicated episode-replay viewer on its own ports."""
-    return _replay.start_replay_viewer()
+    """Start (once) the replay gRPC data server, embedded in the shared web viewer.
+
+    Reuses the metrics web-viewer host (no second ``serve_web_viewer``), pointed at
+    replay's own gRPC server so episode recordings stay isolated from live metrics.
+    """
+    return _replay.start_replay_viewer(web_port=_servers().web_port)
 
 
 @st.cache_resource
@@ -105,27 +117,48 @@ def _registry() -> _runner.RunRegistry:
     return _runner.RunRegistry()
 
 
-def _reset_services(registry: _runner.RunRegistry) -> None:
-    """Restart the dashboard's live services: stop the run, drop caches, reset viewers.
+def _reset_services(registry: _runner.RunRegistry) -> bool:
+    """Restart the dashboard's live services: session daemon + viewers, from scratch.
 
-    The dashboard equivalent of restarting the stack, without killing the process
-    (the Rerun servers keep their bound ports):
+    The dashboard equivalent of restarting the stack without killing the process:
 
-    1. Stop the active run — joins its emitter thread, closing the live
-       ``FlexivSource`` / FACTR-leader connections it holds — and clear history.
-    2. Drop the cached Hydra composes so arms + cameras re-read ``conf`` (and any
+    1. Refuse while a run is active — resetting would kill the in-flight episode;
+       the operator stops the run first (returns False, surfaced as a warning).
+    2. Shut the session daemon down gracefully (arms + cameras released) and stop
+       the metrics mirror, so nothing logs into the recording while it is torn down.
+    3. Drop the cached Hydra composes so arms + cameras re-read ``conf`` (and any
        changed ``runtime.sim``) on next use.
-    3. Return the metrics viewer to idle and snap the robot scene back to home.
+    4. Gracefully tear down the Rerun gRPC data servers (metrics + replay) and drop
+       their recordings via :func:`~.viewer.teardown`, then reset the dependents that
+       cached the now-dead recording (robot scene, replay viewer) and clear the
+       ``st.cache_resource`` handles so they rebind.
+    5. Re-serve the metrics gRPC server, re-attach the robot scene, and send the idle
+       welcome layout; respawn the daemon (fresh robot connections) + the mirror.
+       The web-viewer HTTP host is reused throughout (it cannot be rebound
+       in-process); the replay server rebinds lazily on the next ▶.
     """
+    if registry.session_view().run_active:
+        return False
     registry.reset()
+    registry.manager.shutdown()  # release the arms/cameras; respawned below
     _arms.reset()
     _cameras.reset()
     _storage.reset()
-    _runner.reset_viewer()
-    _robot.relog_scene()
+    _teardown_servers()          # rerun_shutdown: releases metrics + replay gRPC ports
+    _robot.reset()               # forget the dead metrics recording
+    _replay.reset()              # forget the (now released) replay server
+    _servers.clear()             # st.cache_resource: re-run start_servers on next call
+    _replay_viewer.clear()
+    _servers()                   # re-serve metrics gRPC + re-attach robot scene + welcome
+    _runner.reset_viewer()       # idle welcome blueprint + README + reset event log
+    # Fresh daemon on the (possibly re-read) rig/sim; ensure restarts the mirror too.
+    registry.ensure_session(_arms.active_rig(), _arms.runtime_is_sim())
+    return True
 
 
-def _render_controls(tasks: list[TaskInfo], registry: _runner.RunRegistry) -> None:
+def _render_controls(
+    tasks: list[TaskInfo], rigs: list[RigInfo], registry: _runner.RunRegistry
+) -> None:
 
     st.subheader("Experiment")
     if not tasks:
@@ -134,48 +167,74 @@ def _render_controls(tasks: list[TaskInfo], registry: _runner.RunRegistry) -> No
             "and reload."
         )
         return
+    if not rigs:
+        st.error("No rigs found in `conf/rig/`. Add one (copy `rig/bimanual.yaml`).")
+        return
 
-    # Tasks (conf/task, run on the default config) plus run profiles (whole-config,
-    # e.g. `test` = dummy arm + one real camera) — profiles are marked with ⚙.
-    by_label = {(f"⚙ {t.name} (profile)" if t.config_name else t.name): t for t in tasks}
-    selected = st.selectbox(
-        "Task", list(by_label),
-        help="Tasks from conf/task, plus ⚙ run profiles (whole-config, e.g. `test`).",
+    view = registry.session_view()
+
+    # Two orthogonal axes: the rig (what hardware exists — conf/rig) and the task
+    # (what is demonstrated/evaluated — conf/task). The session daemon holds the
+    # rig; changing it restarts the daemon, so it is locked while a run is active.
+    rig_names = [r.name for r in rigs]
+    default_rig = rig_names.index("bimanual") if "bimanual" in rig_names else 0
+    rig_name = st.selectbox(
+        "Rig", rig_names, index=default_rig, key="rig_name",
+        disabled=view.run_active,
+        help=(
+            "Hardware setup from conf/rig — arms, cameras, FACTR leaders, serials. "
+            "Changing it restarts the session (locked during a run)."
+        ),
     )
-    task = by_label[selected]
-    if task.config_name:
-        st.caption(f"⚙ Profile — launches the whole `{task.config_name}` config (its own arms/cameras).")
+    rig = next(r for r in rigs if r.name == rig_name)
+    if rig.description:
+        st.caption(rig.description)
 
-    if st.button(
-        "✏️ Edit YAML",
-        use_container_width=True,
-        help=f"Open conf/{task.path.name} in VSCode on this machine.",
+    by_name = {t.name: t for t in tasks}
+    selected = st.selectbox(
+        "Task", list(by_name),
+        help="Manipulation task from conf/task — instruction, dataset, episode counts.",
+    )
+    task = by_name[selected]
+
+    edit_cols = st.columns(2)
+    if edit_cols[0].button(
+        "✏️ Task YAML", use_container_width=True,
+        help=f"Open conf/task/{task.path.name} in VSCode on this machine.",
     ):
         result = open_in_vscode(task.path)
-        if result.ok:
-            st.toast(result.message, icon="📝")
-        else:
-            st.warning(result.message)
+        st.toast(result.message, icon="📝") if result.ok else st.warning(result.message)
+    if edit_cols[1].button(
+        "✏️ Rig YAML", use_container_width=True,
+        help=f"Open conf/rig/{rig.path.name} in VSCode on this machine.",
+    ):
+        result = open_in_vscode(rig.path)
+        st.toast(result.message, icon="📝") if result.ok else st.warning(result.message)
 
-    active = registry.active()
-    running = active is not None
+    # Launchable only from VIEWING with every rig camera streaming (the daemon
+    # refuses otherwise; disabling here just makes that visible up front).
+    launchable = view.state == "viewing" and not view.cameras_down
 
     launch_cols = st.columns(2)
     if launch_cols[0].button(
-        "▶ Collection", use_container_width=True, disabled=running,
-        help="Teleoperated demonstration gathering.",
+        "▶ Collection", use_container_width=True, disabled=not launchable,
+        help="Teleoperated demonstration gathering (real recording run).",
     ):
-        _launch(registry, task, "collection")
+        _launch(registry, task, "collection", rig_name)
     if launch_cols[1].button(
-        "▶ Eval", type="primary", use_container_width=True, disabled=running,
-        help="Online policy rollouts.",
+        "▶ Eval", type="primary", use_container_width=True, disabled=not launchable,
+        help="Online policy rollout (needs the policy server reachable).",
     ):
-        _launch(registry, task, "eval")
+        _launch(registry, task, "eval", rig_name)
 
     st.caption("Each launch runs a single episode.")
 
-    if running:
+    if view.run_active:
         st.caption("A run is active — stop it before launching another.")
+    elif view.state == "starting":
+        st.caption("Session starting — arms and cameras coming up…")
+    elif view.state == "down":
+        st.caption("Session daemon is not running — see the Logs tab or Reset services.")
 
     st.divider()
     _render_status(registry)
@@ -185,6 +244,8 @@ def _render_arm_row(s: ArmStatus) -> None:
     connected = s.source == "live"
     dot = "🟢" if connected else "⚫"
     mode = s.mode if connected else f":gray[{s.mode}]"
+    if s.control_active:
+        mode += " · :orange[controlling]"
     if s.estop_pressed:
         estop = ":red[🛑 **E-STOP PRESSED**]"
     elif s.estop_pressed is False:
@@ -196,15 +257,44 @@ def _render_arm_row(s: ArmStatus) -> None:
 
 @st.fragment(run_every="2s")
 def _arm_status_rows() -> None:
-    """Two read-only per-arm rows (operation mode + E-stop), refreshed periodically."""
-    for arm in discover_arms():
+    """Read-only per-arm rows (operation mode + E-stop), refreshed periodically."""
+    try:
+        arms = discover_arms()
+    except Exception as exc:  # noqa: BLE001 - broken rig conf -> compact, visible note
+        st.warning(f"Arm config failed to compose: {exc}", icon="🛠️")
+        return
+    for arm in arms:
         _render_arm_row(read_arm_status(arm))
 
 
-def _launch(registry: _runner.RunRegistry, task: TaskInfo, phase: str) -> None:
+def _render_camera_row(s: CameraStatus) -> None:
+    dot = "🟢" if s.detected else "⚫"
+    if s.detected:
+        detail = f":green[detected] · {', '.join(s.live_views)}"
+    else:
+        detail = ":gray[no signal]"
+    st.markdown(f"{dot} **{s.camera}**  \n{detail}")
+
+
+@st.fragment(run_every="2s")
+def _camera_status_rows() -> None:
+    """Per-camera detection rows (live shm streams), refreshed periodically."""
+    try:
+        statuses = read_camera_statuses()
+    except Exception as exc:  # noqa: BLE001 - broken camera conf -> compact, visible note
+        st.warning(f"Camera config failed to compose: {exc}", icon="🛠️")
+        return
+    if not statuses:
+        st.caption(":gray[No cameras configured.]")
+        return
+    for s in statuses:
+        _render_camera_row(s)
+
+
+def _launch(registry: _runner.RunRegistry, task: TaskInfo, phase: str, rig: str) -> None:
     """Launch a run, surfacing a refused launch (e.g. one is still saving) inline."""
     try:
-        registry.launch(task, phase)
+        registry.launch(task, phase, rig)
     except RuntimeError as exc:
         st.error(str(exc), icon="⚠️")
         return
@@ -251,11 +341,38 @@ def _run_status_panel(registry: _runner.RunRegistry) -> None:
     if alert is not None:
         st.session_state["run_alert"] = alert
         st.rerun(scope="app")
+    view = registry.session_view()
+    # The launch buttons/rig lock live OUTSIDE this fragment; when the session's
+    # mode changes (starting→viewing, viewing→collection, …) rerun the whole app
+    # so they follow without a user interaction.
+    prev = st.session_state.get("_session_state_seen")
+    if prev != view.state:
+        st.session_state["_session_state_seen"] = view.state
+        if prev is not None:
+            st.rerun(scope="app")
+    if view.message:
+        st.warning(view.message, icon="⚠️")
     active = registry.active()
     if active is None:
-        st.info("No run active. Pick a task and launch.")
+        if view.state == "viewing":
+            st.info("👁 **Viewing** — arms live, read-only. Pick a task and launch.")
+            if view.cameras_down:
+                st.warning(
+                    "Waiting on camera(s): **" + ", ".join(view.cameras_down) + "** — "
+                    "retried automatically; launches are disabled until every rig "
+                    "camera streams (replug/fix, or pick a rig without it).",
+                    icon="📷",
+                )
+        elif view.state == "starting":
+            st.info("⏳ Session starting — arms and cameras coming up…")
+        else:  # down (view.message above says why / whether it is retrying)
+            st.error("Session daemon is not running.", icon="🛑")
+            tail = registry.manager.log_tail()
+            if tail:
+                with st.expander("Session daemon log (tail)"):
+                    st.code(tail, language="text")
         return
-    st.success(f"**{active.phase.upper()}** · {active.task}")
+    st.success(f"**{active.phase.upper()}** · {active.task} · rig `{active.rig}`")
     st.caption(f"run `{active.run_id}` · started {active.started_wall}")
     stopping = active.status == "stopping"
     cs = registry.collection_status()
@@ -283,7 +400,10 @@ def _run_status_panel(registry: _runner.RunRegistry) -> None:
 
 def _render_status(registry: _runner.RunRegistry) -> None:
     st.subheader("Status")
+    st.caption("Arms")
     _arm_status_rows()
+    st.caption("Cameras")
+    _camera_status_rows()
     st.divider()
     _run_status_panel(registry)
 
@@ -301,13 +421,68 @@ def _render_status(registry: _runner.RunRegistry) -> None:
         "🔄 Reset services",
         use_container_width=True,
         help=(
-            "Stop any active run and restart connections: closes the live arm / "
-            "FACTR links, reloads config from conf, and returns the viewers to idle."
+            "Restart the session daemon (fresh arm/camera connections), reload "
+            "config from conf, and return the viewers to idle. Stop any active "
+            "run first."
         ),
     ):
-        _reset_services(registry)
-        st.toast("Services reset — connections restarted.", icon="🔄")
+        if _reset_services(registry):
+            st.toast("Services reset — session restarted.", icon="🔄")
+        else:
+            st.warning("A run is active — stop it before resetting services.", icon="⚠️")
         st.rerun()
+
+
+def _render_logs_tab() -> None:
+    """Browse the flexiv control system's per-run logs (Hydra ``outputs/*/system.log``).
+
+    Lists every run's log newest-first, tails the selected one (bounded read), and
+    — while *Follow* is on — auto-refreshes so a live run streams in. The picker and
+    controls are rendered here; only :func:`_log_tail_view` reruns on the follow tick.
+    """
+    files = _logs.discover_logs()
+    top = st.columns([3, 1])
+    if top[1].button("🔄 Refresh", use_container_width=True,
+                     help="Re-scan the outputs directory for run logs."):
+        st.rerun()
+    if not files:
+        st.info(
+            f"No run logs found under `{_logs.outputs_root()}`. Launch a run "
+            "(or run `dual-flexiv-control` from the CLI) and they'll appear here."
+        )
+        return
+
+    by_name = {f"{f.name}  ·  {_logs.human_size(f.size_bytes)}": f for f in files}
+    label = top[0].selectbox(
+        "Run log", list(by_name), key="log_sel",
+        help="One log per dual-flexiv-control run (Hydra outputs/<timestamp>/system.log).",
+    )
+    selected = by_name[label]
+    st.caption(f"`{selected.path}`")
+    follow = st.checkbox(
+        "Follow (auto-refresh tail)", value=True, key="log_follow",
+        help="Re-read the tail every 2s so a running system's log streams live.",
+    )
+    _log_tail_view(selected.path, follow)
+
+
+def _render_log_code(path) -> None:
+    # Fixed-height container -> the full tail scrolls inside a capped box.
+    with st.container(height=600):
+        st.code(_logs.read_tail(path), language="text")
+
+
+@st.fragment(run_every=LOG_REFRESH)
+def _log_tail_view_following(path) -> None:
+    _render_log_code(path)
+
+
+def _log_tail_view(path, follow: bool) -> None:
+    """Render the log tail, auto-refreshing only when ``follow`` is on."""
+    if follow:
+        _log_tail_view_following(path)
+    else:
+        _render_log_code(path)
 
 
 def _render_camera_tab(views: list[CameraView]) -> None:
@@ -324,15 +499,27 @@ def _render_camera_tab(views: list[CameraView]) -> None:
 
 @st.fragment(run_every=CAMERA_REFRESH)
 def _camera_feed(by_key: dict[str, CameraView]) -> None:
-    """Auto-refreshing image for the selected camera (only this fragment reruns)."""
+    """Auto-refreshing image for the selected camera (only this fragment reruns).
+
+    A camera that is not producing reads as **missing** (nothing is fabricated), so
+    it is surfaced as an error rather than an animated placeholder.
+    """
     key = st.session_state.get("camera_key") or next(iter(by_key))
     view = by_key.get(key)
     if view is None:
         return
     frame, source = get_frame(view)
+    if source != "live" or frame is None:
+        st.error(
+            f"No live frame for `{view.key}` — this camera is not producing. "
+            "The session streams cameras continuously; check the camera / ZED "
+            "connection (or whether the session is up).",
+            icon="⚠️",
+        )
+        st.caption(f"`{view.key}` · {view.width}×{view.height} · ⚫ no signal")
+        return
     st.image(frame, width="stretch")
-    badge = "🟢 live" if source == "live" else "⚪ placeholder"
-    st.caption(f"`{view.key}` · {view.width}×{view.height} · {badge}")
+    st.caption(f"`{view.key}` · {view.width}×{view.height} · 🟢 live")
 
 
 @st.fragment(run_every="0.5s")
@@ -595,6 +782,20 @@ def _render_replay_panel(ds) -> None:
     st.iframe(_browser_url(viewer.web_url), height=VIEWER_HEIGHT_PX)
 
 
+def _sync_rig() -> None:
+    """Pin every dashboard compose (arms/cameras/storage) to the selected rig.
+
+    Runs before any discovery in :func:`main`, so a rig change made in the
+    selectbox (which triggers a full rerun) takes effect on the same pass —
+    the arm-status rows, camera tab, and storage root all follow.
+    """
+    rig = st.session_state.get("rig_name")
+    if rig and rig != _arms.active_rig():
+        _arms.set_active_rig(rig)
+        _cameras.reset()
+        _storage.reset()
+
+
 def main() -> None:
     st.set_page_config(
         page_title="dual-flexiv experiments", page_icon="🤖", layout="wide"
@@ -603,15 +804,43 @@ def main() -> None:
     servers = _servers()
     registry = _registry()
     _show_run_alert()
-    tasks = discover_launchables()
-    cameras = discover_camera_views()
+    tasks = discover_tasks()
+    rigs = discover_rigs()
+    # Seed the rig BEFORE the first session spawn, so the daemon starts on the same
+    # rig the selectbox will show (otherwise the first selectbox render would flip
+    # the rig and needlessly restart a just-spawned daemon).
+    if "rig_name" not in st.session_state and rigs:
+        names = [r.name for r in rigs]
+        st.session_state["rig_name"] = "bimanual" if "bimanual" in names else names[0]
+    _sync_rig()
+    # The session daemon runs for the dashboard's lifespan: spawn it now (no-op when
+    # already matching), restart it when the rig or runtime.sim changed.
+    try:
+        registry.ensure_session(_arms.active_rig(), _arms.runtime_is_sim())
+    except Exception as exc:  # noqa: BLE001 - a broken conf must not kill the page
+        st.error(f"Session daemon failed to start: {exc}", icon="🛑")
+    # A rig YAML edit can break composition (e.g. a camera left in `defaults` but
+    # removed from the inline block -> MISSING placement). That must surface as a
+    # banner the operator can act on — never a dead page with the error in a log.
+    try:
+        cameras = discover_camera_views()
+        compose_error = None
+    except Exception as exc:  # noqa: BLE001 - broken conf must stay visible + recoverable
+        cameras = []
+        rig = _arms.active_rig() or "(default)"
+        compose_error = (
+            f"Config for rig `{rig}` failed to compose — fix its YAML in `conf/rig/` "
+            f"(or pick another rig) and reload.\n\n```\n{exc}\n```"
+        )
+    if compose_error:
+        st.error(compose_error, icon="🛠️")
 
     controls, panel = st.columns([1, 3], gap="large")
     with controls:
-        _render_controls(tasks, registry)
+        _render_controls(tasks, rigs, registry)
     with panel:
-        tab_metrics, tab_camera, tab_storage = st.tabs(
-            ["📊 Metrics", "📷 Camera", "💾 Storage"]
+        tab_metrics, tab_camera, tab_storage, tab_logs = st.tabs(
+            ["📊 Metrics", "📷 Camera", "💾 Storage", "📜 Logs"]
         )
         with tab_metrics:
             # The robot 3D scene now shares this viewer's left panel (it replaced the
@@ -646,6 +875,12 @@ def main() -> None:
                 "individually or in bulk."
             )
             _render_storage_tab(registry)
+        with tab_logs:
+            st.caption(
+                "Per-run flexiv control logs (Hydra `outputs/<timestamp>/system.log`) "
+                "— pick a run, follow the tail live, or read a past run's output."
+            )
+            _render_logs_tab()
 
 
 main()

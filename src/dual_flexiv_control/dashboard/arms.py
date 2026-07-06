@@ -24,8 +24,11 @@ import numpy as np
 
 SIDES = ("left", "right")
 
-#: Per-arm status stream: a 2-vector ``[operational_status_code, estop_pressed]``.
-#: ``operational_status_code`` is ``flexivrdk.OperationalStatus(...).value``.
+#: Per-arm status stream: ``[operational_status_code, estop_pressed, control_active]``.
+#: ``operational_status_code`` is ``flexivrdk.OperationalStatus(...).value``;
+#: ``control_active`` is 1.0 while the arm is inside a control session (a
+#: collection/eval run) and 0.0 while idle (viewing). Older 2-wide streams (no
+#: ``control_active``) are tolerated.
 STATUS_STREAM = "{side}/status"
 
 #: Per-arm measured joint-position stream (published by ``FlexivInterface`` as
@@ -69,7 +72,8 @@ class ArmStatus:
     info: ArmInfo
     mode: str  # friendly operation-mode label
     estop_pressed: bool | None  # None = unknown
-    source: str  # "live" | "placeholder"
+    source: str  # "live" | "disconnected"
+    control_active: bool | None = None  # in a control session? None = unknown/old stream
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +84,37 @@ _LOCK = threading.Lock()
 #: Cached single compose of the bits the dashboard needs: arms, sim flag, FACTR cfg,
 #: per-side leader→Rizon joint conventions.
 _SNAPSHOT: tuple[tuple[ArmInfo, ...], bool, object, dict] | None = None
+#: The rig the dashboard composes against (``rig=<name>`` override); None = the
+#: config default. Owned here so every dashboard compose (arms, cameras, storage)
+#: follows the same selection.
+_ACTIVE_RIG: str | None = None
+
+
+def set_active_rig(rig: str | None) -> None:
+    """Select the rig every dashboard compose uses; drops the cached snapshot.
+
+    The dashboard's Rig dropdown calls this on change; ``cameras.reset()`` /
+    ``storage.reset()`` must be called alongside so their composes follow too.
+    """
+    global _ACTIVE_RIG, _SNAPSHOT
+    with _LOCK:
+        _ACTIVE_RIG = rig
+        _SNAPSHOT = None
+
+
+def active_rig() -> str | None:
+    """The rig name dashboard composes are pinned to, or None for the default.
+
+    Lock-free read (atomic in CPython) — called from inside :func:`_compose`,
+    which already holds the non-reentrant ``_LOCK``.
+    """
+    return _ACTIVE_RIG
+
+
+def compose_overrides() -> list[str]:
+    """The Hydra overrides every dashboard compose should apply (the rig pin)."""
+    rig = active_rig()
+    return [f"rig={rig}"] if rig else []
 
 
 def discover_arms() -> list[ArmInfo]:
@@ -150,7 +185,7 @@ def _compose_uncached() -> tuple[tuple[ArmInfo, ...], bool, object, dict]:
     register_configs()
     GlobalHydra.instance().clear()
     with initialize_config_module(version_base=None, config_module="dual_flexiv_control.conf"):
-        cfg = compose(config_name="config")
+        cfg = compose(config_name="config", overrides=compose_overrides())
 
     arms: list[ArmInfo] = []
     conventions: dict = {}
@@ -185,8 +220,11 @@ def read_arm_status(arm: ArmInfo, runtime_dir: str | None = None) -> ArmStatus:
     """
     live = _read_live_status(arm, runtime_dir)
     if live is not None:
-        code, estop = live
-        return ArmStatus(arm, _label_for_code(code), bool(estop), "live")
+        code, estop, control = live
+        return ArmStatus(
+            arm, _label_for_code(code), bool(estop), "live",
+            control_active=None if control is None else bool(control),
+        )
     return ArmStatus(arm, mode="disconnected", estop_pressed=None, source="disconnected")
 
 
@@ -210,7 +248,7 @@ def _read_live_stream_newest(stream: str, runtime_dir: str | None) -> np.ndarray
     try:
         from dual_flexiv_control.streams import StreamReader
         from dual_flexiv_control.streams import StreamRegistry
-    except Exception:  # noqa: BLE001 - streams stack unavailable -> placeholder
+    except Exception:  # noqa: BLE001 - streams stack unavailable -> no live data
         return None
 
     run_dirs = sorted(
@@ -235,11 +273,14 @@ def _read_live_stream_newest(stream: str, runtime_dir: str | None) -> np.ndarray
     return None
 
 
-def _read_live_status(arm: ArmInfo, runtime_dir: str | None) -> tuple[float, float] | None:
+def _read_live_status(
+    arm: ArmInfo, runtime_dir: str | None
+) -> tuple[float, float, float | None] | None:
     vec = _read_live_stream_newest(STATUS_STREAM.format(side=arm.side), runtime_dir)
     if vec is None or len(vec) < 2:
         return None
-    return float(vec[0]), float(vec[1])
+    control = float(vec[2]) if len(vec) >= 3 else None  # 2-wide: pre-session stream
+    return float(vec[0]), float(vec[1]), control
 
 
 def read_live_joint_positions(side: str, runtime_dir: str | None = None) -> np.ndarray | None:

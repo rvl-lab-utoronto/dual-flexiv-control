@@ -95,14 +95,15 @@ def _build_dataset(root, repo_id, n_episodes, frames_per_ep):
     GlobalHydra.instance().clear()
     with initialize_config_module(config_module="dual_flexiv_control.conf", version_base=None):
         cfg = compose(config_name="config", overrides=[
+            "rig=bimanual",  # wrist_left exists only on the full rig
             "cameras.wrist_left.width=32", "cameras.wrist_left.height=24",
-            f"task.collection.root={root}", f"task.collection.repo_id={repo_id}",
+            f"recording.root={root}", f"task.collection.repo_id={repo_id}",
             "task.collection.frequency_hz=15",
         ])
     c = OmegaConf.to_object(cfg)
     c.cameras = {"wrist_left": c.cameras["wrist_left"]}  # single tiny cam
     b = FrameBuilder(c.arms, ["left"], c.cameras, c.task.language_instruction,
-                     c.task.collection.state_signals, video=True)
+                     c.task.state_signals, video=True)
 
     def smp(v, dt=np.float64):
         return Samples(data=np.asarray(v, dt).reshape(1, -1),
@@ -115,7 +116,7 @@ def _build_dataset(root, repo_id, n_episodes, frames_per_ep):
         o["cam/wrist_left/left"] = smp((np.arange(dim) % 256).astype(np.uint8), np.uint8)
         return o
 
-    rec = LeRobotRecorder(c.task.collection, b.features())
+    rec = LeRobotRecorder(c.task.collection, c.recording, b.features())
     for ep in range(n_episodes):
         for i in range(frames_per_ep):
             rec.add_frame(b.build(obs(), {"left": 0.01 * i * np.ones(7)}, {"left": 0.1 * ep}))

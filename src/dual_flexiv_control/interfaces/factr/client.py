@@ -183,6 +183,29 @@ class FactrClient:
         """One leader's joint positions (queries only that leader's server)."""
         return self._servers[side].get_joint_positions()
 
+    def preflight(self) -> None:
+        """Probe every configured leader once; raise if any is unreachable.
+
+        A launch-time check so a missing teleop leader fails fast with a clear,
+        aggregated error (which the collection node re-raises as a non-zero exit, and
+        the dashboard surfaces as an error popup) instead of the collection loop
+        silently holding stale/zero actions for the whole recording. In ``sim`` mode
+        every server fabricates positions, so this always passes (no hardware
+        expected). Requires **all** configured servers to respond — a bimanual rig
+        needs both leaders up; the shipped ``left_only`` default needs just the one.
+        """
+        failures: list[str] = []
+        for side, client in self._servers.items():
+            try:
+                client.get_joint_positions()
+            except FactrError as exc:
+                failures.append(f"{side} @ {client.url}: {exc}")
+        if failures:
+            raise FactrError(
+                "FACTR teleop preflight failed — leader(s) not reachable: "
+                + "; ".join(failures)
+            )
+
     def server(self, side: str) -> FactrServerClient:
         """The underlying per-leader client (e.g. for diagnostics/tests)."""
         return self._servers[side]

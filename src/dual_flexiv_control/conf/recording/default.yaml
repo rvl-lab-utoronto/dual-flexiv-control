@@ -1,0 +1,16 @@
+defaults:
+  - base_recording
+  - _self_
+
+# Dataset-export machinery (how LeRobot episodes are written) — run-wide, not
+# per-task. A rig may override `root` to quarantine its output (see rig/bench.yaml).
+# All values here restate the schema defaults (configs.py RecordingCfg) for
+# operator visibility; tune freely.
+root: datasets              # dataset tree, resolved absolute against the launch cwd
+video: true                 # camera views as MP4 (false => PNG frames)
+streaming_encoding: true    # encode in real time as frames arrive
+image_writer_processes: 0   # async writer subprocesses (0 => threads only)
+image_writer_threads: 4     # async writer threads per camera
+push_to_hub: false          # push to the Hugging Face Hub after each episode
+resume: true                # append to an existing dataset instead of failing
+keyboard: true              # tty keys end/discard/stop episodes (auto-off sans tty)

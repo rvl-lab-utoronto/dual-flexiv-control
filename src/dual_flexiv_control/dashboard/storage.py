@@ -1,7 +1,7 @@
 """Recorded-episode storage: discover LeRobot datasets and delete episodes.
 
 Backs the dashboard's **Storage** tab. Collection writes demonstrations as
-LeRobot datasets under ``task.collection.root`` (one folder per ``repo_id``,
+LeRobot datasets under ``recording.root`` (one folder per ``repo_id``,
 possibly namespaced, e.g. ``dfc/pick``). This module:
 
 * finds every dataset under that root (any folder with a ``meta/info.json``),
@@ -105,10 +105,12 @@ def _compose_root() -> str:
 
     from dual_flexiv_control.configs import register_configs
 
+    from .arms import compose_overrides
+
     register_configs()
     GlobalHydra.instance().clear()
     with initialize_config_module(version_base=None, config_module="dual_flexiv_control.conf"):
-        cfg = compose(config_name="config")
+        cfg = compose(config_name="config", overrides=compose_overrides())
     root = str(cfg.recording.root)
     return os.path.abspath(root)
 
