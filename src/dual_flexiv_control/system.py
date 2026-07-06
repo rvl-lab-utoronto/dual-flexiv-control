@@ -4,12 +4,12 @@ Topology for the bimanual setup::
 
     FlexivInterface(left)   --\
     FlexivInterface(right)  ---\  shared-memory streams   /-- BrainNode (reads all)
-    ZedInterface(wrist_left) --->                         \-- (+ on-request FACTR client)
-    ZedInterface(wrist_right) -/
-    ZedInterface(static)    --/
+    CameraInterface(wrist_left) --->                      \-- (+ on-request FACTR client)
+    CameraInterface(wrist_right) -/
+    CameraInterface(static)    --/
 
-One process per arm (proprio) and one per ZED camera (frames). FACTR is not a
-spawned node: the brain holds a ``FactrClient`` and queries the FACTR server's
+One process per arm (proprio) and one per camera (frames). FACTR is not a spawned
+node: the brain holds a ``FactrClient`` and queries the FACTR server's
 joint-position endpoint on demand.
 
 All nodes run as **spawned** processes sharing a single stop ``Event``. The
@@ -39,7 +39,7 @@ from .brain import default_stream_names
 from .configs import Config
 from .configs import register_configs
 from .interfaces.flexiv import FlexivInterface
-from .interfaces.zed import ZedInterface
+from .interfaces.camera import CameraInterface
 from .process import ProcessNode
 from .process import run_node
 from .streams.registry import cleanup_run
@@ -78,7 +78,7 @@ def build_nodes(config: Config, run_id: str) -> list[ProcessNode]:
         for side, arm in config.arms.items()
     ]
     nodes += [
-        ZedInterface(name, cam, config.runtime, run_id)
+        CameraInterface(name, cam, config.runtime, run_id)
         for name, cam in config.cameras.items()
     ]
     stream_names = config.brain.subscribe or default_stream_names(config.arms)

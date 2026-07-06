@@ -278,7 +278,7 @@ class ArmCfg:
 
 @dataclass
 class CameraCfg:
-    """One ZED camera publishing image streams (one process per camera).
+    """One camera publishing image streams (one process per camera).
 
     A camera publishes one stream per entry in ``views`` — canonical view names
     (see :mod:`dual_flexiv_control.cameras`): ``left``/``right`` RGB (uint8,
@@ -287,13 +287,18 @@ class CameraCfg:
     hand-computed. Streams are named ``"cam/<name>/<view>"`` where ``<name>`` is
     the camera's key in :attr:`Config.cameras` (e.g. ``cam/wrist_left/left``).
 
-    ``resolution`` is the ZED SDK ``sl.RESOLUTION`` enum name handed to the real
-    camera; ``width``/``height`` must be what that resolution yields (the real
-    source validates this at open and fails fast on mismatch). Valid enums are
-    model-specific — ZED 2: HD2K/HD1080/HD720/VGA; ZED X (Nano): HD1200/HD1080/
-    SVGA — confirm against your installed SDK.
+    ``source`` selects where frames come from. ``zed`` opens real ZED hardware
+    through ``pyzed`` (or the fake source when ``runtime.sim=true``), while
+    ``isaac_sim`` will attach to frames published by the Isaac bridge app.
+
+    For ZED cameras, ``resolution`` is the SDK ``sl.RESOLUTION`` enum name handed
+    to the real camera; ``width``/``height`` must be what that resolution yields
+    (the real source validates this at open and fails fast on mismatch). Valid
+    enums are model-specific — ZED 2: HD2K/HD1080/HD720/VGA; ZED X (Nano):
+    HD1200/HD1080/SVGA — confirm against your installed SDK.
     """
 
+    source: str = "zed"            # zed | isaac_sim | fake
     model: str = MISSING          # "zed2" | "zedx_nano" (informational; SDK auto-detects)
     serial: str = ""              # ZED serial number (numeric); "" => first available
     placement: str = MISSING      # "wrist_left" | "wrist_right" | "static"

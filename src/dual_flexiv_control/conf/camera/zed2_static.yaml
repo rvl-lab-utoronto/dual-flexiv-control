@@ -9,6 +9,7 @@ defaults:
 # NOTE: ZED 2 resolutions are HD2K(2208x1242) / HD1080(1920x1080) /
 # HD720(1280x720) / VGA(672x376). `width`/`height` MUST match `resolution` (the
 # real source validates this at open). Confirm exact enums/fps against your SDK.
+source: zed
 model: zed2
 resolution: HD720
 width: 1280

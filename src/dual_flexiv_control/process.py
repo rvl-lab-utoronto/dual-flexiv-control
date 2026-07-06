@@ -129,7 +129,12 @@ class StreamProducerNode(ProcessNode):
             while not stop_event.is_set():
                 sample = self.poll()
                 if sample:
-                    t_ns = time.monotonic_ns()  # one coherent stamp per tick
+                    t_ns = getattr(self, "_sample_t_ns", None)
+                    if t_ns is None:
+                        t_ns = time.monotonic_ns()  # one coherent stamp per tick
+                    else:
+                        t_ns = int(t_ns)
+                        self._sample_t_ns = None
                     for stream_name, vec in sample.items():
                         self._writers[stream_name].write(vec, t_ns)
                 rate.sleep()

@@ -1,0 +1,17 @@
+defaults:
+  - base_camera
+  - _self_
+
+# Camera frames published by the Isaac bridge app and consumed through
+# IsaacSimCameraSource. The source reads shaped frames from shared memory; the
+# generic CameraInterface still owns flattening and stream publication.
+source: isaac_sim
+# For Isaac Sim, `model` is the bridge camera name. The shared memory name is
+# `isaac_sim_camera_<model>`, matching the bridge app.
+model: camera_1
+width: 1280
+height: 720
+fps: 30.0
+depth_mode: NONE
+capacity: 16
+views: [left]

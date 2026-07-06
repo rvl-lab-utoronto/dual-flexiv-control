@@ -9,6 +9,7 @@ defaults:
 # NOTE: ZED X (Nano) resolutions are SVGA(960x600) / HD1080(1920x1080) /
 # HD1200(1920x1200). `width`/`height` MUST match `resolution` (the real source
 # validates this at open). Confirm exact enums/fps against your installed ZED SDK.
+source: zed
 model: zedx_nano
 resolution: SVGA
 width: 960
