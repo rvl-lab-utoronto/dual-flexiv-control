@@ -1,60 +1,29 @@
 # Main composed configuration for the bimanual Flexiv brain.
 #
+# Three orthogonal axes select a run:
+#   rig=<name>            what hardware exists (arms/cameras/FACTR + serials) — conf/rig
+#   task=<name>           what is being demonstrated/evaluated — conf/task
+#   runtime.phase=<p>     collection | eval
+#
 # Override anything from the CLI, Hydra-style, e.g.:
 #   dual-flexiv-control runtime.sim=true runtime.duration_s=10
-#   dual-flexiv-control arms.left.serial=Rizon4-AAA arms.right.serial=Rizon4-BBB
+#   dual-flexiv-control rig=bench runtime.phase=collection
 #   dual-flexiv-control control@arms.left.control=force brain.rate_hz=200
 #   dual-flexiv-control task=handover task.eval.num_timesteps=800
 defaults:
   - base_config            # structured schema (ConfigStore) -> validates everything below
   - runtime: default
   - brain: default
-  - factr: bimanual
+  - recording: default     # dataset-export machinery (root/encoders/writers)
   - task: default          # active manipulation task (switch with `task=<name>`)
   - policy: openpi         # eval policy-server client (used when runtime.phase=eval)
-  - arm@arms.left: flexiv   # the same arm template, placed at arms.left ...
-  - arm@arms.right: flexiv  # ... and arms.right
-  - control@arms.left.control: qpos    # each arm inherits its own, independently-tunable
-  - control@arms.right.control: qpos   # control schema (switch a mode here or via CLI)
-  - camera@cameras.wrist_left: zedx_wrist    # a ZED X Nano on each arm's wrist ...
-  - camera@cameras.wrist_right: zedx_wrist
-  - camera@cameras.static: zed2_static       # ... plus one static external ZED 2
+  - rig: left_only         # the hardware: arms/cameras/FACTR + serials (`rig=<name>`).
+                           # Defaults to the single-arm rig that matches the plugged-in
+                           # hardware (left Rizon + left FACTR leader on :5000), so a
+                           # collection run's launch-time preflight (every configured
+                           # leader must respond) is satisfiable. Use `rig=bimanual` once
+                           # the right leader (:5001) is served.
   - _self_                 # this file's values win over the groups above
-
-# Per-arm specifics (the template in arm/flexiv.yaml supplies everything else).
-arms:
-  left:
-    name: "Lauer"          # display name (dashboard); customize freely
-    serial: Rizon4s-062841
-    # FACTR serves the trailing gripper as un-normalized servo radians. To record
-    # the gripper action as a 0..1 fraction, measure the raw leader gripper value
-    # (radians) at the fully-open and fully-closed trigger and set both here (open→0,
-    # closed→1, clipped). Leave unset to record the raw radian value. Because the
-    # read-only FACTR publisher re-zeroes the gripper at startup, measure against a
-    # consistent startup pose. Example (replace with measured values):
-    # convention: { gripper_open: 0.0, gripper_closed: 1.2 }
-  right:
-    name: "Rogers"
-    serial: Rizon4s-062837
-    # convention: { gripper_open: 0.0, gripper_closed: 1.2 }   # measure per leader
-
-# Per-camera specifics (templates in camera/*.yaml supply the rest). Set `serial`
-# to each camera's real (numeric) ZED serial number to bind a process to a
-# specific device; "" opens the first available camera (fine for a single cam /
-# for sim, where serials are ignored). Set `auto_serial: true` to bind a camera
-# to whatever ZED is currently connected (overrides `serial`) — handy for the
-# static cam on a bench where only one ZED is plugged in; see CameraCfg.
-cameras:
-  wrist_left:
-    placement: wrist_left
-    serial: ""
-  wrist_right:
-    placement: wrist_right
-    serial: ""
-  static:
-    placement: static
-    serial: ""
-    auto_serial: true    # bind the static cam to the connected ZED's serial
 
 hydra:
   job:

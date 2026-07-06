@@ -57,6 +57,10 @@ _PED_TRANSLATION = (0.8881, -0.3835, -0.6457)  # plate-pair outer-face midpoint 
 MOUNT_SEP_M = 0.4447
 #: Each arm leans outward by 45° (rotation about world Y), matching its plate normal.
 MOUNT_TILT_RAD = math.pi / 4
+#: Each arm is bolted to its plate rotated 90° about the plate normal (matched
+#: against the real rig by eye). Composed after the outward tilt, i.e. a yaw in
+#: the arm's own base frame.
+MOUNT_YAW_RAD = math.pi / 2
 # _MOUNTS itself is defined below the quaternion helpers it needs.
 
 #: Skeleton styling (per arm), matching the metrics 3D-track colours.
@@ -173,19 +177,23 @@ def _quat_z_to(direction) -> tuple[float, float, float, float]:
 
 #: Arm mounts on the two 45°-outward plates (see the placement block above): each
 #: base sits at its plate's outer-face centre, tilted ``MOUNT_TILT_RAD`` outward
-#: about world Y so base +Z matches the plate normal. ``rot`` is the same rotation
-#: as ``quat_xyzw`` in matrix form (for numeric FK in :func:`fk_world_eef`).
+#: about world Y so base +Z matches the plate normal, then spun ``MOUNT_YAW_RAD``
+#: about that normal (the bolt orientation). ``rot`` is the same rotation as
+#: ``quat_xyzw`` in matrix form (for numeric FK in :func:`fk_world_eef`).
+def _mount(sep_sign: float, tilt: float) -> dict:
+    tilt_q = _quat_from_axis_angle((0.0, 1.0, 0.0), tilt)
+    yaw_q = _quat_from_axis_angle((0.0, 0.0, 1.0), MOUNT_YAW_RAD)
+    return {
+        "translation": (sep_sign * MOUNT_SEP_M / 2, 0.0, 0.0),
+        "quat_xyzw": _quat_mul(tilt_q, yaw_q),
+        "rot": _rot_from_axis_angle((0.0, 1.0, 0.0), tilt)
+        @ _rot_from_axis_angle((0.0, 0.0, 1.0), MOUNT_YAW_RAD),
+    }
+
+
 _MOUNTS = {
-    "left": {
-        "translation": (-MOUNT_SEP_M / 2, 0.0, 0.0),
-        "quat_xyzw": _quat_from_axis_angle((0.0, 1.0, 0.0), -MOUNT_TILT_RAD),
-        "rot": _rot_from_axis_angle((0.0, 1.0, 0.0), -MOUNT_TILT_RAD),
-    },
-    "right": {
-        "translation": (MOUNT_SEP_M / 2, 0.0, 0.0),
-        "quat_xyzw": _quat_from_axis_angle((0.0, 1.0, 0.0), MOUNT_TILT_RAD),
-        "rot": _rot_from_axis_angle((0.0, 1.0, 0.0), MOUNT_TILT_RAD),
-    },
+    "left": _mount(-1.0, -MOUNT_TILT_RAD),
+    "right": _mount(1.0, MOUNT_TILT_RAD),
 }
 
 
@@ -821,16 +829,6 @@ def clear_depth_points() -> None:
         )
 
 
-def relog_scene() -> None:
-    """Re-log the static robot scene at its idle home pose (no-op until attached).
-
-    Called by the dashboard's *Reset services* action to snap the arms back from
-    whatever live pose the last run left them at, on the existing metrics recording.
-    """
-    if _REC is not None:
-        log_scene(_REC)
-
-
 def robot_recording():
     """The metrics recording the robot scene is logged into (``None`` until
     :func:`attach` binds it).
@@ -872,3 +870,16 @@ def attach(rec=None):
             log_scene(rec)
         _REC = rec
         return _REC
+
+
+def reset() -> None:
+    """Forget the bound metrics recording so the next :func:`attach` rebinds.
+
+    Used by the dashboard's *Reset services* action after :func:`~.viewer.teardown`
+    drops the recording the scene was logged into; without this, :func:`attach`
+    would keep returning the stale (now dead) handle instead of binding the fresh
+    recording that the restarted servers install.
+    """
+    global _REC
+    with _LOCK:
+        _REC = None

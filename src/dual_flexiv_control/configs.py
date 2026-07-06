@@ -394,8 +394,8 @@ class JointConventionCfg:
     (see :func:`~dual_flexiv_control.control.normalize_gripper`).
     """
 
-    offsets_deg: List[float] = field(default_factory=lambda: [180.0, -90.0, 90.0, 90.0, 90.0, 180.0, -90.0])
-    sign_flip_joints: List[int] = field(default_factory=lambda: [3])
+    offsets_deg: List[float] = field(default_factory=lambda: [180.0, -90.0, -90.0, 90.0, 90.0, 180.0, -90.0])
+    sign_flip_joints: List[int] = field(default_factory=lambda: [1, 2, 3])
     wrap_deg: bool = True
     drop_trailing: int = 1
     gripper_open: Optional[float] = None       # raw FACTR gripper value [rad] mapped to normalized 0.0

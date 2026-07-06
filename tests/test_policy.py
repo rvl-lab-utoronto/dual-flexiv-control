@@ -26,9 +26,11 @@ from dual_flexiv_control.streams.ring import Samples
 
 
 def _config(*overrides: str):
+    # These fixtures exercise the full two-arm setup, so pin the bimanual rig (the
+    # shipped default is now the single-arm left_only — see conf/config.yaml).
     register_configs()
     with initialize_config_module(config_module="dual_flexiv_control.conf", version_base=None):
-        cfg = compose(config_name="config", overrides=list(overrides))
+        cfg = compose(config_name="config", overrides=["rig=bimanual", *overrides])
     return OmegaConf.to_object(cfg)
 
 
@@ -48,7 +50,7 @@ def _empty_samples(dtype=np.float64) -> Samples:
 def _observer(cfg) -> ObservationBuilder:
     return ObservationBuilder(
         cfg.arms, cfg.cameras,
-        cfg.task.language_instruction, cfg.task.collection.state_signals,
+        cfg.task.language_instruction, cfg.task.state_signals,
     )
 
 
@@ -77,7 +79,7 @@ def test_observation_matches_training_frame_schema():
     assert obs["task"] == cfg.task.language_instruction
     # Image keys are exactly what collection would record (schema parity).
     fb = FrameBuilder(cfg.arms, [], cfg.cameras,
-                      cfg.task.language_instruction, cfg.task.collection.state_signals)
+                      cfg.task.language_instruction, cfg.task.state_signals)
     assert ob.image_keys == fb.image_keys
     assert obs["observation.images.static_left"].shape == (720, 1280, 3)
 
@@ -110,7 +112,7 @@ def test_action_layout_matches_collection_action_schema():
     cfg = _config()
     layout = ActionLayout(cfg.arms, ["left", "right"])
     fb = FrameBuilder(cfg.arms, ["left", "right"], cfg.cameras,
-                      cfg.task.language_instruction, cfg.task.collection.state_signals)
+                      cfg.task.language_instruction, cfg.task.state_signals)
     assert layout.names == fb.action_names
     assert layout.dim == fb.action_dim == 16
 

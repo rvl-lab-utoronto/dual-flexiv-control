@@ -66,12 +66,13 @@ def _cfg_and_features(root, repo_id):
     GlobalHydra.instance().clear()
     with initialize_config_module(config_module="dual_flexiv_control.conf", version_base=None):
         cfg = OmegaConf.to_object(compose(config_name="config", overrides=[
+            "rig=bimanual",  # wrist_left exists only on the full rig
             "cameras.wrist_left.width=32", "cameras.wrist_left.height=24",
-            f"task.collection.root={root}", f"task.collection.repo_id={repo_id}",
+            f"recording.root={root}", f"task.collection.repo_id={repo_id}",
         ]))
     cfg.cameras = {"wrist_left": cfg.cameras["wrist_left"]}
     b = FrameBuilder(cfg.arms, list(cfg.arms), cfg.cameras, cfg.task.language_instruction,
-                     cfg.task.collection.state_signals, video=True)
+                     cfg.task.state_signals, video=True)
     return cfg, b
 
 
@@ -106,14 +107,14 @@ def test_recorder_recreates_corrupt_leftover_then_resumes(tmp_path):
         json.dump({"total_episodes": 0, "total_frames": 0, "fps": 15, "video_keys": []}, f)
 
     # create over the corrupt leftover (must not touch the Hub), record one episode
-    rec = LeRobotRecorder(coll, feats)
+    rec = LeRobotRecorder(coll, cfg.recording, feats)
     _record_episode(rec, builder, cfg, ep=0)
     rec.finalize()
     assert rec.dataset.meta.total_episodes == 1
 
     # resume the now-valid dataset and append a second episode (the path that used
     # to crash on the missing start_image_writer)
-    rec2 = LeRobotRecorder(coll, feats)
+    rec2 = LeRobotRecorder(coll, cfg.recording, feats)
     assert rec2.dataset.meta.total_episodes == 1
     _record_episode(rec2, builder, cfg, ep=1)
     rec2.finalize()

@@ -113,9 +113,16 @@ def factr_group(signal: str) -> str:
 
 
 def for_phase(phase: str, task_name: str | None = None) -> rrb.Blueprint:
-    """Blueprint for a single-episode run; both phases show proprio."""
-    if phase not in ("eval", "collection"):
-        raise ValueError(f"unknown phase {phase!r} (expected 'eval' or 'collection')")
+    """Blueprint for a session mode; runs and idle viewing all show live proprio.
+
+    ``viewing`` is the session's idle mode: the arms publish read-only telemetry
+    with no run active, so the same proprio grid applies (its rows simply follow
+    whatever the hardware is doing).
+    """
+    if phase not in ("eval", "collection", "viewing"):
+        raise ValueError(
+            f"unknown phase {phase!r} (expected 'eval', 'collection' or 'viewing')"
+        )
     return _proprio_blueprint(phase, task_name)
 
 

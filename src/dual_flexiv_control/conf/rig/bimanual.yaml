@@ -1,0 +1,48 @@
+# @package _global_
+# The full bimanual rig: two Flexiv Rizon 4s arms, two ZED X Nano wrist cameras,
+# one static ZED 2i, and both FACTR leaders. The default rig (`config.yaml`).
+#
+# A rig answers "what hardware exists": which arms/cameras/FACTR servers to spawn,
+# their serials and display names, and each arm's control mode. Switch rigs with
+# `rig=<name>` (CLI) or the dashboard's Rig selector.
+defaults:
+  - /arm@arms.left: flexiv
+  - /arm@arms.right: flexiv
+  - /control@arms.left.control: qpos
+  - /control@arms.right.control: qpos
+  - /camera@cameras.wrist_left: zedx_wrist
+  - /camera@cameras.wrist_right: zedx_wrist
+  - /camera@cameras.static: zed2_static
+  - /factr: bimanual
+  - _self_
+
+arms:
+  left:
+    name: "Lauer"          # display name (dashboard); customize freely
+    serial: Rizon4s-062841
+    # FACTR serves the trailing gripper as un-normalized servo radians. To record
+    # the gripper action as a 0..1 fraction, measure the raw leader gripper value
+    # (radians) at the fully-open and fully-closed trigger and set both here (open→0,
+    # closed→1, clipped) — see scripts/factr_gripper_calibrate.py. Because the
+    # read-only FACTR publisher re-zeroes the gripper at startup, measure against a
+    # consistent startup pose. Example (replace with measured values):
+    # convention: { gripper_open: 0.0, gripper_closed: 1.2 }
+  right:
+    name: "Rogers"
+    serial: Rizon4s-062837
+    # convention: { gripper_open: 0.0, gripper_closed: 1.2 }   # measure per leader
+
+# `serial` "" opens the first available camera; set each camera's real (numeric)
+# ZED serial to bind a process to a specific device. `auto_serial: true` binds to
+# whatever single ZED is connected (overrides `serial`).
+cameras:
+  wrist_left:
+    placement: wrist_left
+    serial: ""
+  wrist_right:
+    placement: wrist_right
+    serial: ""
+  static:
+    placement: static
+    serial: ""
+    auto_serial: true

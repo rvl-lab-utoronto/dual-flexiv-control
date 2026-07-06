@@ -23,3 +23,7 @@ multirun/
 
 # Large test fixtures (do not commit)
 rizon_tests.zip
+
+# Dataset videos over GitHub's 50 MB limit (kept locally, not in git)
+datasets/dfc/default/videos/observation.images.static_left/chunk-000/file-001.mp4
+datasets/dfc/default/videos/observation.images.static_right/chunk-000/file-001.mp4

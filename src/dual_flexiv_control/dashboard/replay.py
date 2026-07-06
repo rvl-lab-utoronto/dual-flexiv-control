@@ -12,16 +12,22 @@ FK posing and logs everything on that module's ``"elapsed"`` timeline so the 3D
 scene, the images, and the plots scrub together.
 
 **Each replay is its own Rerun recording** (fresh ``recording_id``, timeline from
-0), streamed to one persistent gRPC + web-viewer server. A fresh recording — rather
-than clearing and re-logging a reused one — is what actually isolates episodes: a
+0), streamed to a persistent gRPC data server. A fresh recording — rather than
+clearing and re-logging a reused one — is what actually isolates episodes: a
 time-scoped ``rr.Clear`` cannot retroactively purge a previous (longer) episode's
 per-frame rows, so replaying a shorter episode after a longer one would otherwise
 show the previous episode's tail. The per-arm ``q`` / action split is read from the
 dataset's **stored column names**, so replay reflects exactly what was recorded
 (robust to later config/control-kind changes), not the current config.
 
-The viewer is a single process-global server (like the metrics / robot viewers), so
-the replay tab is single-session.
+Replay has its **own gRPC data server** (so its recordings stay isolated from the
+live metrics stream) but **no web viewer of its own** — it is embedded in the single
+shared web-viewer host that :mod:`~.viewer` binds for the metrics tab, just pointed
+at this server via the iframe's ``?url=``. That deliberately avoids a second
+``serve_web_viewer``: rerun's web viewer cannot be stopped or rebound in-process, and
+binding a second one is what used to wedge on a rapid restart (black viewer needing a
+full process restart). The gRPC data server, by contrast, is torn down cleanly by
+:func:`~.viewer.teardown` and re-served on demand.
 """
 
 from __future__ import annotations
@@ -44,7 +50,6 @@ log = logging.getLogger(__name__)
 
 REPLAY_APP_ID = "dual-flexiv-replay"
 DEFAULT_REPLAY_GRPC_PORT = 9880
-DEFAULT_REPLAY_WEB_PORT = 9094
 
 #: Canonical camera-image key prefix in a LeRobot frame.
 _IMAGE_PREFIX = "observation.images."
@@ -258,7 +263,10 @@ def replay_blueprint(cam_names) -> rrb.Blueprint:
 
 @dataclass(frozen=True)
 class ReplayViewer:
+    #: The SHARED metrics web-viewer port (:mod:`~.viewer`); replay has no web host
+    #: of its own, it just embeds that viewer pointed at ``grpc_uri`` below.
     web_port: int
+    #: Replay's own gRPC data server, keeping its recordings isolated from metrics.
     grpc_uri: str
 
     @property
@@ -267,32 +275,47 @@ class ReplayViewer:
         return f"{base}/?url={quote(self.grpc_uri, safe='')}&persist=0"
 
 
-def ports_from_env() -> tuple[int, int]:
-    return (
-        int(os.environ.get("DFC_REPLAY_GRPC_PORT", DEFAULT_REPLAY_GRPC_PORT)),
-        int(os.environ.get("DFC_REPLAY_WEB_PORT", DEFAULT_REPLAY_WEB_PORT)),
-    )
+def grpc_port_from_env() -> int:
+    """Replay gRPC-server port, honouring the ``DFC_REPLAY_GRPC_PORT`` override."""
+    return int(os.environ.get("DFC_REPLAY_GRPC_PORT", DEFAULT_REPLAY_GRPC_PORT))
 
 
-def start_replay_viewer(grpc_port: int | None = None, web_port: int | None = None) -> ReplayViewer:
-    """Bring up the persistent replay gRPC + web viewer (idempotent per process).
+def start_replay_viewer(web_port: int, grpc_port: int | None = None) -> ReplayViewer:
+    """Bring up the replay gRPC data server, embedded in the SHARED web viewer.
 
-    A host recording owns the server; each :func:`log_episode` streams a fresh
-    per-episode recording to it via ``connect_grpc``.
+    ``web_port`` is the metrics web-viewer port (from :func:`~.viewer.start_servers`)
+    — replay reuses that single HTTP viewer host and serves only its own gRPC data
+    server here, so episodes stay isolated on their own recordings without a second
+    ``serve_web_viewer``. Idempotent while up; after :func:`reset` (paired with
+    :func:`~.viewer.teardown`) the next call re-serves a fresh gRPC server. A host
+    recording owns the server; each :func:`log_episode` streams a fresh per-episode
+    recording to it via ``connect_grpc``.
     """
     global _VIEWER, _HOST, _SERVER_URI
     with _LOCK:
         if _VIEWER is not None:
             return _VIEWER
-        gp, wp = ports_from_env()
-        grpc_port = grpc_port or gp
-        web_port = web_port or wp
+        gp = grpc_port or grpc_port_from_env()
         _HOST = rr.RecordingStream(REPLAY_APP_ID, recording_id="replay-host")
         _SERVER_URI = _HOST.serve_grpc(
-            grpc_port=grpc_port,
+            grpc_port=gp,
             default_blueprint=replay_blueprint([]),
             cors_allow_origin=["*"],
         )
-        rr.serve_web_viewer(web_port=web_port, open_browser=False, connect_to=_SERVER_URI)
         _VIEWER = ReplayViewer(web_port=web_port, grpc_uri=_SERVER_URI)
         return _VIEWER
+
+
+def reset() -> None:
+    """Drop the replay viewer singletons so the next replay re-serves its gRPC.
+
+    Paired with :func:`~.viewer.teardown` — that global ``rerun_shutdown`` releases
+    this gRPC port too, so after a *Reset services* the next ▶ rebinds a fresh replay
+    server (reusing the same shared web viewer).
+    """
+    global _VIEWER, _HOST, _SERVER_URI, _LAST_REC
+    with _LOCK:
+        _VIEWER = None
+        _HOST = None
+        _SERVER_URI = None
+        _LAST_REC = None

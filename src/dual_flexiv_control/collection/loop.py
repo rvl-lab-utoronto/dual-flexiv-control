@@ -248,6 +248,17 @@ class CollectionNode(ProcessNode):
         )
         registry = StreamRegistry(self.runtime.runtime_dir, self.run_id)
         factr = FactrClient.from_config(self.factr_cfg, sim=self.runtime.sim)
+        # Launch-time teleop preflight: every configured FACTR leader must respond
+        # before we start recording. A missing leader would otherwise be silently
+        # tolerated (the loop holds stale/zero actions), so fail fast with a clear
+        # error — it propagates as a non-zero exit and the dashboard surfaces it as an
+        # error popup. Cameras + arm proprio get the same fail-fast treatment for free
+        # via brain.attach() below (a stream that never publishes → TimeoutError).
+        try:
+            factr.preflight()
+        except FactrError:
+            factr.close()
+            raise
         brain = Brain(
             registry, builder.stream_names, self.brain_cfg.attach_timeout_s, factr=factr
         )
@@ -283,4 +294,7 @@ class CollectionNode(ProcessNode):
                 )
                 loop.run(stop_event)
         finally:
+            # Hand control back cleanly: STOP the arms (they exit their control
+            # session at once instead of riding the deadman), then unlink channels.
+            brain.stop_arms()
             brain.close()

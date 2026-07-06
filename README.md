@@ -96,38 +96,55 @@ pip install -e ".[dev]"                       # editable install + pytest
 
 Configuration is composed by [Hydra](https://hydra.cc) from
 [`conf/`](src/dual_flexiv_control/conf) and validated against the structured schema
-in [configs.py](src/dual_flexiv_control/configs.py). The tree is hierarchical along
-the stream paths:
+in [configs.py](src/dual_flexiv_control/configs.py). Three orthogonal axes select a
+run — **rig** (what hardware exists), **task** (what is demonstrated/evaluated),
+and **phase** (`runtime.phase=collection|eval`):
 
 ```
 conf/
-  config.yaml              # composes the groups below; per-arm serials
-  runtime/default.yaml     # sim, runtime_dir, duration_s
+  config.yaml              # tiny: composes the groups below (rig=bimanual, task=default, …)
+  rig/                     # WHAT HARDWARE EXISTS (select with `rig=<name>`):
+    bimanual.yaml          #   both arms + 3 ZEDs + both FACTR leaders (default)
+    left_only.yaml         #   left arm + static ZED + left leader
+    bench.yaml             #   dummy left arm + the one real ZED (bring-up/testing)
+  task/                    # WHAT IS DEMONSTRATED (select with `task=<name>`):
+    default.yaml  handover.yaml    # instruction + dataset (repo_id) + phase counts
+  recording/default.yaml   # dataset-export machinery (root, encoders, writer threads)
+  runtime/default.yaml     # sim, runtime_dir, duration_s, phase, save_grace_s
   brain/default.yaml       # rate, attach timeout, subscriptions
-  factr/bimanual.yaml      # FACTR server host/port/endpoint + factr/left,factr/right schemas
-  arm/flexiv.yaml          # per-arm: dof, wrench_frame, the 6 proprio stream schemas
-  camera/                  # per-camera templates (resolution, fps, views, capacity):
-    zedx_wrist.yaml  zed2_static.yaml
+  factr/                   # FACTR server sets (selected by the rig): bimanual / left
+  arm/                     # arm templates: flexiv (real), flexiv_dummy (fabricated)
+  camera/                  # camera templates: zedx_wrist, zed2_static
   control/                 # control-type library (command schemas, SDK-aligned):
-    qpos.yaml  qvel.yaml  end_effector.yaml  force.yaml
-  task/                    # one file per manipulation task (select with `task=<name>`):
-    default.yaml  handover.yaml
+    qpos.yaml  qvel.yaml  end_effector.yaml  eef_vel.yaml  force.yaml
+```
+
+A **rig** file carries the hardware composition — which `arm@arms.<side>` /
+`camera@cameras.<name>` / `factr` entries exist, their serials and display names —
+via Hydra's [experiment pattern](https://hydra.cc/docs/patterns/configuring_experiments/)
+(`# @package _global_` + absolute package-directed defaults). Bring-up on a bench
+with no robots is one override away:
+
+```bash
+dual-flexiv-control rig=bench runtime.phase=collection   # dummy arm + real ZED,
+                                                         # records to datasets/bench/
 ```
 
 Cameras compose just like arms: `camera@cameras.<name>: <template>` places a
-template at `cameras.<name>`, with per-camera `serial`/`placement` set in
-`config.yaml`. Override resolution/fps/views from the CLI, e.g.
+template at `cameras.<name>`, with per-camera `serial`/`placement` set in the rig
+file. Override resolution/fps/views from the CLI, e.g.
 `cameras.static.resolution=HD1080 cameras.static.width=1920 cameras.static.height=1080`
 or `'+cameras.static.views=[left,right,depth]' cameras.static.depth_mode=NEURAL`.
 Camera streams are produced unconditionally but are **not** in the brain's default
 subscription (proprio only); subscribe to them explicitly, e.g.
 `'brain.subscribe=[left/q, cam/static/left]'`.
 
-Each **task** carries one `language_instruction` shared by both phases, plus the
-counts unique to each phase — `collection.num_episodes` (demos to teleoperate) and
-`eval.num_timesteps` (rollout horizon). Add a task by copying `task/default.yaml`;
-select it with `task=<name>` and tune fields inline, e.g.
-`task=handover task.eval.num_timesteps=800`.
+Each **task** carries the `language_instruction` and `state_signals` shared by
+both phases, its LeRobot dataset (`collection.repo_id` — required, so tasks never
+silently share one), plus the counts unique to each phase —
+`collection.num_episodes` (demos to teleoperate) and `eval.num_timesteps` (rollout
+horizon). Add a task by copying `task/default.yaml`; select it with `task=<name>`
+and tune fields inline, e.g. `task=handover task.eval.num_timesteps=800`.
 
 Each stream's schema (`dim`, `dtype`, `capacity`, `rate_hz`) lives under its path,
 e.g. `arms.left.streams.tau` → stream `left/tau`. The **control configs** lay out
@@ -144,13 +161,17 @@ per tick (the rest are static limits from the coeffs). All paths are **NRT**
 | `eef_vel` | `NRT_CARTESIAN_MOTION_FORCE` | `SendCartesianMotionForce` | `twist_d` (arm integrates `pose_d`) |
 | `force` | `NRT_CARTESIAN_MOTION_FORCE` | `SendCartesianMotionForce` | `wrench_d`, `pose_d` |
 
-**Controller coefficients** (impedances + motion limits) are a *separate* importable
-group, `conf/control_coeffs/` (`default`/`compliant`/`stiff`), pulled into each task
-**per phase** — `task.collection.coeffs` (training) and `task.eval.coeffs` (eval) —
-so a task runs compliant during teleop collection and stiff during policy eval.
-`runtime.phase` (`collection`|`eval`) selects which set the arms apply. The arm
-applies, after `SwitchMode`, only the coeffs its mode accepts (e.g. cartesian
-impedance for the Cartesian kinds; `dq_max`/`ddq_max` for the joint kinds).
+**Controller coefficients** (impedances + motion limits) default per phase from
+the schema — `task.collection.coeffs` is **compliant** (soft teleop) and
+`task.eval.coeffs` is **stiff** (precise tracking). The named presets
+(`compliant`/`stiff`/`default`) are registered in
+[configs.py](src/dual_flexiv_control/configs.py) (single source of truth — no YAML
+files); swap one per phase with an appended group override, e.g.
+`'+control_coeffs@task.eval.coeffs=compliant'`, or tune fields directly
+(`task.eval.coeffs.max_joint_vel=2.0`). `runtime.phase` (`collection`|`eval`)
+selects which set the arms apply. The arm applies, after `SwitchMode`, only the
+coeffs its mode accepts (e.g. cartesian impedance for the Cartesian kinds;
+`dq_max`/`ddq_max` for the joint kinds).
 
 ### Teleoperation (FACTR → follower)
 
@@ -191,14 +212,35 @@ dual-flexiv-control --cfg job        # print the fully composed config and exit
 
 ## Dashboard
 
-A dark-mode [Rerun](https://rerun.io)-backed experiment dashboard. The **left
-column** drives experiments — pick a task from the `conf/task` group, ✏️ open its
-YAML in VSCode, then launch **Collection** (teleop demos) or **Eval** (policy
-rollouts). The **right area** is tabbed: **📊 Metrics** embeds a live Rerun web
-viewer holding the run's metrics; **📷 Camera** shows a live view of any camera
-stream (`cam/<camera>/<view>`, selected from a dropdown), reading frames from
-shared memory when the system is running and falling back to an animated
-placeholder otherwise.
+A dark-mode [Rerun](https://rerun.io)-backed experiment dashboard, coupled to a
+long-lived **session daemon** (`dfc-session`, `session.py`) that holds the rig
+for the dashboard's whole lifespan and runs a three-mode state machine:
+
+* **VIEWING** (default while stopped) — arms connected **read-only**, cameras
+  streaming; live status (operation mode, E-stop), proprio plots, and the 3D
+  scene all work with **no control of any kind**.
+* **COLLECTION** — FACTR teleop + LeRobot recording (the real `CollectionNode`).
+* **EVAL** — a real policy rollout (the real `EvalNode`).
+
+The dashboard spawns the daemon on startup and talks to it over JSON lines on
+stdin (`start`/`stop`/`shutdown`; stdin EOF = shutdown, so a dead dashboard can
+never orphan robot connections) and reads its state from
+`<runtime_dir>/session.json`. Per run, the daemon hands each control-enabled arm
+that phase's controller coefficients and spawns the consumer; when it exits the
+arms `Stop()` and drop back to read-only VIEWING — connections, streams, and
+cameras persist across runs, so runs start fast and status is always live.
+Supervision: an **arm** node dying is session-fatal; a **camera** node dying is
+not — it reads as down (launches are gated until every rig camera streams) and
+is respawned periodically, so a replugged/recovered camera rejoins on its own.
+
+The **left column** drives experiments — pick a **rig** (`conf/rig`) and a
+**task** (`conf/task`), ✏️ open either YAML in VSCode, then launch **Collection**
+or **Eval**. Switching the rig restarts the session onto that hardware set (and
+re-points the arm-status rows, camera tab, and storage root). The **right area**
+is tabbed: **📊 Metrics** embeds a live Rerun web viewer (live in every mode,
+including VIEWING); **📷 Camera** shows a live view of any camera stream
+(`cam/<camera>/<view>`, streaming continuously while the session is up);
+**💾 Storage** lists recorded episodes with replay and (bulk) delete.
 
 ```bash
 pip install -e ".[dashboard]"     # adds rerun-sdk + streamlit
@@ -213,23 +255,24 @@ viewer streams live over gRPC, so metrics update in the browser without a
 Streamlit rerun.
 
 ```
- ┌──────────────┬─[ 📊 Metrics ]─[ 📷 Camera ]──────┐
- │  Task: [▼]   │   ┌────────────┬───────────────┐  │
- │  ✏️ Edit YAML│   │  EEF 3D    │ x/y/z series  │  │   Metrics → eval: 3D EEF
- │  ▶ Collection│   │  tracking  │ reward/success│  │             collection: progress
- │  ▶ Eval      │   └────────────┴───────────────┘  │   Camera  → live cam/<cam>/<view>
- │  Running ▣   │   (cam tab: dropdown + live image) │
- └──────────────┴──────────────────────────────────┘
+ ┌──────────────┬─[ 📊 Metrics ]─[ 📷 Camera ]─[ 💾 Storage ]─┐
+ │  Rig:  [▼]   │   ┌────────────┬───────────────┐            │
+ │  Task: [▼]   │   │  3D robot  │ proprio series│            │  Metrics → live 3D scene + plots
+ │  ✏️ YAML  ✏️  │   │  scene     │ FACTR leaders │            │  Camera  → live cam/<cam>/<view>
+ │  ▶ Collection│   └────────────┴───────────────┘            │  Storage → episodes: ▶ replay, 🗑 delete
+ │  ▶ Eval      │                                             │
+ │  Running ▣   │                                             │
+ └──────────────┴─────────────────────────────────────────────┘
 ```
 
-**Status:** launching is a **stub** — it switches the viewer's blueprint and
-streams *synthetic placeholder* metrics (eval traces 3D end-effector paths for
-both arms; collection shows demo progress). The seam for the real run is marked
-in [`dashboard/runner.py`](src/dual_flexiv_control/dashboard/runner.py): the eval/
-collection process will spawn and `rr.connect_grpc` back to the dashboard's
-server, logging real telemetry to the same entity paths
-([`dashboard/blueprints.py`](src/dual_flexiv_control/dashboard/blueprints.py)) the
-placeholder uses — so the viewer needs no change when control lands.
+**Collection** and **Eval** run the real consumers inside the session; the
+Metrics tab mirrors live proprio/FACTR/3D-scene in every mode, and run outcomes
+surface as popups (episode saved / crash with log tail). Stop is asynchronous —
+the consumer gets `runtime.save_grace_s` to finalize the episode video while the
+arms return to VIEWING. The one-shot CLI (`dual-flexiv-control
+runtime.phase=collection|eval`) still works standalone, spawning and tearing
+down its own hardware nodes; the headless session daemon does too
+(`dfc-session rig=<r>`, commands on stdin).
 
 ## Use the brain API directly
 
@@ -260,13 +303,16 @@ src/dual_flexiv_control/
     factr/      backend.py (black-box skeleton) · interface.py
   brain/        brain.py (Brain + BrainNode)
   dashboard/    Streamlit control panel + embedded Rerun viewer:
-                app.py · tasks.py · blueprints.py · viewer.py · runner.py · launch.py
+                app.py · tasks.py · blueprints.py · viewer.py · runner.py ·
+                session.py (daemon client) · launch.py
   process.py    RateLimiter · ProcessNode · StreamProducerNode · run_node
   configs.py    structured config schema (StreamCfg, ArmCfg, CameraCfg, ControlCfg, …)
-  conf/         Hydra YAML tree (runtime/brain/factr/task/arm/camera/control groups)
+  conf/         Hydra YAML tree (rig/task/recording/runtime/brain/factr/arm/camera/control)
   proprio.py    Side · canonical signals · config→StreamSpec builder
   cameras.py    canonical camera views · config→StreamSpec builder · reshape_frame
-  system.py     Hydra @main orchestrator / console entry point
+  system.py     Hydra @main orchestrator / console entry point (one-shot runs)
+  session.py    session daemon (dfc-session): persistent hardware + the
+                VIEWING ↔ COLLECTION ↔ EVAL state machine the dashboard drives
 ```
 
 ## Status / TODO

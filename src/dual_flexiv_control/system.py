@@ -60,60 +60,82 @@ def make_run_id() -> str:
     return f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
 
 
-def build_nodes(config: Config, run_id: str) -> list[ProcessNode]:
-    """The set of spawned nodes for a run: one process per arm, one per camera, + the brain.
-
-    FACTR is not a node — it is an on-request HTTP client the brain holds. Camera
-    streams are produced unconditionally but are not in the brain's default
-    subscription (proprio only); subscribe to them via ``brain.subscribe`` (see
-    :func:`dual_flexiv_control.cameras.camera_stream_names`).
-    """
-    # Active-phase controller coefficients (collection vs eval) applied by every
-    # control-enabled arm; the brain posts setpoints, the arms apply these coeffs.
+def active_coeffs(config: Config):
+    """The selected phase's per-task controller coefficients (validates the phase)."""
     if config.runtime.phase not in ("collection", "eval"):
         raise ValueError(
             f"runtime.phase must be 'collection' or 'eval', got {config.runtime.phase!r}"
         )
-    active_coeffs = getattr(config.task, config.runtime.phase).coeffs
+    return getattr(config.task, config.runtime.phase).coeffs
 
+
+def build_hardware_nodes(
+    config: Config, run_id: str, session_qs: dict | None = None
+) -> list[ProcessNode]:
+    """The hardware producers: one process per arm, one per camera.
+
+    ``session_qs`` maps ``side -> mp.Queue`` for session-daemon hosting (arms idle
+    read-only and enter control per :class:`~.interfaces.flexiv.EnterControl`
+    message, with per-run coeffs). Without it (the one-shot CLI), each
+    control-enabled arm gets the active phase's coeffs at spawn and runs a single
+    control session.
+    """
+    coeffs = active_coeffs(config)
     nodes: list[ProcessNode] = [
-        FlexivInterface(side, arm, config.runtime, run_id, coeffs=active_coeffs)
+        FlexivInterface(
+            side,
+            arm,
+            config.runtime,
+            run_id,
+            coeffs=coeffs,
+            session_q=(session_qs or {}).get(side),
+        )
         for side, arm in config.arms.items()
     ]
     nodes += [
         ZedInterface(name, cam, config.runtime, run_id)
         for name, cam in config.cameras.items()
     ]
-    # The phase selects the consumer: collection runs the recording teleop loop
-    # (reads FACTR + proprio, commands the arms at the collection frequency, samples
-    # all cameras software-synchronised, and exports LeRobot demos); eval runs the
-    # policy rollout (same observation schema, actions from the policy server).
-    if config.runtime.phase == "collection":
-        nodes.append(
-            CollectionNode(
-                config.task,
-                config.runtime,
-                config.factr,
-                config.brain,
-                config.recording,
-                run_id,
-                config.arms,
-                config.cameras,
-            )
-        )
-    else:
-        nodes.append(
-            EvalNode(
-                config.task,
-                config.runtime,
-                config.policy,
-                config.brain,
-                run_id,
-                config.arms,
-                config.cameras,
-            )
-        )
     return nodes
+
+
+def build_consumer(config: Config, run_id: str) -> ProcessNode:
+    """The phase-selected consumer node: collection runs the recording teleop loop
+    (reads FACTR + proprio, commands the arms at the collection frequency, samples
+    all cameras software-synchronised, and exports LeRobot demos); eval runs the
+    policy rollout (same observation schema, actions from the policy server)."""
+    active_coeffs(config)  # validate the phase before constructing anything
+    if config.runtime.phase == "collection":
+        return CollectionNode(
+            config.task,
+            config.runtime,
+            config.factr,
+            config.brain,
+            config.recording,
+            run_id,
+            config.arms,
+            config.cameras,
+        )
+    return EvalNode(
+        config.task,
+        config.runtime,
+        config.policy,
+        config.brain,
+        run_id,
+        config.arms,
+        config.cameras,
+    )
+
+
+def build_nodes(config: Config, run_id: str) -> list[ProcessNode]:
+    """The set of spawned nodes for a one-shot run: hardware + the phase's consumer.
+
+    FACTR is not a node — it is an on-request HTTP client the brain holds. Camera
+    streams are produced unconditionally but are not in the brain's default
+    subscription (proprio only); subscribe to them via ``brain.subscribe`` (see
+    :func:`dual_flexiv_control.cameras.camera_stream_names`).
+    """
+    return [*build_hardware_nodes(config, run_id), build_consumer(config, run_id)]
 
 
 def run_system(config: Config, run_id: str | None = None) -> None:

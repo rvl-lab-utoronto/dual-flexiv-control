@@ -47,6 +47,21 @@ def test_sign_flip_is_joint_index_3_only():
     assert out[6] == pytest.approx(5.0)
 
 
+def test_default_joints_1_2_mirrored_with_home_plus_90():
+    """Joint indices 1 and 2 on hardware: home maps to +90 deg, motion mirrored.
+
+    The flip applies after the offset, so a flipped joint stores the negated
+    offset: out = -(theta - 90) = -theta + 90.
+    """
+    conv = JointConventionCfg()
+    assert set(conv.sign_flip_joints) == {1, 2, 3}
+    home = np.degrees(convert_factr_to_rizon(np.zeros(8), conv))
+    moved = np.degrees(convert_factr_to_rizon(np.deg2rad([0, 10, 10, 0, 0, 0, 0, 0]), conv))
+    for j in (1, 2):
+        assert home[j] == pytest.approx(90.0)
+        assert moved[j] - home[j] == pytest.approx(-10.0)  # leader +10 -> follower -10
+
+
 def test_wraps_to_plus_minus_180():
     conv = JointConventionCfg(offsets_deg=[179.0] * 7, sign_flip_joints=[], drop_trailing=0)
     out = np.degrees(convert_factr_to_rizon(np.deg2rad([10.0] * 7), conv))
