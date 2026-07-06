@@ -2,9 +2,10 @@ defaults:
   - base_camera
   - _self_
 
-# Static external ZED 2 stereo camera. Publishes left + right RGB. To add metric
-# depth: set `depth_mode` (e.g. PERFORMANCE or NEURAL — needs a CUDA host) and
-# append `depth` to `views`.
+# Static external ZED 2i stereo camera. Publishes left + right RGB and metric
+# depth. ULTRA is classic CUDA stereo matching — it does NOT need the SDK's AI
+# module (TensorRT), unlike the NEURAL* modes. Drop `depth` from `views` (and
+# set `depth_mode: NONE`) to go RGB-only.
 #
 # NOTE: ZED 2 resolutions are HD2K(2208x1242) / HD1080(1920x1080) /
 # HD720(1280x720) / VGA(672x376). `width`/`height` MUST match `resolution` (the
@@ -15,6 +16,17 @@ resolution: HD720
 width: 1280
 height: 720
 fps: 30.0
-depth_mode: NONE
+depth_mode: ULTRA
 capacity: 16
-views: [left, right]
+views: [left, right, depth]
+
+# Dashboard RGB-D overlay: optical frame posed relative to the LEFT arm's URDF
+# base (`mount_left`). This default places the camera 1.2 m in front of the rig
+# (+Y world), 0.6 m above the mount plane, level, looking back at the arms
+# (optical +Z -> world -Y). Tune to the real tripod placement.
+pose_frame: mount_left
+pose_xyz: [0.3, 1.2, 0.6]
+pose_rpy: [-1.5708, 0.0, 3.1416]
+# From this unit's factory calibration (fx=989.7 @ 1280px -> 2*atan(640/989.7)):
+# a narrow-lens (4mm) ZED 2i. The 2.1mm variant would be ~101.
+hfov_deg: 65.8

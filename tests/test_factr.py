@@ -141,6 +141,48 @@ def test_sim_needs_no_server():
     client.close()
 
 
+def test_preflight_passes_when_all_leaders_reachable():
+    left_srv = _serve({"left": list(range(7))})
+    right_srv = _serve({"right": list(range(7))})
+    try:
+        client = FactrClient.from_config(
+            _factr_cfg(left_srv.server_address, right_srv.server_address)
+        )
+        client.preflight()  # both up -> no raise
+        client.close()
+    finally:
+        for s in (left_srv, right_srv):
+            s.shutdown()
+            s.server_close()
+
+
+def test_preflight_raises_and_names_unreachable_leader():
+    # Left is served; right is bound-then-closed so nothing listens on its port.
+    left_srv = _serve({"left": list(range(7))})
+    right_srv = _serve([])
+    right_addr = right_srv.server_address
+    right_srv.shutdown()
+    right_srv.server_close()
+    try:
+        client = FactrClient.from_config(_factr_cfg(left_srv.server_address, right_addr))
+        with pytest.raises(FactrError) as exc:
+            client.preflight()
+        msg = str(exc.value)
+        assert "right @" in msg  # the failing leader is named
+        assert "left @" not in msg  # the reachable leader is not reported as a failure
+        client.close()
+    finally:
+        left_srv.shutdown()
+        left_srv.server_close()
+
+
+def test_preflight_passes_in_sim_without_servers():
+    # sim fabricates positions -> preflight needs no live server.
+    client = FactrClient.from_config(_factr_cfg(("localhost", 5000), ("localhost", 5001)), sim=True)
+    client.preflight()  # no raise despite nothing listening
+    client.close()
+
+
 def test_brain_queries_two_factr_servers(tmp_path):
     """The brain exposes factr_joint_positions(), backed by two live servers."""
     from dual_flexiv_control.brain import Brain

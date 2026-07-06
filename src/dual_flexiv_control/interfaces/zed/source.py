@@ -50,6 +50,32 @@ def _parse_serial(serial: str) -> int | None:
         return None
 
 
+def _autodetect_serial(sl, cam: CameraCfg) -> int:
+    """Resolve ``cam``'s serial from the currently connected ZED(s).
+
+    Queries the SDK's device list and returns the connected camera's serial, so a
+    static/bench camera binds to whatever ZED is plugged in without hand-entering
+    the number. Intended for a single attached ZED; if several are connected it
+    picks the first and warns, since it cannot know which one this camera means.
+    """
+    devices = sl.Camera.get_device_list()
+    if not devices:
+        raise RuntimeError(
+            f"camera {cam.placement!r} has auto_serial=true but no ZED is connected"
+        )
+    serial = int(devices[0].serial_number)
+    if len(devices) > 1:
+        others = ", ".join(str(int(d.serial_number)) for d in devices)
+        log.warning(
+            "auto_serial (%s): %d ZEDs connected [%s]; binding to first (serial=%s). "
+            "Set an explicit `serial` to disambiguate.",
+            cam.placement, len(devices), others, serial,
+        )
+    else:
+        log.info("auto_serial (%s): bound to connected ZED serial=%s", cam.placement, serial)
+    return serial
+
+
 class ZedSource:
     """Real ``pyzed.sl`` connection to one ZED camera; read-only frame capture."""
 
@@ -75,7 +101,7 @@ class ZedSource:
         init.camera_fps = int(cam.fps)
         init.depth_mode = getattr(sl.DEPTH_MODE, cam.depth_mode)
         init.coordinate_units = sl.UNIT.METER
-        serial = _parse_serial(cam.serial)
+        serial = _autodetect_serial(sl, cam) if cam.auto_serial else _parse_serial(cam.serial)
         if serial is not None:
             init.set_from_serial_number(serial)
 
@@ -103,7 +129,9 @@ class ZedSource:
         self._mats = {view: sl.Mat() for view in cam.views}
         log.info(
             "ZED %s open (serial=%s, %dx%d @ %.0f Hz, views=%s)",
-            cam.placement, cam.serial, cam.width, cam.height, cam.fps, list(cam.views),
+            cam.placement,
+            serial if serial is not None else "first-available",
+            cam.width, cam.height, cam.fps, list(cam.views),
         )
 
     def read(self):

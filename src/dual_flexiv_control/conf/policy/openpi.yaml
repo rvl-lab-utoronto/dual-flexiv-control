@@ -1,0 +1,19 @@
+defaults:
+  - base_policy
+
+# The openpi policy server (openpi scripts/serve_policy.py): msgpack-numpy
+# frames over a websocket, one action chunk per inference. Point host/port at
+# the GPU machine serving the checkpoint, e.g.:
+#   dual-flexiv-control runtime.phase=eval policy.host=jeju policy.port=8000
+#
+# The request keys follow openpi's LeRobot convention (flat slash-keyed dict +
+# a "prompt"). Override image_keys per checkpoint if it expects its camera
+# views under different names, or to drop a view it does not use, e.g.:
+#   policy.image_keys='{wrist_left: observation/wrist_image_left, static_right: ""}'
+#
+# For a serverless end-to-end smoke test of the eval path (observe -> infer ->
+# command), use the stand-still policy:  policy.kind=hold
+kind: remote
+schema: openpi
+host: localhost
+port: 8000

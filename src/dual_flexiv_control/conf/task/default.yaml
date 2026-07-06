@@ -1,17 +1,14 @@
 defaults:
   - base_task
-  # Per-phase controller coefficients, imported from the `control_coeffs` group:
-  # compliant for teleoperated collection, stiff for policy eval. Override per run,
-  # e.g. `task.collection.coeffs=stiff` or `control_coeffs@collection.coeffs=default`.
-  - /control_coeffs@collection.coeffs: compliant
-  - /control_coeffs@eval.coeffs: stiff
-  - _self_
 
-# A manipulation task: one natural-language goal shared by both phases, plus the
-# knobs that differ between data collection (teleop demos) and online eval
-# (policy rollouts). Copy this file to add a task, then select it with `task=<name>`.
-language_instruction: "Perform the bimanual task."   # shared by collection + eval
+# A manipulation task: the natural-language goal (shared by collection + eval),
+# its dataset, and the per-phase counts. Copy this file to add a task, then select
+# it with `task=<name>`. Controller coefficients default to compliant (collection)
+# / stiff (eval) from the schema; swap a preset per phase if needed, e.g.
+# `control_coeffs@task.collection.coeffs=stiff` (presets: compliant|stiff|default).
+language_instruction: "Perform the bimanual task."
 collection:
+  repo_id: dfc/default  # LeRobot dataset for this task (under the recording root)
   num_episodes: 50      # demonstrations to teleoperate and record
 eval:
   num_timesteps: 400    # rollout horizon (max steps before an eval episode is cut off)

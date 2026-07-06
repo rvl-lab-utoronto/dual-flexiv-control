@@ -176,6 +176,41 @@ class StreamRegistry:
             time.sleep(poll_s)
 
 
+def cleanup_sub(runtime_dir: str | os.PathLike[str], run_id: str, sub: str = "control") -> int:
+    """Unlink one manifest sub-registry's segments + entries, leaving the rest alone.
+
+    The session daemon calls this with ``sub="control"`` after a consumer crashes
+    hard (SIGKILL — its ``brain.close()`` never ran): the brain owns the control
+    channel segments, so nobody else will unlink them, and a stale manifest would
+    otherwise let the next run's arm attach a dead channel. Telemetry streams
+    (``streams/``) are untouched — their producers are alive and own them.
+    Returns the number of shared-memory segments unlinked.
+    """
+    from multiprocessing import shared_memory
+
+    subdir = StreamRegistry(runtime_dir, run_id, sub=sub).dir
+    unlinked = 0
+    if not subdir.is_dir():
+        return 0
+    for path in subdir.glob("*.json"):
+        try:
+            entry = RegistryEntry.from_json(json.loads(path.read_text()))
+        except (json.JSONDecodeError, KeyError, OSError):
+            continue
+        try:
+            shm = shared_memory.SharedMemory(name=entry.shm_name, create=False)
+            shm.close()
+            shm.unlink()
+            unlinked += 1
+        except FileNotFoundError:
+            pass
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    return unlinked
+
+
 def cleanup_run(runtime_dir: str | os.PathLike[str], run_id: str) -> int:
     """Unlink every shared-memory segment for a run and delete its manifest dir.
 

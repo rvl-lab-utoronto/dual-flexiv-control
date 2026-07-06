@@ -1,0 +1,27 @@
+# @package _global_
+# Left-arm-only rig: the real left Rizon 4s, the static ZED 2i, and the left
+# FACTR leader. For single-arm work while the right arm / leader is offline
+# (no right server on :5001, so reads aren't dragged down).
+#
+# NOTE: a camera exists only if BOTH its defaults entry (`/camera@cameras.<name>`)
+# and its inline block below are present — to add the wrist cam back, restore
+#   - /camera@cameras.wrist_left: zedx_wrist
+# in defaults AND `wrist_left: { placement: wrist_left, serial: "" }` below.
+defaults:
+  - /arm@arms.left: flexiv
+  - /control@arms.left.control: qpos
+  - /camera@cameras.static: zed2_static
+  - /factr: left                        # left leader only (:5000)
+  - _self_
+
+arms:
+  left:
+    name: "Lauer"
+    serial: Rizon4s-062841
+    # convention: { gripper_open: 0.0, gripper_closed: 1.2 }  # see rig/bimanual.yaml
+
+cameras:
+  static:
+    placement: static
+    serial: ""
+    auto_serial: true

@@ -178,10 +178,17 @@ def run_node(node: ProcessNode, stop_event) -> None:
 
     signal.signal(signal.SIGINT, _handle)
     signal.signal(signal.SIGTERM, _handle)
+    crashed = False
     try:
         node.run(stop_event)
     except Exception:  # noqa: BLE001
         log.exception("[%s] crashed", getattr(node, "name", "?"))
+        crashed = True
         stop_event.set()  # bring the rest of the system down with us
     finally:
         node.cleanup()
+    # Exit non-zero on a crash so the parent (and, through it, the dashboard) can
+    # distinguish a node that FAILED from one that finished cleanly or was asked to
+    # stop. Cleanup already ran in the finally above, so this leaks nothing.
+    if crashed:
+        raise SystemExit(1)

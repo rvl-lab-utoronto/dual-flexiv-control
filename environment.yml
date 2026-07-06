@@ -16,4 +16,44 @@ dependencies:
   - pip:
       - numpy>=2.0
       - flexivrdk==1.8.0
-      - -e .
+      - dynamixel-sdk>=3.7
+      # Install this package with the dashboard extra (rerun-sdk + streamlit),
+      # the policy extra (websockets + msgpack for eval rollouts), and the dev
+      # extra (pytest) so the full system + tests run from a fresh env.
+      - -e .[dashboard,policy,dev]
+
+# ---------------------------------------------------------------------------
+# ZED cameras (real hardware) — NOT installable via conda/pip; do this manually.
+# ---------------------------------------------------------------------------
+# The ZED Python API (`pyzed`) is a thin binding over the system-installed ZED
+# SDK. It is not a pip/conda package, so it is deliberately kept out of the
+# dependency lists above (the sim path, `runtime.sim=true`, never imports
+# `pyzed` and needs none of this). To run against real ZED cameras, on the
+# capture host:
+#
+#   1. NVIDIA driver — the ONLY hardware prerequisite for RGB capture. The ZED
+#      SDK statically bundles its CUDA runtime, so `libsl_zed.so` links only
+#      `libcuda.so.1` (the driver) — a separate CUDA *toolkit* install is NOT
+#      needed for RGB streaming. (TensorRT 10 is only needed for the AI /
+#      neural-depth module, which this project does not use: depth_mode=NONE.)
+#      NOTE: after any driver install/upgrade, REBOOT — a userspace/kernel
+#      driver mismatch makes camera.open() fail with "NO GPU DETECTED" (CUDA
+#      error 999) even though get_device_list() still enumerates the camera.
+#   2. ZED SDK 5.x — download + run the Stereolabs installer for your platform
+#      (https://www.stereolabs.com/developers/release). Use 5.x, NOT 4.x:
+#      pyzed 5.0 requires `numpy>=2,<3` (compatible with this env), whereas
+#      pyzed 4.2 pins `numpy<2` and conflicts with numpy>=2 / rerun-sdk.
+#      Headless silent install (skip the AI module + system python):
+#        sudo ./ZED_SDK_*.run -- silent skip_python skip_od_module
+#      (If the outer installer tries to open a GUI terminal with no TTY, extract
+#      first: `./ZED_SDK_*.run --noexec --keep --nox11 --target ./zed && cd zed
+#      && sudo ./linux_install_release.sh silent skip_python skip_od_module`.)
+#      The SDK installs to /usr/local/zed as root:zed mode 770 — add your user
+#      to the `zed` group: `sudo usermod -aG zed $USER` (re-login to take effect).
+#   3. pyzed — from *inside* this conda env, install the wheel matched to the SDK:
+#        conda run -n dual-flexiv-control python /usr/local/zed/get_python_api.py
+#      (`get_python_api.py` ships with the ZED SDK; it fetches the pyzed wheel
+#      that matches the installed SDK + this env's Python 3.12.)
+#
+# Verify:  conda run -n dual-flexiv-control python -c "import pyzed.sl as sl; print(sl.Camera.get_device_list())"
+# Reference working host (tailscale `jeju`): ZED SDK 5.0.7, pyzed 5.0, numpy 2.x.

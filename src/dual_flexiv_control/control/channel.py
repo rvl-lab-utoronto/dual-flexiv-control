@@ -67,6 +67,79 @@ def slice_streamed(ctrl_cfg, vec: np.ndarray) -> dict[str, np.ndarray]:
     return {f: v[s:e].copy() for f, s, e in streamed_layout(ctrl_cfg)}
 
 
+#: The one streamed command field a learned policy's action fills, per control
+#: kind — its *action space*. The policy emits this field (per side); the arm's
+#: RDK mode (set from ``ControlCfg.mode``) defines how it's realised. Everything
+#: else the kind streams is filled by :func:`pack_action` (feedforward → zeros;
+#: absolute non-primary targets → held at the measured value).
+_ACTION_PRIMARY = {
+    "qpos": "q_d",          # joint positions
+    "qvel": "dq_d",         # joint velocities (arm integrates to q_d)
+    "end_effector": "pose_d",   # TCP pose
+    "eef_vel": "twist_d",   # TCP twist (arm integrates to pose_d)
+    "force": "wrench_d",    # TCP wrench on force-controlled axes
+}
+
+#: Streamed fields that are *absolute* targets (not feedforward): when such a
+#: field is streamed but is NOT the primary, it must be held at the measured value
+#: rather than zeroed (e.g. ``pose_d`` on the motion axes under ``force`` control).
+_ABSOLUTE_FIELDS = frozenset({"q_d", "pose_d"})
+
+
+def action_field(ctrl_cfg) -> str:
+    """The streamed field a policy action fills for this control kind (its action space)."""
+    try:
+        return _ACTION_PRIMARY[ctrl_cfg.kind]
+    except KeyError:
+        raise ValueError(
+            f"control kind {ctrl_cfg.kind!r} has no policy action mapping "
+            f"(known: {sorted(_ACTION_PRIMARY)})"
+        ) from None
+
+
+def action_dim(ctrl_cfg) -> int:
+    """Width of one side's policy action for this kind (the primary field's dim)."""
+    return int(ctrl_cfg.command[action_field(ctrl_cfg)])
+
+
+def action_hold_fields(ctrl_cfg) -> list[str]:
+    """Streamed fields that must be *held at measured* (absolute, non-primary).
+
+    These need a measured value supplied to :func:`pack_action` (via ``held``);
+    for the wired kinds only ``force`` has one (``pose_d`` on the motion axes).
+    """
+    primary = action_field(ctrl_cfg)
+    return [f for f in ctrl_cfg.streamed if f != primary and f in _ABSOLUTE_FIELDS]
+
+
+def pack_action(ctrl_cfg, primary_value, held: dict | None = None) -> np.ndarray:
+    """One setpoint vector from a policy action for *any* control kind.
+
+    ``primary_value`` is the policy's per-side output (the :func:`action_field`);
+    it fills the primary streamed field. Remaining streamed fields are filled as:
+    feedforward fields (``dq_d``/``twist_d``) → zeros; absolute non-primary fields
+    (see :func:`action_hold_fields`) → the corresponding entry in ``held`` (the
+    measured value), which must be supplied. The result matches the width the arm's
+    :func:`slice_streamed` expects, so the same setpoint channel serves every kind.
+    """
+    primary = action_field(ctrl_cfg)
+    held = held or {}
+    fields: dict[str, np.ndarray] = {}
+    for f in ctrl_cfg.streamed:
+        if f == primary:
+            fields[f] = np.asarray(primary_value, dtype=np.float64).ravel()
+        elif f in _ABSOLUTE_FIELDS:
+            if f not in held:
+                raise ValueError(
+                    f"control kind {ctrl_cfg.kind!r} streams absolute field {f!r} "
+                    f"that the policy does not emit; a measured value to hold is required"
+                )
+            fields[f] = np.asarray(held[f], dtype=np.float64).ravel()
+        else:
+            fields[f] = np.zeros(int(ctrl_cfg.command[f]), dtype=np.float64)
+    return pack_streamed(ctrl_cfg, fields)
+
+
 def control_specs(side: str, ctrl_cfg) -> dict[str, StreamSpec]:
     """Build the ``{SETPOINT, COMMAND}`` channel specs for one arm's control."""
     ch = ctrl_cfg.channel

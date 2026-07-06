@@ -18,6 +18,7 @@ from ..configs import ArmCfg
 from ..configs import BrainCfg
 from ..configs import FactrCfg
 from ..configs import RuntimeCfg
+from ..control import CommandKind
 from ..control import ControlCommand
 from ..control import SETPOINT
 from ..control import COMMAND
@@ -145,6 +146,21 @@ class Brain:
     @property
     def controlled_sides(self) -> list[str]:
         return list(self._setpoint_writers)
+
+    def stop_arms(self) -> None:
+        """Post STOP to every controlled arm — the clean end-of-run handoff.
+
+        Called by the consumers on their way out (before :meth:`close` unlinks the
+        channels) so session-hosted arms leave their control session immediately
+        instead of riding out the deadman. Best-effort and exception-safe: teardown
+        must never raise, and an arm that already dropped its reader just won't see
+        the command (its deadman/exit already handled it).
+        """
+        for side, writer in self._command_writers.items():
+            try:
+                writer.write(ControlCommand(CommandKind.STOP).encode(writer.spec.dim))
+            except Exception:  # noqa: BLE001 - teardown must not raise
+                log.exception("error sending STOP to %s", side)
 
     def close(self) -> None:
         for reader in self._readers.values():
