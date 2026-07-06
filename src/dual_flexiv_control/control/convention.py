@@ -38,3 +38,23 @@ def convert_factr_to_rizon(q_leader_rad, conv: "JointConventionCfg") -> np.ndarr
     if conv.wrap_deg:
         deg = (deg + 180.0) % 360.0 - 180.0
     return np.radians(deg)
+
+
+def normalize_gripper(raw_value, conv: "JointConventionCfg") -> float:
+    """Map FACTR's trailing gripper value (raw servo radians) to a 0..1 fraction.
+
+    FACTR serves the gripper as an un-normalized servo angle in radians (no 0..1
+    mapping exists anywhere in FACTR). When both ``gripper_open`` and
+    ``gripper_closed`` are set on the convention, this linearly maps
+    ``gripper_open → 0.0`` and ``gripper_closed → 1.0`` and clips to ``[0, 1]``;
+    when either is unset (or they are equal), the raw value is returned unchanged so
+    an uncalibrated setup records exactly what it did before. Endpoints may be given
+    in either order — a closed reading below the open reading still maps correctly.
+    """
+    lo = conv.gripper_open
+    hi = conv.gripper_closed
+    raw = float(raw_value)
+    if lo is None or hi is None or lo == hi:
+        return raw
+    frac = (raw - lo) / (hi - lo)
+    return float(min(1.0, max(0.0, frac)))

@@ -1,0 +1,30 @@
+defaults:
+  - base_policy
+
+# ACME policy server (rvl-lab-utoronto/ACME): an HTTP service speaking
+# multipart/form-data over `POST /predict`, one action chunk per request.
+# Point host/port at the GPU machine serving the checkpoint, e.g. the pi0.5
+# base policy on borabora:
+#   dual-flexiv-control runtime.phase=eval policy=acme \
+#       policy.host=100.92.86.90 policy.port=53805 \
+#       task.language_instruction='pick up the moose'
+#
+# Single-arm franka recipe: three camera views (two exterior + one wrist) and a
+# 7-dim qpos. Enable control on exactly ONE arm (its 8-dim action = q1..q7 +
+# gripper matches the server output) and align `qpos_slice` with that arm's
+# joints inside observation.state — [0,7]=left, [7,14]=right.
+#
+# The default `acme_image_keys` wires the static ZED 2i's left/right views to
+# the two exterior slots and the left wrist ZED X to the wrist slot; override to
+# match the arm and cameras in use, e.g.:
+#   policy.acme_image_keys='{exterior_image_1_left: static_left,
+#       exterior_image_2_left: static_right, wrist_image_left: wrist_right}'
+#
+# The server returns ABSOLUTE joint targets (it integrates the network's joint
+# velocities at dt=1/15 s), so the eval loop posts them directly — run eval at
+# task.eval.frequency_hz=15 to match that integration step.
+kind: remote
+schema: acme
+transport: http
+host: localhost
+port: 53805

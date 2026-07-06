@@ -1,0 +1,10 @@
+defaults:
+  - base_factr
+  - _self_
+
+# Left leader only — a single FACTR FastAPI server on :5000 (arm_index 0). Use when
+# only the left leader is plugged in (the right server has no producer), so the
+# brain's batch read isn't dragged down by an unreachable right server. Matches the
+# left entry of factr/bimanual.yaml.
+servers:
+  left: { host: localhost, port: 5000, endpoint: get_joint_positions_left, request_timeout_s: 0.5, dof: 8 }

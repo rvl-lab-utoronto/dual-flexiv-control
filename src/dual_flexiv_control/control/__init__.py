@@ -17,13 +17,18 @@ the two categories never alias during discovery.
 from .channel import COMMAND
 from .channel import SETPOINT
 from .channel import CommandCursor
+from .channel import action_dim
+from .channel import action_field
+from .channel import action_hold_fields
 from .channel import control_channel_name
 from .channel import control_specs
+from .channel import pack_action
 from .channel import pack_streamed
 from .channel import setpoint_dim
 from .channel import slice_streamed
 from .channel import streamed_layout
 from .convention import convert_factr_to_rizon
+from .convention import normalize_gripper
 from .message import CommandKind
 from .message import ControlCommand
 
@@ -31,13 +36,18 @@ __all__ = [
     "CommandKind",
     "ControlCommand",
     "CommandCursor",
+    "action_field",
+    "action_dim",
+    "action_hold_fields",
     "control_channel_name",
     "control_specs",
     "setpoint_dim",
     "streamed_layout",
+    "pack_action",
     "pack_streamed",
     "slice_streamed",
     "convert_factr_to_rizon",
+    "normalize_gripper",
     "SETPOINT",
     "COMMAND",
 ]

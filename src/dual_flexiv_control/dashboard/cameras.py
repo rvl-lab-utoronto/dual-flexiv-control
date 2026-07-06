@@ -14,6 +14,7 @@ the same philosophy as the dashboard's placeholder metrics.
 
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
@@ -48,6 +49,7 @@ class CameraView:
 
 _LOCK = threading.Lock()
 _VIEWS: tuple[CameraView, ...] | None = None
+_CAMS: dict | None = None  # camera name -> plain CameraCfg (typed via the schema)
 
 
 def discover_camera_views() -> list[CameraView]:
@@ -59,10 +61,33 @@ def discover_camera_views() -> list[CameraView]:
         return list(_VIEWS)
 
 
+def camera_cfg(name: str):
+    """The composed :class:`~dual_flexiv_control.configs.CameraCfg` for one camera."""
+    discover_camera_views()  # populates _CAMS on first compose
+    return _CAMS[name]
+
+
+def depth_cameras() -> list[str]:
+    """Cameras publishing both a ``left`` RGB view and a ``depth`` view."""
+    have: dict[str, set[str]] = {}
+    for v in discover_camera_views():
+        have.setdefault(v.camera, set()).add(v.view)
+    return [c for c, vs in have.items() if "left" in vs and "depth" in vs]
+
+
+def reset() -> None:
+    """Drop the cached camera views so the next call re-composes from ``conf``."""
+    global _VIEWS, _CAMS
+    with _LOCK:
+        _VIEWS = None
+        _CAMS = None
+
+
 def _compose_views() -> list[CameraView]:
     from hydra import compose
     from hydra import initialize_config_module
     from hydra.core.global_hydra import GlobalHydra
+    from omegaconf import OmegaConf
 
     from dual_flexiv_control import cameras as cam_mod
     from dual_flexiv_control.configs import register_configs
@@ -71,6 +96,9 @@ def _compose_views() -> list[CameraView]:
     GlobalHydra.instance().clear()
     with initialize_config_module(version_base=None, config_module="dual_flexiv_control.conf"):
         cfg = compose(config_name="config")
+
+    global _CAMS
+    _CAMS = {name: OmegaConf.to_object(cam) for name, cam in cfg.cameras.items()}
 
     views: list[CameraView] = []
     for name, cam in cfg.cameras.items():
@@ -146,6 +174,51 @@ def _read_live_frame(view: CameraView, runtime_dir: str | None) -> np.ndarray | 
         except Exception:  # noqa: BLE001 - dead run / lapped buffer -> try next
             continue
     return None
+
+
+def depth_point_cloud(
+    camera: str,
+    stride: int = 4,
+    max_depth_m: float = 5.0,
+    runtime_dir: str | None = None,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """The latest RGB-D frame pair of ``camera`` as a coloured point cloud.
+
+    Back-projects the ``depth`` view through a pinhole model (``hfov_deg`` from
+    the camera's config; principal point at the image centre) and colours each
+    point from the ``left`` RGB view (the ZED depth map is registered to the
+    left sensor). Returns ``(points (N,3) float32 [m], colors (N,3) uint8)`` in
+    the camera's **optical frame** (X right, Y down, Z forward) — pose it into
+    the robot scene with :func:`~.robot_view.camera_world_pose`. ``None`` when
+    either stream has no live frame.
+
+    ``stride`` subsamples pixels (720p @ 4 -> ≤57.6k points); invalid depth
+    (NaN/Inf/0) and anything beyond ``max_depth_m`` is dropped.
+    """
+    views = {v.view: v for v in discover_camera_views() if v.camera == camera}
+    depth_view, rgb_view = views.get("depth"), views.get("left")
+    if depth_view is None or rgb_view is None:
+        return None
+    depth = _read_live_frame(depth_view, runtime_dir)
+    rgb = _read_live_frame(rgb_view, runtime_dir)
+    if depth is None or rgb is None:
+        return None
+
+    h, w = depth.shape
+    fx = (w / 2.0) / math.tan(math.radians(float(camera_cfg(camera).hfov_deg)) / 2.0)
+    cx, cy = w / 2.0, h / 2.0
+
+    d = depth[::stride, ::stride]
+    c = rgb[::stride, ::stride]
+    vs, us = np.mgrid[0:h:stride, 0:w:stride]
+    valid = np.isfinite(d) & (d > 0.2) & (d <= max_depth_m)
+    if not valid.any():
+        return None
+    z = d[valid]
+    pts = np.stack(
+        [(us[valid] - cx) * z / fx, (vs[valid] - cy) * z / fx, z], axis=1
+    ).astype(np.float32)
+    return pts, np.ascontiguousarray(c[valid])
 
 
 def _to_display(frame: np.ndarray, view: CameraView) -> np.ndarray:

@@ -1,0 +1,16 @@
+defaults:
+  - flexiv
+  - _self_
+
+# A Flexiv arm that publishes DUMMY (fabricated) proprio instead of connecting to
+# the robot: every proprio stream is marked `dummy: true`, so FlexivInterface uses
+# the simulated source (no flexivrdk connection). Used by the test config to run a
+# real camera against a robot that isn't connected. Actions can still come from a
+# real FACTR leader; keep `control_enabled: false` (there is no robot to drive).
+streams:
+  q:       { dummy: true }
+  dq:      { dummy: true }
+  tau:     { dummy: true }
+  wrench:  { dummy: true }
+  eef:     { dummy: true }
+  eef_vel: { dummy: true }

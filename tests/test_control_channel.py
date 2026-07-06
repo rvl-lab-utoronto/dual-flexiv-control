@@ -52,6 +52,88 @@ def test_pack_slice_round_trip():
     np.testing.assert_allclose(fields["dq_d"], dq)
 
 
+@pytest.mark.parametrize(
+    "kind,field,dim",
+    [("qpos", "q_d", 7), ("qvel", "dq_d", 7), ("end_effector", "pose_d", 7),
+     ("eef_vel", "twist_d", 6), ("force", "wrench_d", 6)],
+)
+def test_action_field_and_dim_per_kind(kind, field, dim):
+    from dual_flexiv_control.control import action_dim
+    from dual_flexiv_control.control import action_field
+
+    ctrl = _ctrl(kind)
+    assert action_field(ctrl) == field
+    assert action_dim(ctrl) == dim
+
+
+@pytest.mark.parametrize("kind", ["qpos", "qvel", "end_effector", "eef_vel"])
+def test_pack_action_fills_primary_and_zeros_feedforward(kind):
+    """A policy's primary field lands in the setpoint; feedforward fields are zeroed."""
+    from dual_flexiv_control.control import action_dim
+    from dual_flexiv_control.control import action_field
+    from dual_flexiv_control.control import pack_action
+
+    ctrl = _ctrl(kind)
+    primary = np.arange(1.0, action_dim(ctrl) + 1.0)
+    setpoint = pack_action(ctrl, primary)
+    assert setpoint.shape == (setpoint_dim(ctrl),)
+    fields = slice_streamed(ctrl, setpoint)
+    np.testing.assert_allclose(fields[action_field(ctrl)], primary)
+    for f, vec in fields.items():
+        if f != action_field(ctrl):
+            np.testing.assert_allclose(vec, 0.0)  # non-primary streamed fields zeroed
+
+
+def test_pack_action_force_holds_measured_pose():
+    """force streams wrench_d (policy) + pose_d (held at the measured TCP pose)."""
+    from dual_flexiv_control.control import action_hold_fields
+    from dual_flexiv_control.control import pack_action
+
+    ctrl = _ctrl("force")
+    assert action_hold_fields(ctrl) == ["pose_d"]
+    wrench = np.arange(1.0, 7.0)
+    pose = np.array([0.1, 0.2, 0.3, 1.0, 0.0, 0.0, 0.0])
+    setpoint = pack_action(ctrl, wrench, held={"pose_d": pose})
+    fields = slice_streamed(ctrl, setpoint)
+    np.testing.assert_allclose(fields["wrench_d"], wrench)
+    np.testing.assert_allclose(fields["pose_d"], pose)
+    # without the measured hold it must refuse rather than command a zero pose
+    with pytest.raises(ValueError):
+        pack_action(ctrl, wrench)
+
+
+def test_normalize_gripper_passthrough_when_uncalibrated():
+    from dual_flexiv_control.configs import JointConventionCfg
+    from dual_flexiv_control.control import normalize_gripper
+
+    conv = JointConventionCfg()  # gripper_open/closed default None
+    assert normalize_gripper(0.73, conv) == pytest.approx(0.73)   # raw radians unchanged
+    assert normalize_gripper(-1.5, conv) == pytest.approx(-1.5)
+
+
+def test_normalize_gripper_maps_and_clips_to_unit_interval():
+    from dual_flexiv_control.configs import JointConventionCfg
+    from dual_flexiv_control.control import normalize_gripper
+
+    conv = JointConventionCfg(gripper_open=0.2, gripper_closed=1.2)  # 1.0 rad span
+    assert normalize_gripper(0.2, conv) == pytest.approx(0.0)     # open endpoint
+    assert normalize_gripper(1.2, conv) == pytest.approx(1.0)     # closed endpoint
+    assert normalize_gripper(0.7, conv) == pytest.approx(0.5)     # midpoint
+    assert normalize_gripper(-1.0, conv) == pytest.approx(0.0)    # below open -> clip
+    assert normalize_gripper(9.0, conv) == pytest.approx(1.0)     # above closed -> clip
+
+
+def test_normalize_gripper_handles_reversed_endpoints():
+    from dual_flexiv_control.configs import JointConventionCfg
+    from dual_flexiv_control.control import normalize_gripper
+
+    # closed reading below the open reading (sign-flipped leader) still maps correctly
+    conv = JointConventionCfg(gripper_open=1.0, gripper_closed=0.0)
+    assert normalize_gripper(1.0, conv) == pytest.approx(0.0)
+    assert normalize_gripper(0.0, conv) == pytest.approx(1.0)
+    assert normalize_gripper(0.5, conv) == pytest.approx(0.5)
+
+
 def test_control_specs_names_and_dims():
     ctrl = _ctrl("qpos")
     specs = control_specs("left", ctrl)

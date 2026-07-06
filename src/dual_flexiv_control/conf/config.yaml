@@ -11,6 +11,7 @@ defaults:
   - brain: default
   - factr: bimanual
   - task: default          # active manipulation task (switch with `task=<name>`)
+  - policy: openpi         # eval policy-server client (used when runtime.phase=eval)
   - arm@arms.left: flexiv   # the same arm template, placed at arms.left ...
   - arm@arms.right: flexiv  # ... and arms.right
   - control@arms.left.control: qpos    # each arm inherits its own, independently-tunable
@@ -25,14 +26,24 @@ arms:
   left:
     name: "Lauer"          # display name (dashboard); customize freely
     serial: Rizon4s-062841
+    # FACTR serves the trailing gripper as un-normalized servo radians. To record
+    # the gripper action as a 0..1 fraction, measure the raw leader gripper value
+    # (radians) at the fully-open and fully-closed trigger and set both here (open→0,
+    # closed→1, clipped). Leave unset to record the raw radian value. Because the
+    # read-only FACTR publisher re-zeroes the gripper at startup, measure against a
+    # consistent startup pose. Example (replace with measured values):
+    # convention: { gripper_open: 0.0, gripper_closed: 1.2 }
   right:
     name: "Rogers"
     serial: Rizon4s-062837
+    # convention: { gripper_open: 0.0, gripper_closed: 1.2 }   # measure per leader
 
 # Per-camera specifics (templates in camera/*.yaml supply the rest). Set `serial`
 # to each camera's real (numeric) ZED serial number to bind a process to a
 # specific device; "" opens the first available camera (fine for a single cam /
-# for sim, where serials are ignored).
+# for sim, where serials are ignored). Set `auto_serial: true` to bind a camera
+# to whatever ZED is currently connected (overrides `serial`) — handy for the
+# static cam on a bench where only one ZED is plugged in; see CameraCfg.
 cameras:
   wrist_left:
     placement: wrist_left
@@ -43,6 +54,7 @@ cameras:
   static:
     placement: static
     serial: ""
+    auto_serial: true    # bind the static cam to the connected ZED's serial
 
 hydra:
   job:

@@ -1,0 +1,540 @@
+"""Hardware-free tests for the eval path.
+
+The ObservationBuilder, ActionLayout, and wire schemas are pure. The EvalLoop
+is exercised with a fake Brain and a scripted Policy, so no shared memory, no
+policy server, and no ``websockets``/``msgpack`` dependency are needed (the
+msgpack round-trip test skips if ``msgpack`` is absent).
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+from hydra import compose
+from hydra import initialize_config_module
+from omegaconf import OmegaConf
+
+from dual_flexiv_control.collection import FrameBuilder
+from dual_flexiv_control.configs import register_configs
+from dual_flexiv_control.policy import ActionLayout
+from dual_flexiv_control.policy import EvalLoop
+from dual_flexiv_control.policy import ObservationBuilder
+from dual_flexiv_control.policy import PolicyError
+from dual_flexiv_control.policy import build_policy
+from dual_flexiv_control.policy import build_schema
+from dual_flexiv_control.streams.ring import Samples
+
+
+def _config(*overrides: str):
+    register_configs()
+    with initialize_config_module(config_module="dual_flexiv_control.conf", version_base=None):
+        cfg = compose(config_name="config", overrides=list(overrides))
+    return OmegaConf.to_object(cfg)
+
+
+def _samples(vec, dtype=np.float64) -> Samples:
+    data = np.asarray(vec, dtype=dtype).reshape(1, -1)
+    return Samples(data=data, t_ns=np.array([1], np.int64), seq=np.array([0], np.int64))
+
+
+def _empty_samples(dtype=np.float64) -> Samples:
+    return Samples(
+        data=np.empty((0, 0), dtype=dtype),
+        t_ns=np.empty((0,), np.int64),
+        seq=np.empty((0,), np.int64),
+    )
+
+
+def _observer(cfg) -> ObservationBuilder:
+    return ObservationBuilder(
+        cfg.arms, cfg.cameras,
+        cfg.task.language_instruction, cfg.task.collection.state_signals,
+    )
+
+
+def _full_observation(cfg):
+    """A complete snapshot: q for both arms + every camera frame."""
+    obs = {"left/q": _samples(np.arange(7.0)), "right/q": _samples(np.arange(7.0) + 10)}
+    for name, cam in cfg.cameras.items():
+        for view in cam.views:
+            dim = cam.height * cam.width * (3 if view in ("left", "right") else 1)
+            obs[f"cam/{name}/{view}"] = _samples(np.zeros(dim, np.uint8), dtype=np.uint8)
+    return obs
+
+
+# --------------------------------------------------------------------------- #
+# ObservationBuilder: the canonical (training-frame) observation
+# --------------------------------------------------------------------------- #
+
+
+def test_observation_matches_training_frame_schema():
+    cfg = _config()
+    ob = _observer(cfg)
+    obs = ob.build(_full_observation(cfg))
+    assert obs is not None
+    assert "action" not in obs
+    assert obs["observation.state"].shape == (14,)
+    assert obs["task"] == cfg.task.language_instruction
+    # Image keys are exactly what collection would record (schema parity).
+    fb = FrameBuilder(cfg.arms, [], cfg.cameras,
+                      cfg.task.language_instruction, cfg.task.collection.state_signals)
+    assert ob.image_keys == fb.image_keys
+    assert obs["observation.images.static_left"].shape == (720, 1280, 3)
+
+
+def test_observation_none_until_streams_warm():
+    cfg = _config()
+    ob = _observer(cfg)
+    snapshot = _full_observation(cfg)
+    snapshot["cam/wrist_left/left"] = _empty_samples(np.uint8)
+    assert ob.build(snapshot) is None
+
+
+def test_observation_state_slices():
+    cfg = _config()
+    ob = _observer(cfg)
+    obs = ob.build(_full_observation(cfg))
+    state = obs["observation.state"]
+    np.testing.assert_allclose(state[ob.state_slice("left", "q")], np.arange(7.0))
+    np.testing.assert_allclose(state[ob.state_slice("right", "q")], np.arange(7.0) + 10)
+    with pytest.raises(KeyError):
+        ob.state_slice("left", "tau")  # not among state_signals
+
+
+# --------------------------------------------------------------------------- #
+# ActionLayout: parity with the collection action feature
+# --------------------------------------------------------------------------- #
+
+
+def test_action_layout_matches_collection_action_schema():
+    cfg = _config()
+    layout = ActionLayout(cfg.arms, ["left", "right"])
+    fb = FrameBuilder(cfg.arms, ["left", "right"], cfg.cameras,
+                      cfg.task.language_instruction, cfg.task.collection.state_signals)
+    assert layout.names == fb.action_names
+    assert layout.dim == fb.action_dim == 16
+
+
+def test_action_layout_split():
+    cfg = _config()
+    layout = ActionLayout(cfg.arms, ["left", "right"])
+    action = np.arange(16.0)
+    targets = layout.split(action)
+    np.testing.assert_allclose(targets["left"]["q_d"], np.arange(7.0))
+    assert targets["left"]["gripper"] == pytest.approx(7.0)
+    np.testing.assert_allclose(targets["right"]["q_d"], np.arange(8.0, 15.0))
+    assert targets["right"]["gripper"] == pytest.approx(15.0)
+    with pytest.raises(ValueError):
+        layout.split(np.zeros(5))
+
+
+# --------------------------------------------------------------------------- #
+# OpenPISchema: request mapping + response parsing
+# --------------------------------------------------------------------------- #
+
+
+def test_openpi_schema_request_keys():
+    cfg = _config()
+    obs = _observer(cfg).build(_full_observation(cfg))
+    req = build_schema(cfg.policy).request(obs)
+    assert req["prompt"] == cfg.task.language_instruction
+    assert req["observation/state"].shape == (14,)
+    assert req["observation/images/wrist_left"].shape == (600, 960, 3)  # ZED X Nano SVGA
+    assert "observation/images/static_right" in req
+
+
+def test_openpi_schema_image_key_overrides_and_drops():
+    cfg = _config()
+    cfg.policy.image_keys = {
+        "wrist_left": "observation/wrist_image_left",
+        "static_right": "",  # checkpoint does not use this view: drop it
+    }
+    obs = _observer(cfg).build(_full_observation(cfg))
+    req = build_schema(cfg.policy).request(obs)
+    assert "observation/wrist_image_left" in req
+    assert "observation/images/wrist_left" not in req
+    assert "observation/images/static_right" not in req
+    assert "observation/images/static_left" in req  # untouched cameras keep the template
+
+
+def test_openpi_schema_actions_parsing():
+    cfg = _config()
+    schema = build_schema(cfg.policy)
+    chunk = schema.actions({"actions": np.ones((5, 16))})
+    assert chunk.shape == (5, 16)
+    single = schema.actions({"actions": np.zeros(16)})  # single action -> chunk of one
+    assert single.shape == (1, 16)
+    with pytest.raises(PolicyError):
+        schema.actions({"wrong_key": np.ones((5, 16))})
+
+
+def test_unknown_schema_rejected():
+    cfg = _config()
+    cfg.policy.schema = "nonsense"
+    with pytest.raises(ValueError):
+        build_schema(cfg.policy)
+
+
+# --------------------------------------------------------------------------- #
+# AcmeSchema: single-arm multipart request mapping + response parsing
+# --------------------------------------------------------------------------- #
+
+
+def test_acme_schema_request_structure():
+    cfg = _config("policy=acme")
+    obs = _observer(cfg).build(_full_observation(cfg))
+    req = build_schema(cfg.policy).request(obs)
+    assert set(req["images"]) == {
+        "exterior_image_1_left", "exterior_image_2_left", "wrist_image_left"
+    }
+    assert req["images"]["exterior_image_1_left"].shape == (720, 1280, 3)  # static_left
+    assert req["images"]["wrist_image_left"].shape == (600, 960, 3)        # wrist_left
+    # qpos is the LEFT arm's 7 joints sliced out of the 14-dim state.
+    np.testing.assert_allclose(req["lowdim"]["qpos"], np.arange(7.0))
+    assert req["lowdim"]["qpos"].shape == (7,)
+    assert req["form"]["prompt"] == cfg.task.language_instruction
+    assert req["form"]["obs_steps"] == 1
+
+
+def test_acme_schema_qpos_slice_selects_right_arm():
+    cfg = _config("policy=acme", "policy.qpos_slice=[7,14]")
+    obs = _observer(cfg).build(_full_observation(cfg))
+    req = build_schema(cfg.policy).request(obs)
+    np.testing.assert_allclose(req["lowdim"]["qpos"], np.arange(7.0) + 10)
+
+
+def test_acme_schema_missing_camera_view_raises():
+    cfg = _config("policy=acme")
+    cfg.policy.acme_image_keys = {"wrist_image_left": "nonexistent_cam"}
+    obs = _observer(cfg).build(_full_observation(cfg))
+    with pytest.raises(PolicyError):
+        build_schema(cfg.policy).request(obs)
+
+
+def test_acme_schema_actions_parsing():
+    cfg = _config("policy=acme")
+    schema = build_schema(cfg.policy)
+    # (B, H, 8) batched -> the single item's (H, 8) chunk.
+    chunk = schema.actions({"action": np.ones((1, 10, 8)), "success": True})
+    assert chunk.shape == (10, 8)
+    # (H, 8) already unbatched passes through.
+    assert schema.actions({"action": np.zeros((4, 8))}).shape == (4, 8)
+    with pytest.raises(PolicyError):
+        schema.actions({"action": np.ones((2, 10, 8))})  # B != 1
+    with pytest.raises(PolicyError):
+        schema.actions({"wrong_key": np.ones((10, 8))})
+
+
+def test_acme_transport_encodes_torch_and_npz():
+    pytest.importorskip("torch")
+    pytest.importorskip("requests")
+    from dual_flexiv_control.policy.client import AcmeHttpTransport
+
+    cfg = _config("policy=acme")
+    obs = _observer(cfg).build(_full_observation(cfg))
+    payload = build_schema(cfg.policy).request(obs)
+    # Encode without constructing (no server contacted): exercises the wire format.
+    transport = AcmeHttpTransport.__new__(AcmeHttpTransport)
+    import torch
+
+    transport._torch = torch
+    files = transport._encode_files(payload)
+    assert set(files) == {
+        "exterior_image_1_left", "exterior_image_2_left", "wrist_image_left", "lowdim_data"
+    }
+    # Image part round-trips to a (B, T, C, H, W) uint8 tensor.
+    import io
+
+    name, data, _ = files["exterior_image_1_left"]
+    assert name.endswith(".pt")
+    tensor = torch.load(io.BytesIO(data))
+    assert tuple(tensor.shape) == (1, 1, 3, 720, 1280)
+    assert tensor.dtype == torch.uint8
+    # lowdim npz carries qpos as (B, T, D).
+    npz = np.load(io.BytesIO(files["lowdim_data"][1]))
+    assert npz["qpos"].shape == (1, 1, 7)
+
+
+# --------------------------------------------------------------------------- #
+# msgpack-numpy wire format (openpi-compatible)
+# --------------------------------------------------------------------------- #
+
+
+def test_msgpack_numpy_roundtrip():
+    msgpack = pytest.importorskip("msgpack")
+    from dual_flexiv_control.policy.client import pack_array
+    from dual_flexiv_control.policy.client import unpack_array
+
+    payload = {
+        "observation/state": np.linspace(0, 1, 14, dtype=np.float32),
+        "observation/images/wrist_left": np.arange(24, dtype=np.uint8).reshape(2, 4, 3),
+        "prompt": "do the task",
+    }
+    packed = msgpack.packb(payload, default=pack_array)
+    out = msgpack.unpackb(packed, object_hook=unpack_array)
+    assert out["prompt"] == "do the task"
+    for key in ("observation/state", "observation/images/wrist_left"):
+        np.testing.assert_array_equal(out[key], payload[key])
+        assert out[key].dtype == payload[key].dtype
+
+
+# --------------------------------------------------------------------------- #
+# HoldPolicy: serverless stand-still
+# --------------------------------------------------------------------------- #
+
+
+def test_hold_policy_repeats_measured_q():
+    cfg = _config()
+    cfg.policy.kind = "hold"
+    ob = _observer(cfg)
+    layout = ActionLayout(cfg.arms, ["left", "right"])
+    policy = build_policy(cfg.policy, layout, ob)
+    obs = ob.build(_full_observation(cfg))
+    chunk = policy.infer(obs)
+    assert chunk.ndim == 2 and chunk.shape[1] == layout.dim
+    targets = layout.split(chunk[0])
+    np.testing.assert_allclose(targets["left"]["q_d"], np.arange(7.0))
+    np.testing.assert_allclose(targets["right"]["q_d"], np.arange(7.0) + 10)
+    assert targets["left"]["gripper"] == 0.0
+
+
+def test_build_policy_rejects_unknown_kind():
+    cfg = _config()
+    cfg.policy.kind = "nonsense"
+    with pytest.raises(ValueError):
+        build_policy(cfg.policy, ActionLayout(cfg.arms, ["left"]), _observer(cfg))
+
+
+# --------------------------------------------------------------------------- #
+# EvalLoop: end-to-end with fakes
+# --------------------------------------------------------------------------- #
+
+
+class _FakeBrain:
+    def __init__(self, cfg):
+        self._cfg = cfg
+        self.commands = []
+
+    def observe(self):
+        return _full_observation(self._cfg)
+
+    def command(self, side, setpoint):
+        self.commands.append((side, np.asarray(setpoint)))
+
+
+class _ScriptedPolicy:
+    """Returns a fixed (horizon, dim) chunk; optionally fails the first N calls."""
+
+    def __init__(self, dim, horizon=4, fail_first=0):
+        self.dim = dim
+        self.horizon = horizon
+        self.fail_first = fail_first
+        self.calls = 0
+
+    def infer(self, obs):
+        self.calls += 1
+        if self.calls <= self.fail_first:
+            raise PolicyError("scripted failure")
+        return np.tile(np.arange(self.dim, dtype=np.float64), (self.horizon, 1))
+
+    def close(self):
+        pass
+
+
+class _StopAfter:
+    """Stop event that trips after N `is_set` checks (bounds the loop)."""
+
+    def __init__(self, n):
+        self._n = n
+
+    def is_set(self):
+        self._n -= 1
+        return self._n < 0
+
+    def set(self):
+        self._n = 0
+
+
+def _loop(cfg, brain, policy, layout, num_timesteps, replan_steps=0):
+    return EvalLoop(
+        brain, _observer(cfg), policy, layout,
+        control_arms={"left": cfg.arms["left"]},
+        frequency_hz=1000.0, num_timesteps=num_timesteps, replan_steps=replan_steps,
+    )
+
+
+def test_loop_executes_chunk_and_replans():
+    cfg = _config()
+    layout = ActionLayout(cfg.arms, ["left"])
+    brain = _FakeBrain(cfg)
+    policy = _ScriptedPolicy(layout.dim, horizon=4)
+    loop = _loop(cfg, brain, policy, layout, num_timesteps=6, replan_steps=2)
+    loop.run(_StopAfter(100))
+    assert loop.timesteps_done == 6
+    assert policy.calls == 3          # 2 executed actions per inference
+    assert len(brain.commands) == 6
+    side, setpoint = brain.commands[0]
+    assert side == "left"
+    assert setpoint.shape == (14,)    # qpos: q_d(7) + dq_d(7)
+    np.testing.assert_allclose(setpoint[:7], np.arange(7.0))   # q_d from the action
+    np.testing.assert_allclose(setpoint[7:], 0.0)              # dq_d zeroed
+
+
+def test_action_layout_is_control_kind_aware():
+    # Each arm's control kind sets its action space (primary field + width).
+    for kind, field, dim in [("qvel", "dq_d", 7), ("eef_vel", "twist_d", 6),
+                             ("end_effector", "pose_d", 7), ("force", "wrench_d", 6)]:
+        cfg = _config(f"control@arms.left.control={kind}")
+        layout = ActionLayout(cfg.arms, ["left"])
+        assert layout.field("left") == field
+        assert layout.dim == dim + 1                         # primary + gripper
+        assert layout.names[0] == f"left.{field}.0"
+        assert layout.names[-1] == "left.gripper"
+        split = layout.split(np.arange(float(layout.dim)))
+        np.testing.assert_allclose(split["left"][field], np.arange(float(dim)))
+
+
+def test_loop_executes_qvel_and_zero_fills_nothing():
+    cfg = _config("control@arms.left.control=qvel")
+    layout = ActionLayout(cfg.arms, ["left"])
+    brain = _FakeBrain(cfg)
+    policy = _ScriptedPolicy(layout.dim, horizon=3)
+    _loop(cfg, brain, policy, layout, num_timesteps=3, replan_steps=0).run(_StopAfter(100))
+    _, setpoint = brain.commands[0]
+    assert setpoint.shape == (7,)                             # streamed [dq_d]
+    np.testing.assert_allclose(setpoint, np.arange(7.0))      # dq_d = policy primary
+
+
+def test_loop_executes_end_effector_zeros_feedforward_twist():
+    cfg = _config("control@arms.left.control=end_effector")
+    layout = ActionLayout(cfg.arms, ["left"])
+    brain = _FakeBrain(cfg)
+    policy = _ScriptedPolicy(layout.dim, horizon=3)
+    _loop(cfg, brain, policy, layout, num_timesteps=3, replan_steps=0).run(_StopAfter(100))
+    _, setpoint = brain.commands[0]
+    assert setpoint.shape == (13,)                            # streamed [pose_d, twist_d]
+    np.testing.assert_allclose(setpoint[:7], np.arange(7.0))  # pose_d from action
+    np.testing.assert_allclose(setpoint[7:], 0.0)             # twist_d feedforward = 0
+
+
+def test_loop_force_holds_measured_pose_from_eef():
+    cfg = _config("control@arms.left.control=force")
+    layout = ActionLayout(cfg.arms, ["left"])
+    measured_pose = np.array([0.1, 0.2, 0.3, 1.0, 0.0, 0.0, 0.0])
+
+    class _BrainWithEef(_FakeBrain):
+        def observe(self):
+            snap = _full_observation(self._cfg)
+            snap["left/eef"] = _samples(measured_pose)        # arm's measured TCP pose
+            return snap
+
+    brain = _BrainWithEef(cfg)
+    policy = _ScriptedPolicy(layout.dim, horizon=3)
+    _loop(cfg, brain, policy, layout, num_timesteps=3, replan_steps=0).run(_StopAfter(100))
+    _, setpoint = brain.commands[0]
+    assert setpoint.shape == (13,)                            # streamed [wrench_d, pose_d]
+    np.testing.assert_allclose(setpoint[:6], np.arange(6.0))  # wrench_d = policy primary
+    np.testing.assert_allclose(setpoint[6:], measured_pose)   # pose_d held at measured
+
+
+def test_loop_force_holds_command_when_pose_unavailable():
+    # No eef stream in the snapshot -> can't build a force setpoint -> hold (no command),
+    # rather than silently commanding a zero pose.
+    cfg = _config("control@arms.left.control=force")
+    layout = ActionLayout(cfg.arms, ["left"])
+    brain = _FakeBrain(cfg)                                   # snapshot has no left/eef
+    policy = _ScriptedPolicy(layout.dim, horizon=3)
+    loop = _loop(cfg, brain, policy, layout, num_timesteps=3, replan_steps=0)
+    loop.run(_StopAfter(100))
+    assert brain.commands == []
+
+
+def test_loop_consumes_full_chunk_when_replan_zero():
+    cfg = _config()
+    layout = ActionLayout(cfg.arms, ["left"])
+    brain = _FakeBrain(cfg)
+    policy = _ScriptedPolicy(layout.dim, horizon=4)
+    loop = _loop(cfg, brain, policy, layout, num_timesteps=8, replan_steps=0)
+    loop.run(_StopAfter(100))
+    assert loop.timesteps_done == 8
+    assert policy.calls == 2
+
+
+def test_loop_holds_on_policy_error_then_recovers():
+    cfg = _config()
+    layout = ActionLayout(cfg.arms, ["left"])
+    brain = _FakeBrain(cfg)
+    policy = _ScriptedPolicy(layout.dim, horizon=4, fail_first=2)
+    loop = _loop(cfg, brain, policy, layout, num_timesteps=4)
+    loop.run(_StopAfter(100))
+    # Failed inferences hold (no command, timestep not counted), then recover.
+    assert loop.timesteps_done == 4
+    assert len(brain.commands) == 4
+    assert policy.calls == 3  # 2 failures + 1 success
+
+
+def test_loop_announces_horizon_end_target_per_inference():
+    """on_chunk gets the FULL chunk's last q_d (policy intent), once per inference —
+    even when replan_steps executes only a prefix of the chunk."""
+    cfg = _config()
+    layout = ActionLayout(cfg.arms, ["left"])
+    brain = _FakeBrain(cfg)
+    policy = _ScriptedPolicy(layout.dim, horizon=4)
+    announced = []
+    loop = _loop(cfg, brain, policy, layout, num_timesteps=6, replan_steps=2)
+    loop._on_chunk = announced.append
+    loop.run(_StopAfter(100))
+    assert len(announced) == policy.calls == 3
+    assert set(announced[0]) == {"left"}
+    # scripted chunk rows are all arange(dim): last row's q_d = first 7 values
+    np.testing.assert_allclose(announced[0]["left"], np.arange(7.0))
+
+
+def test_loop_survives_failing_horizon_hook():
+    cfg = _config()
+    layout = ActionLayout(cfg.arms, ["left"])
+    brain = _FakeBrain(cfg)
+    policy = _ScriptedPolicy(layout.dim, horizon=4)
+
+    def bad_hook(targets):
+        raise RuntimeError("viz exploded")
+
+    loop = _loop(cfg, brain, policy, layout, num_timesteps=4)
+    loop._on_chunk = bad_hook
+    loop.run(_StopAfter(100))  # must not raise
+    assert loop.timesteps_done == 4
+
+
+def test_loop_rejects_wrong_action_dim():
+    cfg = _config()
+    layout = ActionLayout(cfg.arms, ["left"])
+    brain = _FakeBrain(cfg)
+    policy = _ScriptedPolicy(dim=3, horizon=4)  # checkpoint/config mismatch
+    loop = _loop(cfg, brain, policy, layout, num_timesteps=4)
+    with pytest.raises(ValueError):
+        loop.run(_StopAfter(100))
+
+
+# --------------------------------------------------------------------------- #
+# Config composition
+# --------------------------------------------------------------------------- #
+
+
+def test_policy_config_composes():
+    cfg = _config()
+    assert cfg.policy.kind == "remote"
+    assert cfg.policy.schema == "openpi"
+    assert cfg.policy.port == 8000
+    assert cfg.task.eval.frequency_hz == pytest.approx(15.0)
+
+    cfg2 = _config("policy.kind=hold", "policy.replan_steps=8", "policy.host=jeju")
+    assert (cfg2.policy.kind, cfg2.policy.replan_steps, cfg2.policy.host) == ("hold", 8, "jeju")
+
+
+def test_acme_policy_config_composes():
+    cfg = _config("policy=acme")
+    assert cfg.policy.schema == "acme"
+    assert cfg.policy.transport == "http"
+    assert cfg.policy.port == 53805
+    assert cfg.policy.qpos_slice == [0, 7]
+    assert cfg.policy.acme_image_keys["exterior_image_1_left"] == "static_left"

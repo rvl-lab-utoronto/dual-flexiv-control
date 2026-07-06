@@ -20,10 +20,49 @@ from dual_flexiv_control.configs import TaskCfg
 from dual_flexiv_control.configs import register_configs
 
 
-def _compose(*overrides: str):
+def _compose(*overrides: str, config_name: str = "config"):
     register_configs()
     with initialize_config_module(config_module="dual_flexiv_control.conf", version_base=None):
-        return compose(config_name="config", overrides=list(overrides))
+        return compose(config_name=config_name, overrides=list(overrides))
+
+
+def test_stream_dummy_flag_defaults_false():
+    cfg = _compose()
+    assert cfg.arms.left.streams.q.dummy is False  # real hardware by default
+
+
+def test_runtime_save_grace_default_and_override():
+    # The shutdown window the recording node gets to finalize its episode video
+    # (see system._shutdown). Generous by default; CLI-tunable like any field.
+    assert _compose().runtime.save_grace_s == pytest.approx(300.0)
+    assert _compose("runtime.save_grace_s=15").runtime.save_grace_s == pytest.approx(15.0)
+
+
+def test_test_config_is_dummy_arm_plus_real_static_camera():
+    cfg = OmegaConf.to_object(_compose(config_name="test"))
+    # single dummy arm, single real camera, left-only FACTR
+    assert set(cfg.arms) == {"left"}
+    assert set(cfg.cameras) == {"static"}
+    assert set(cfg.factr.servers) == {"left"}
+    assert cfg.arms["left"].control_enabled is False
+    assert all(s.dummy for s in cfg.arms["left"].streams.values())  # whole arm fabricated
+    assert cfg.cameras["static"].auto_serial is True                # binds the connected ZED
+
+
+def test_flexiv_interface_uses_fake_source_when_streams_dummy(tmp_path):
+    from dual_flexiv_control.configs import RuntimeCfg
+    from dual_flexiv_control.interfaces.flexiv import FlexivInterface
+    from dual_flexiv_control.interfaces.flexiv.source import FakeFlexivSource
+
+    cfg = OmegaConf.to_object(_compose(config_name="test"))
+    runtime = RuntimeCfg(runtime_dir=str(tmp_path), sim=False)  # NOT global sim
+    node = FlexivInterface("left", cfg.arms["left"], runtime, run_id="t")
+    node.open_source()
+    try:
+        # dummy streams -> fabricated source even though runtime.sim is False
+        assert isinstance(node._source, FakeFlexivSource)
+    finally:
+        node.close_source()
 
 
 def test_composes_to_typed_objects_and_pickles():
@@ -114,12 +153,16 @@ def test_cameras_compose_to_typed_objects():
     obj = OmegaConf.to_object(_compose())
     assert set(obj.cameras) == {"wrist_left", "wrist_right", "static"}
     assert isinstance(obj.cameras["static"], CameraCfg)
-    # Wrist cams: ZED X Nano, left RGB only; static cam: ZED 2, stereo RGB.
+    # Wrist cams: ZED X Nano, left RGB only; static cam: ZED 2, stereo RGB + depth.
     assert obj.cameras["wrist_left"].model == "zedx_nano"
     assert obj.cameras["wrist_left"].views == ["left"]
     assert obj.cameras["static"].model == "zed2"
-    assert obj.cameras["static"].views == ["left", "right"]
+    assert obj.cameras["static"].views == ["left", "right", "depth"]
+    assert obj.cameras["static"].depth_mode == "ULTRA"  # depth view needs != NONE
     assert obj.cameras["wrist_left"].placement == "wrist_left"
+    # RGB-D overlay extrinsics: static cam anchored to the left arm's URDF base.
+    assert obj.cameras["static"].pose_frame == "mount_left"
+    assert obj.cameras["wrist_left"].pose_frame == "world"  # schema default
 
 
 def test_camera_stream_specs_derive_image_dims():
@@ -134,9 +177,13 @@ def test_camera_stream_specs_derive_image_dims():
     assert specs[left].rate_hz == wl.fps
 
     static = obj.cameras["static"]
-    assert {s.name for s in camera_streams_to_specs("static", static)} == {
-        "cam/static/left", "cam/static/right",
+    static_specs = {s.name: s for s in camera_streams_to_specs("static", static)}
+    assert set(static_specs) == {
+        "cam/static/left", "cam/static/right", "cam/static/depth",
     }
+    depth = static_specs["cam/static/depth"]
+    assert depth.dim == static.width * static.height  # single channel
+    assert depth.dtype == "float32"
 
 
 def test_camera_cli_overrides():

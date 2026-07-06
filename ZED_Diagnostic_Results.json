@@ -1,0 +1,177 @@
+{
+    "AI Models": {
+        "info": [
+            "MULTI CLASS DETECTION is not optimized",
+            "MULTI CLASS MEDIUM DETECTION is not optimized",
+            "MULTI CLASS ACCURATE DETECTION is not optimized",
+            "HUMAN BODY FAST DETECTION is not optimized",
+            "HUMAN BODY MEDIUM DETECTION is not optimized",
+            "HUMAN BODY ACCURATE DETECTION is not optimized",
+            "HUMAN BODY 38 FAST DETECTION is not optimized",
+            "HUMAN BODY 38 MEDIUM DETECTION is not optimized",
+            "HUMAN BODY 38 ACCURATE DETECTION is not optimized",
+            "PERSON HEAD DETECTION is not optimized",
+            "PERSON HEAD ACCURATE DETECTION is not optimized",
+            "REID ASSOCIATION is not optimized",
+            "NEURAL LIGHT DEPTH is not optimized",
+            "NEURAL DEPTH is not optimized",
+            "NEURAL PLUS DEPTH is not optimized"
+        ]
+    },
+    "Camera Test": {
+        "InternalDevicesCount (GMSL)": 0,
+        "InternalDevicesCount (USB)": 2,
+        "ZEDCount": 0,
+        "ZEDs": [
+        ],
+        "error": [
+            "<b>Camera not detected</b> <br/> Make sure the camera is plugged in or try another USB 3.0 port."
+        ]
+    },
+    "Devices": {
+        "CorruptedFirmware": false,
+        "MCUDetected": true,
+        "USBList": [
+            {
+                "USBMode": 3,
+                "USB_path": "/1",
+                "bDescriptorType": 1,
+                "bDeviceProtocol": 1,
+                "bLength": 18,
+                "bMaxPacketSize0": 9,
+                "bNumConfigurations": 1,
+                "bcdDevice": "1.0",
+                "bcdUSB": "3.0",
+                "bcdUSBClass": 239,
+                "bcdUSBSubClass": 2,
+                "busNumber": 2,
+                "device": "ZED2i",
+                "iManufacturer": 1,
+                "iProduct": 2,
+                "iSerial": 4,
+                "idProduct": "0xf880",
+                "idVendor": "0x2b03"
+            },
+            {
+                "USB_path": "/9",
+                "idProduct": "0x6014",
+                "idVendor": "0x0403"
+            },
+            {
+                "USB_path": "/8",
+                "idProduct": "0xe009",
+                "idVendor": "0x0cf3"
+            },
+            {
+                "USB_path": "/4",
+                "idProduct": "0x0550",
+                "idVendor": "0x187c"
+            },
+            {
+                "USB_path": "/14",
+                "idProduct": "0x2113",
+                "idVendor": "0x413c"
+            },
+            {
+                "USBMode": 2,
+                "USB_path": "/13/2",
+                "bDescriptorType": 1,
+                "bDeviceProtocol": 0,
+                "bLength": 18,
+                "bMaxPacketSize0": 64,
+                "bNumConfigurations": 1,
+                "bcdDevice": "3.9",
+                "bcdUSB": "2.0",
+                "bcdUSBClass": 0,
+                "bcdUSBSubClass": 0,
+                "busNumber": 1,
+                "device": "ZED2i MCU",
+                "iManufacturer": 1,
+                "iProduct": 2,
+                "iSerial": 3,
+                "idProduct": "0xf881",
+                "idVendor": "0x2b03"
+            },
+            {
+                "USB_path": "/13",
+                "idProduct": "0x2512",
+                "idVendor": "0x0424"
+            },
+            {
+                "USB_path": "/12",
+                "idProduct": "0x4e8d",
+                "idVendor": "0x0461"
+            }
+        ],
+        "USBMode": 3,
+        "ZED Camera Module Detected": 63616,
+        "ZED MCU Module Detected": 63617,
+        "ZEDDetected": true,
+        "notTested": [
+            "Please connect a camera to test the USB connection."
+        ]
+    },
+    "Graphics Card": {
+        "deviceCount": 1,
+        "deviceDriverVersion": 13030,
+        "devices": [
+            {
+                "arch": "Turing",
+                "computeCapability": "7.5",
+                "cores": 8704,
+                "name": "NVIDIA GeForce RTX 2080 Ti",
+                "totalMemoryBytes": "11348213760",
+                "totalMemoryMB": 10822.5
+            }
+        ],
+        "glx_info": "OpenGL vendor string: NVIDIA Corporation\nOpenGL renderer string: NVIDIA GeForce RTX 2080 Ti/PCIe/SSE2\nOpenGL core profile version string: 4.6.0 NVIDIA 610.43.02\nOpenGL core profile shading language version string: 4.60 NVIDIA\nOpenGL core profile context flags: (none)\nOpenGL core profile profile mask: core profile\nOpenGL core profile extensions:\nOpenGL version string: 4.6.0 NVIDIA 610.43.02\nOpenGL shading language version string: 4.60 NVIDIA\nOpenGL context flags: (none)\nOpenGL profile mask: (none)\nOpenGL extensions:\nOpenGL ES profile version string: OpenGL ES 3.2 NVIDIA 610.43.02\nOpenGL ES profile shading language version string: OpenGL ES GLSL ES 3.20\nOpenGL ES profile extensions:\n",
+        "initResult": 0,
+        "valid": [
+            "<b>Graphics card: </b> NVIDIA GeForce RTX 2080 Ti"
+        ]
+    },
+    "Processor": {
+        "OS": "Ubuntu 22.04.5 LTS ",
+        "avxSupported": true,
+        "coreCount": "16",
+        "cpu": " Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz",
+        "datetime": "2026-07-06 02:18:20 PM",
+        "hyperThreading": "1",
+        "motherboard": "02XRCM, Alienware",
+        "ramCapacity": "50.183467",
+        "ramUsage": "",
+        "ramUsed": "45.379260",
+        "threadCount": "32",
+        "valid": [
+            "<b>Processor: </b>  Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz",
+            "<b>Motherboard: </b> 02XRCM, Alienware"
+        ]
+    },
+    "ZED SDK": {
+        "CUDA Toolkit version": "V12.1.105 -->located in /usr/local/cuda-12.1/bin/nvcc",
+        "GPU Driver Version": "Driver Version                                         : 610.43.02 [Deprecated; will be removed in CUDA 14.0. Use KMD Version instead]",
+        "GPU Performance": "    Performance State                                  : P2",
+        "ZED SDK Version (Diag)": "5.0.7",
+        "ai": {
+            "checkAI": false,
+            "cudaVersion": 12010,
+            "loadAI": "SL AI NOT FOUND",
+            "tensorVersion": 8601
+        },
+        "binFiles": [
+            "libsl_ai.so",
+            "libsl_zed.so"
+        ],
+        "error": [
+            "<b>Loading ZED binaries :</b> libnvinfer.so.10: cannot open shared object file: No such file or directory"
+        ],
+        "resourcesFiles": [
+        ],
+        "resourcesFilesExpected": [
+            "objects_performance_3.2"
+        ],
+        "valid": [
+            "<b>CUDA version:</b> V12.1.105"
+        ]
+    }
+}

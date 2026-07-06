@@ -1,0 +1,43 @@
+# Test config: the real static ZED 2i camera + a DUMMY (fabricated) left arm.
+#
+# For bench bring-up / pipeline testing when the robots aren't connected: the left
+# arm publishes fabricated proprio (no flexivrdk connection — see arm/flexiv_dummy),
+# while the static camera opens the real connected ZED. Actions are recorded from the
+# real left FACTR leader (:5000). No right arm, no wrist cameras.
+#
+# Run (collection is the useful phase here):
+#   dual-flexiv-control --config-name test runtime.phase=collection
+#   dual-flexiv-control --config-name test runtime.phase=collection runtime.duration_s=8
+defaults:
+  - base_config
+  - runtime: default
+  - brain: default
+  - factr: left                        # left leader only (:5000)
+  - task: default
+  - policy: openpi
+  - arm@arms.left: flexiv_dummy         # fabricated proprio — no robot connection
+  - control@arms.left.control: qpos
+  - camera@cameras.static: zed2_static  # the real connected ZED 2i
+  - _self_
+
+task:
+  collection:
+    repo_id: dfc/test                   # keep test recordings out of the real dataset
+
+arms:
+  left:
+    name: "Lauer (dummy)"
+    serial: Rizon4s-062841
+    control_enabled: false              # no real robot to drive; record only
+
+cameras:
+  static:
+    placement: static
+    serial: ""
+    auto_serial: true                   # bind to the sole connected ZED
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: outputs/${now:%Y-%m-%d_%H-%M-%S}

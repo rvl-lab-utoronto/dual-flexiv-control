@@ -41,6 +41,17 @@ from .states import map_states
 
 log = logging.getLogger(__name__)
 
+#: Leaf name of the per-arm status stream the dashboard reads to tell "connected"
+#: from "disconnected" (and to show operation mode + E-stop). Published as
+#: ``"<side>/status"`` — the consumer counterpart is ``dashboard.arms.STATUS_STREAM``.
+STATUS_SIGNAL = "status"
+#: 2-vector ``[operational_status_code, estop_pressed]``.
+STATUS_DIM = 2
+#: Refresh the (slow-changing) operation-mode/E-stop read at ~10 Hz regardless of the
+#: telemetry/control loop rate: the RDK status calls are pointless to run at 1 kHz and
+#: this keeps them off the hot control path's per-tick budget.
+STATUS_RATE_HZ = 10.0
+
 
 class FlexivInterface(StreamProducerNode):
     """Reads one Flexiv arm and publishes its proprio signals as streams.
@@ -72,12 +83,60 @@ class FlexivInterface(StreamProducerNode):
         #: Active-phase controller coefficients (applied only when control_enabled).
         self.coeffs = coeffs if coeffs is not None else ControlCoeffsCfg()
         self._source: FlexivSource | FakeFlexivSource | None = None
+        #: Cached ``[op_status_code, estop_pressed]`` + next-refresh deadline; the
+        #: status read is throttled to ``STATUS_RATE_HZ`` (see :meth:`_status_signal`).
+        self._status_cache: np.ndarray | None = None
+        self._status_next_ns: int = 0
 
     def declare_streams(self) -> list[StreamSpec]:
-        return streams_to_specs(self.side, self.arm.streams)
+        # Proprio streams (from config) + the dashboard-facing status stream. The
+        # latter is published like the camera streams: not part of the brain's
+        # observation set, only the dashboard's connection/mode indicator reads it.
+        specs = streams_to_specs(self.side, self.arm.streams)
+        specs.append(
+            StreamSpec(
+                name=f"{self.side}/{STATUS_SIGNAL}",
+                dim=STATUS_DIM,
+                capacity=64,
+                dtype="float64",
+                rate_hz=STATUS_RATE_HZ,
+            )
+        )
+        return specs
+
+    def _status_signal(self, now_ns: int) -> np.ndarray:
+        """Cached ``[op_status_code, estop_pressed]``, refreshed at ~``STATUS_RATE_HZ``.
+
+        A transient status read failure is swallowed (reusing the last value, or
+        ``UNKNOWN``/clear on the very first tick): the status stream is a cosmetic
+        dashboard indicator and must never take down the arm's data/control loop.
+        """
+        if self._status_cache is None or now_ns >= self._status_next_ns:
+            try:
+                self._status_cache = self._source.read_status()
+            except Exception:  # noqa: BLE001 - status is cosmetic; never kill the loop
+                log.debug("[%s] status read failed; reusing last", self.name, exc_info=True)
+                if self._status_cache is None:
+                    self._status_cache = np.zeros(STATUS_DIM)  # UNKNOWN, estop clear
+            self._status_next_ns = now_ns + int(1e9 / STATUS_RATE_HZ)
+        return self._status_cache
 
     def open_source(self) -> None:
-        if self.sim:
+        # A stream marked `dummy` means "fabricate, don't read hardware". One robot
+        # connection feeds all of an arm's proprio streams, so it's all-or-nothing:
+        # fabricate the whole arm (no flexivrdk connect) when every stream is dummy.
+        streams = self.arm.streams.values()
+        dummy = bool(streams) and all(getattr(s, "dummy", False) for s in streams)
+        any_dummy = any(getattr(s, "dummy", False) for s in streams)
+        if any_dummy and not dummy:
+            log.warning(
+                "[%s] some but not all proprio streams are dummy — a real robot can't "
+                "fabricate a subset; treating the arm as REAL (connecting hardware).",
+                self.name,
+            )
+        if self.sim or dummy:
+            if dummy and not self.sim:
+                log.info("[%s] publishing DUMMY (fabricated) proprio — no robot connection", self.name)
             self._source = FakeFlexivSource(self.arm.serial, dof=self.arm.dof)
         else:
             self._source = FlexivSource(
@@ -92,7 +151,9 @@ class FlexivInterface(StreamProducerNode):
         rs = self._source.read()
         # map_states emits float64; each writer casts to its stream's dtype.
         signals = map_states(rs, self.arm.wrench_frame)
-        return {f"{self.side}/{sig}": vec for sig, vec in signals.items()}
+        out = {f"{self.side}/{sig}": vec for sig, vec in signals.items()}
+        out[f"{self.side}/{STATUS_SIGNAL}"] = self._status_signal(time.monotonic_ns())
+        return out
 
     def close_source(self) -> None:
         if self._source is not None:
@@ -164,9 +225,12 @@ class FlexivInterface(StreamProducerNode):
                 t_ns = time.monotonic_ns()
                 rs = self._source.read()
 
-                # (a) telemetry out
+                # (a) telemetry out (+ the dashboard status stream, self-throttled)
                 for sig, vec in map_states(rs, self.arm.wrench_frame).items():
                     self._writers[f"{self.side}/{sig}"].write(vec, t_ns)
+                self._writers[f"{self.side}/{STATUS_SIGNAL}"].write(
+                    self._status_signal(t_ns), t_ns
+                )
 
                 # (b) fault watchdog
                 if self._source.fault():
@@ -220,6 +284,12 @@ class FlexivInterface(StreamProducerNode):
         The arm is already servoed and operational here, so a command-channel STOP must
         abort this wait too — it is drained each iteration (stop_event covers only
         process shutdown, not an operator/brain STOP).
+
+        Telemetry keeps streaming during the wait: a policy-driven brain (eval)
+        computes its first setpoint FROM the measured state, so withholding
+        telemetry until the first setpoint would deadlock the bootstrap
+        (observation incomplete <-> no setpoint). Teleop brains don't need this
+        but the dashboard still benefits (live state while waiting).
         """
         deadline = time.monotonic() + self.arm.control_attach_timeout_s
         while not stop_event.is_set():
@@ -235,6 +305,12 @@ class FlexivInterface(StreamProducerNode):
                     self.name, self.arm.control_attach_timeout_s,
                 )
                 return None
+            t_ns = time.monotonic_ns()
+            for sig, vec in map_states(self._source.read(), self.arm.wrench_frame).items():
+                self._writers[f"{self.side}/{sig}"].write(vec, t_ns)
+            self._writers[f"{self.side}/{STATUS_SIGNAL}"].write(
+                self._status_signal(t_ns), t_ns
+            )
             time.sleep(0.01)
         return None
 

@@ -53,6 +53,13 @@ def _integrate_pose(pose: np.ndarray, twist: np.ndarray, dt: float) -> np.ndarra
     return np.concatenate([pos, qn])
 
 
+#: Synthetic operation status for the hardware-free source: ``READY`` (the value
+#: of ``flexivrdk.OperationalStatus.READY`` in RDK 1.8.0) with the E-stop clear, so
+#: a sim run shows the dashboard "connected · Auto (Remote)" instead of disconnected.
+#: Hard-coded rather than importing flexivrdk to keep this source usable with no wheel.
+_SIM_STATUS = np.array([1.0, 0.0], dtype=np.float64)  # [OperationalStatus.READY, estop_pressed]
+
+
 class SafetyHalt(RuntimeError):
     """Raised by the control send path when a safety gate trips; the caller halts."""
 
@@ -120,6 +127,23 @@ class FlexivSource:
         arm (one ``Robot`` connection per arm), not a dict keyed by joint group.
         """
         return self._robot.states()
+
+    def read_status(self) -> np.ndarray:
+        """``[operational_status_code, estop_pressed]`` for the dashboard status stream.
+
+        Read from the ``Robot`` object (not ``RobotStates``): ``operational_status()``
+        returns a ``flexivrdk.OperationalStatus`` enum whose ``.value`` the dashboard
+        maps back to a friendly label, and ``estop_released()`` is the *inverse* of the
+        ``estop_pressed`` flag the stream carries. Available whenever connected — the
+        arm need not be enabled/operational (read-only runs report e.g. ``NOT_ENABLED``).
+        """
+        return np.array(
+            [
+                float(self._robot.operational_status().value),
+                float(not self._robot.estop_released()),
+            ],
+            dtype=np.float64,
+        )
 
     # -- control half (write path) --------------------------------------------
     #
@@ -364,6 +388,10 @@ class FakeFlexivSource:
             ext_wrench_in_tcp=wrench,
             ext_wrench_in_world=wrench,
         )
+
+    def read_status(self) -> np.ndarray:
+        """Synthetic status: operational (``READY``) with the E-stop clear."""
+        return _SIM_STATUS.copy()
 
     # -- control half (no hardware; mirrors FlexivSource's contract) ----------
 
