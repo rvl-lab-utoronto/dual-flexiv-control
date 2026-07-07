@@ -70,8 +70,8 @@ class FakeManager:
     def ensure(self, rig, sim):
         return False
 
-    def start_run(self, phase, task):
-        self.commands.append(("start", phase, task))
+    def start_run(self, phase, task, host=None, port=None):
+        self.commands.append(("start", phase, task, host, port))
         return True
 
     def stop_run(self):
@@ -92,7 +92,13 @@ def _registry(**view_kwargs):
 def test_launch_sends_start_command_from_viewing():
     registry, mgr = _registry()
     registry.launch(_task(), "collection", rig="bimanual")
-    assert mgr.commands == [("start", "collection", "fake")]
+    assert mgr.commands == [("start", "collection", "fake", None, None)]
+
+
+def test_launch_forwards_eval_policy_host_and_port():
+    registry, mgr = _registry()
+    registry.launch(_task(), "eval", rig="bimanual", host="100.92.86.90", port=8000)
+    assert mgr.commands == [("start", "eval", "fake", "100.92.86.90", 8000)]
 
 
 def test_launch_refused_while_run_active():

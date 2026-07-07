@@ -85,9 +85,12 @@ class RerunServers:
         ``URLSearchParams``, which percent-decodes), so the gRPC URI must be
         percent-encoded — otherwise the bare viewer just shows its welcome page.
         ``persist=0`` keeps each load fresh so blueprint/phase switches aren't
-        masked by cached viewer state.
+        masked by cached viewer state. ``renderer=webgl`` forces the WebGL
+        backend: when the browser exposes WebGPU via Dawn's GL-compatibility
+        mode (Chrome on Linux/NVIDIA), the viewer's preferred WebGPU path runs
+        ~50x slower than WebGL on the same GPU (measured 0.6 vs 32 fps).
         """
-        return f"{self.web_base}/?url={quote(self.grpc_uri, safe='')}&persist=0"
+        return f"{self.web_base}/?url={quote(self.grpc_uri, safe='')}&persist=0&renderer=webgl"
 
 
 def start_servers(

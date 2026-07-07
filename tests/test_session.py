@@ -64,6 +64,14 @@ def test_run_overrides_repin_task_and_phase():
     assert got == ["task.eval.num_timesteps=10", "task=t", "runtime.phase=eval"]
 
 
+def test_run_overrides_extra_repins_matching_session_override():
+    got = run_overrides(
+        ["rig=bench", "policy.port=1111"],
+        task="t", phase="eval", extra=["policy.port=8000"],
+    )
+    assert got == ["rig=bench", "task=t", "runtime.phase=eval", "policy.port=8000"]
+
+
 def test_state_file_roundtrip(tmp_path):
     from dual_flexiv_control.session import SessionState
     from dual_flexiv_control.session import StateFile
@@ -265,6 +273,8 @@ def test_camera_death_is_not_fatal_and_respawns(tmp_path, monkeypatch):
 
     monkeypatch.setattr(sess, "_CAMERA_RESPAWN_S", 0.5)
     monkeypatch.setattr(sess, "_CAMERA_BOOT_GRACE_S", 10.0)
+    monkeypatch.setattr(sess, "_CAMERA_FRESH_S", 1.0)
+    monkeypatch.setattr(sess, "_CAMERA_KILL_GRACE_S", 0.2)
     daemon = sess.SessionDaemon(config, overrides)
     try:
         daemon.start_hardware()
@@ -298,6 +308,27 @@ def test_camera_death_is_not_fatal_and_respawns(tmp_path, monkeypatch):
         # The camera respawns (paced) and recovers on its own.
         _tend_until(lambda: daemon.state.cameras_down == [], 30.0,
                     "killed camera never respawned/recovered")
+
+        # Wedge a camera ALIVE (SIGSTOP freezes it mid-loop, like a ZED whose
+        # device dropped: process up, frames stale). The supervisor must report
+        # it down, then kill + respawn it — a wedged handle never heals in
+        # place, so waiting on the old process would show "waiting on camera"
+        # forever even after a replug.
+        import signal as _signal
+        victim = daemon.cameras[1]
+        wedged_pid = victim.proc.pid
+        os.kill(wedged_pid, _signal.SIGSTOP)
+        try:
+            _tend_until(lambda: victim.node.name in daemon.state.cameras_down, 20.0,
+                        "stalled camera never reported down")
+            _tend_until(lambda: daemon.state.cameras_down == [], 30.0,
+                        "stalled camera never killed/respawned/recovered")
+        finally:
+            try:  # unfreeze on failure so teardown/escalation can reap it
+                os.kill(wedged_pid, _signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+        assert victim.proc.pid != wedged_pid, "stalled camera was not replaced"
     finally:
         daemon._teardown()
 

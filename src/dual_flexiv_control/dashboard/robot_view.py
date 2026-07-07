@@ -69,10 +69,10 @@ _ARM_COLOR = {"left": [80, 160, 255], "right": [255, 140, 80]}
 #: off / no system publishing ``<side>/q``): a muted red so it reads as "stale, not
 #: tracking". The arm also stops moving (see :func:`~.runner._emit_collection_view`).
 _STALE_COLOR = [200, 90, 85]
-#: Translucent "ghost" of each arm at the *commanded* teleop config (RGBA). Rerun 0.33
-#: renders alpha for Capsules3D/Mesh3D but NOT Points3D/LineStrips3D, so the ghost is
-#: drawn as capsules (genuinely translucent) while the solid real arm stays line-strips.
-_GHOST_COLOR = {"left": [130, 190, 255, 80], "right": [255, 190, 140, 80]}
+#: Translucent "ghost" of each arm at the *commanded* teleop config (RGBA): the same
+#: URDF visual meshes as the solid arm, flat-tinted in the side's colour at 20%
+#: alpha (Rerun 0.33 honours alpha for Mesh3D/Capsules3D but not LineStrips3D).
+_GHOST_COLOR = {"left": [130, 190, 255, 51], "right": [255, 190, 140, 51]}
 #: Translucent purple ghost at the policy's horizon-END joint target (eval), plus the
 #: solid purple used for the current-EEF → horizon-EEF trace (LineStrips3D ignore
 #: alpha in 0.33, so the trace is solid on purpose). Same purple for both sides —
@@ -498,10 +498,11 @@ def _log_arm_geometry(rec, side: str, chain: list[_Link], *, ghost: bool) -> Non
     """Log one arm's constant geometry (static) in each link's frame.
 
     Real arm = the URDF's visual meshes (or the ``LineStrips3D`` + ``Points3D``
-    skeleton if the mesh files are missing). Ghost arm = translucent
-    ``Capsules3D`` bones (alpha-honoured in 0.33). The FK ``Transform3D``s that
-    place these are logged separately by :func:`_log_arm_pose`, so animating the
-    arm re-logs only the transforms, not this geometry.
+    skeleton if the mesh files are missing). Ghost arm = those same meshes
+    flat-tinted translucent (capsule bones when the mesh files are missing).
+    The FK ``Transform3D``s that place these are logged separately by
+    :func:`_log_arm_pose`, so animating the arm re-logs only the transforms,
+    not this geometry.
     """
     root = _arm_root(side, ghost)
     mount = _MOUNTS[side]
@@ -516,7 +517,57 @@ def _log_arm_geometry(rec, side: str, chain: list[_Link], *, ghost: bool) -> Non
         else:
             _log_real_skeleton(rec, side, chain, _ARM_COLOR[side], static=True)
         return
-    _log_ghost_capsules(rec, root, chain, _GHOST_COLOR[side], static=True)
+    _log_ghost_geometry(rec, root, chain, _GHOST_COLOR[side], static=True)
+
+
+def _log_ghost_geometry(rec, root: str, chain: list[_Link], color, *, static: bool) -> None:
+    """A ghost arm under ``root``: translucent URDF meshes, or capsule bones without meshes."""
+    if _has_mesh_visuals(chain):
+        _log_ghost_meshes(rec, root, chain, color, static=static)
+    else:
+        _log_ghost_capsules(rec, root, chain, color, static=static)
+
+
+def _log_ghost_meshes(rec, root: str, chain: list[_Link], color, *, static: bool) -> None:
+    """The full URDF visual meshes as a translucent ghost arm under ``root``.
+
+    Mirrors :func:`_log_arm_meshes`'s entity layout (cumulative link nesting +
+    per-visual origin transform) so the same FK transforms from
+    :func:`_log_arm_pose` pose it — but every mesh part gets the flat RGBA
+    ``color`` as its albedo (alpha included; Mesh3D honours it in Rerun 0.33)
+    instead of its MTL colour, so the ghost reads as one translucent tint.
+    """
+    albedo = tuple(c / 255.0 for c in color)
+    path = root
+    logged_transform = set()
+    for lk in chain:
+        path = f"{path}/{lk.name}"
+        for vis in lk.visuals:
+            if not vis.mesh.is_file():
+                continue
+            parent = f"{path}/visual/{vis.name}"
+            if parent not in logged_transform:
+                logged_transform.add(parent)
+                rec.log(
+                    parent,
+                    rr.Transform3D(
+                        translation=vis.xyz,
+                        quaternion=rr.Quaternion(xyzw=_quat_from_rpy(*vis.rpy)),
+                        scale=vis.scale,
+                    ),
+                    static=static,
+                )
+            for part in _load_obj(vis.mesh):
+                rec.log(
+                    f"{parent}/{part.material}",
+                    rr.Mesh3D(
+                        vertex_positions=part.positions,
+                        triangle_indices=part.indices,
+                        vertex_normals=part.normals,
+                        albedo_factor=albedo,
+                    ),
+                    static=static,
+                )
 
 
 def _log_ghost_capsules(rec, root: str, chain: list[_Link], color, *, static: bool) -> None:
@@ -704,7 +755,7 @@ def update_horizon_targets(rec, target_q: dict, real_q: dict, t: float) -> None:
                 ),
                 static=False,
             )
-            _log_ghost_capsules(rec, root, chain, _TARGET_COLOR, static=False)
+            _log_ghost_geometry(rec, root, chain, _TARGET_COLOR, static=False)
         _log_arm_pose(rec, side, chain, q, ghost=False, static=False, root=root)
 
         rq = real_q.get(side)

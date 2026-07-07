@@ -181,13 +181,18 @@ class RunRegistry:
 
     # -- launch / stop ---------------------------------------------------------------
 
-    def launch(self, task: TaskInfo, phase: str, rig: str = "bimanual") -> None:
+    def launch(
+        self, task: TaskInfo, phase: str, rig: str = "bimanual",
+        host: str | None = None, port: int | None = None,
+    ) -> None:
         """Ask the daemon to start ``phase`` for ``task``; raises on a refusal.
 
         The daemon composes ``task=<name>`` itself (validating it), hands the
         phase's coefficients to the arms, and spawns the real consumer — the same
         node the CLI runs. ``rig`` is the *session's* rig; a mismatch means the
-        session needs a restart (surfaced, not silently absorbed).
+        session needs a restart (surfaced, not silently absorbed). ``host`` /
+        ``port`` (eval only) override ``policy.host`` / ``policy.port`` for
+        this run; None keeps the task's policy config.
         """
         if phase not in PHASES:
             raise ValueError(f"unknown phase {phase!r} (expected one of {PHASES})")
@@ -209,9 +214,12 @@ class RunRegistry:
                 f"the session holds rig {view.rig!r} but {rig!r} is selected — wait "
                 "for the session to restart onto the new rig, then launch"
             )
-        if not self.manager.start_run(phase, task.name):
+        if not self.manager.start_run(phase, task.name, host=host, port=port):
             raise RuntimeError("could not reach the session daemon — see the Logs tab")
-        _log_event(f"launch {phase} · task={task.name} · rig={view.rig or rig}")
+        detail = ""
+        if host is not None or port is not None:
+            detail = f" · policy {host or 'config-host'}:{port or 'config-port'}"
+        _log_event(f"launch {phase} · task={task.name} · rig={view.rig or rig}{detail}")
 
     def stop_active(self) -> None:
         """Ask the daemon to stop the active run (non-blocking; episode saves)."""
@@ -512,8 +520,13 @@ class SessionMirror:
         state_every = max(1, round(_MIRROR_HZ))        # poll session.json ~1 Hz
         layout_key: tuple | None = None
         step = 0
+        # Anchor the viewer timeline to the wall clock (monotonic), NOT step*dt: an
+        # iteration that overruns dt must show up as sparser samples at their true
+        # times, never as the timeline lagging further and further behind reality.
+        t0_ns = time.monotonic_ns()
+        slow_warned = 0.0  # last time (s since t0) a slow-tick warning was logged
         while not stop.is_set():
-            t = step * dt
+            t = (time.monotonic_ns() - t0_ns) / 1e9
             rr.set_time("elapsed", duration=t)
 
             if step % state_every == 0:  # follow the session's mode (layout + README)
@@ -555,6 +568,17 @@ class SessionMirror:
                 else:
                     robot_view.clear_horizon_targets(robot_rec)
             step += 1
-            stop.wait(dt)
+            # Pace to the tick boundary: sleep only the remainder of dt. When an
+            # iteration overruns, surface it (throttled) — a slow mirror otherwise
+            # just looks like "the viewer is slow" with nothing in the logs.
+            tick_s = (time.monotonic_ns() - t0_ns) / 1e9 - t
+            if tick_s > 4 * dt and t - slow_warned > 30.0:
+                slow_warned = t
+                log.warning(
+                    "session mirror tick took %.2fs (target %.3fs) — live view is "
+                    "updating slower than %.0f Hz",
+                    tick_s, dt, _MIRROR_HZ,
+                )
+            stop.wait(max(0.0, dt - tick_s))
         if factr_client is not None:
             factr_client.close()

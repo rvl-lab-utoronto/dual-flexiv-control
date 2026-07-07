@@ -436,3 +436,35 @@ def test_read_tail_returns_whole_small_log(tmp_path):
     p = tmp_path / "system.log"
     p.write_text("only line\n")
     assert logs.read_tail(p) == "only line\n"
+
+
+# ---------------------------------------------------------------------------
+# Launcher rig option (dfc-dashboard --rig <name>)
+# ---------------------------------------------------------------------------
+
+
+def test_pop_rig_arg_extracts_both_forms():
+    from dual_flexiv_control.dashboard.launch import _pop_rig_arg
+
+    assert _pop_rig_arg(["--rig", "bench"]) == ("bench", [])
+    assert _pop_rig_arg(["--rig=left_only"]) == ("left_only", [])
+    # Streamlit args pass through untouched, wherever --rig sits among them.
+    rig, rest = _pop_rig_arg(["--server.port", "8502", "--rig", "bimanual", "-v"])
+    assert rig == "bimanual"
+    assert rest == ["--server.port", "8502", "-v"]
+    assert _pop_rig_arg([]) == (None, [])
+
+
+def test_pop_rig_arg_rejects_missing_value():
+    from dual_flexiv_control.dashboard.launch import _pop_rig_arg
+
+    with pytest.raises(SystemExit):
+        _pop_rig_arg(["--rig"])
+
+
+def test_validate_rig_accepts_shipped_and_rejects_unknown():
+    from dual_flexiv_control.dashboard.launch import _validate_rig
+
+    _validate_rig("bimanual")  # shipped rig: no error
+    with pytest.raises(SystemExit, match="unknown rig"):
+        _validate_rig("no_such_rig")

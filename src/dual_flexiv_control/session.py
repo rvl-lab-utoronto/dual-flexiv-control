@@ -17,8 +17,10 @@ session drops back to VIEWING with the hardware untouched.
 **Protocol** (dashboard ↔ daemon):
 
 * commands — JSON lines on **stdin**: ``{"cmd": "start", "phase": "collection",
-  "task": "<name>"}``, ``{"cmd": "stop"}``, ``{"cmd": "shutdown"}``. stdin EOF ==
-  shutdown, so a dead dashboard can never leave an orphaned daemon holding robots.
+  "task": "<name>"}`` (eval may add ``"host": <str>`` and/or ``"port": <int>``
+  to point at a different policy server), ``{"cmd": "stop"}``, ``{"cmd":
+  "shutdown"}``. stdin EOF == shutdown, so a dead dashboard can never leave an
+  orphaned daemon holding robots.
 * state — ``<runtime_dir>/session.json``, atomically replaced (same pattern as the
   stream-manifest registry): current mode, active run, a heartbeat timestamp, and
   the last run's outcome. The dashboard polls it.
@@ -27,11 +29,13 @@ session drops back to VIEWING with the hardware untouched.
 crashed control channels are swept so the next run can't attach a dead segment).
 An **arm** node exit is session-fatal — everything stops (the in-progress episode
 gets its save grace) and the daemon exits non-zero for the dashboard to surface.
-A **camera** node exit is NOT fatal: the camera is reported down (``cameras_down``
-in the state file), runs are refused while any rig camera is down (recording
-needs every view), and the node is respawned periodically so a recovered camera
-(e.g. after a USB replug) is picked back up automatically — arm telemetry and
-VIEWING are never held hostage by a flaky camera.
+A **camera** node exit or stall is NOT fatal: the camera is reported down
+(``cameras_down`` in the state file), runs are refused while any rig camera is
+down (recording needs every view), and the node is respawned periodically — a
+stalled-but-alive node is killed first, because a ZED handle never recovers
+once its device dropped — so a recovered camera (e.g. after a USB replug) is
+picked back up automatically. Arm telemetry and VIEWING are never held hostage
+by a flaky camera.
 """
 
 from __future__ import annotations
@@ -90,6 +94,9 @@ _CAMERA_RESPAWN_S = 30.0
 _CAMERA_BOOT_GRACE_S = 20.0
 #: A camera whose newest published frame is older than this reads as down.
 _CAMERA_FRESH_S = 5.0
+#: Cooperative grace when killing a stalled-but-alive camera node before its
+#: respawn (a wedged ZED grab may not unwind; SIGTERM/SIGKILL follow promptly).
+_CAMERA_KILL_GRACE_S = 2.0
 
 #: session.json filename under the runtime dir (one session per runtime dir).
 STATE_BASENAME = "session.json"
@@ -224,13 +231,21 @@ def compose_config(overrides: list[str]) -> Config:
     return config
 
 
-def run_overrides(session_overrides: list[str], task: str, phase: str) -> list[str]:
-    """The compose overrides for one run: the session's, re-pinned to task + phase."""
+def run_overrides(
+    session_overrides: list[str], task: str, phase: str, extra: list[str] = (),
+) -> list[str]:
+    """The compose overrides for one run: the session's, re-pinned to task + phase.
+
+    ``extra`` overrides (e.g. a per-run ``policy.port``) are appended last and
+    likewise re-pinned: a session override of the same key is dropped so the
+    per-run value wins.
+    """
+    pinned = {"task", "runtime.phase", *(e.split("=", 1)[0].lstrip("+~") for e in extra)}
     keep = [
         o for o in session_overrides
-        if not o.split("=", 1)[0].lstrip("+~") in ("task", "runtime.phase")
+        if o.split("=", 1)[0].lstrip("+~") not in pinned
     ]
-    return [*keep, f"task={task}", f"runtime.phase={phase}"]
+    return [*keep, f"task={task}", f"runtime.phase={phase}", *extra]
 
 
 def _override_value(overrides: list[str], key: str) -> str | None:
@@ -263,7 +278,7 @@ class _ActiveRun:
 
 @dataclass
 class _CameraUnit:
-    """One camera node + its live process; respawned (paced) when it dies.
+    """One camera node + its live process; respawned (paced) when it dies or stalls.
 
     Each camera gets its OWN stop event: ``run_node`` sets its stop event on a
     crash ("bring the system down with us" — the right call for a one-shot run),
@@ -277,6 +292,7 @@ class _CameraUnit:
     stop_event: object                      # this camera's own mp Event
     spawned_at: float
     announced_down: bool = False
+    stalled_since: float | None = None      # alive but not producing since (monotonic)
 
 
 class SessionDaemon:
@@ -464,6 +480,17 @@ class SessionDaemon:
         if phase not in PHASES or not task:
             self.state.message = f"bad start command (phase={phase!r}, task={task!r})"
             return
+        port = cmd.get("port")
+        if port is not None and not (isinstance(port, int) and 0 < port < 65536):
+            self.state.message = f"bad start command (port={port!r})"
+            return
+        host = cmd.get("host")
+        if host is not None and not (
+            isinstance(host, str) and host
+            and all(c.isalnum() or c in "._-" for c in host)
+        ):
+            self.state.message = f"bad start command (host={host!r})"
+            return
         busy = self._arms_still_in_control()
         if busy:
             self.state.message = (
@@ -491,8 +518,13 @@ class SessionDaemon:
                     "a rig without it."
                 )
             return
+        extra = []
+        if host is not None:
+            extra.append(f"policy.host={host}")
+        if port is not None:
+            extra.append(f"policy.port={port}")
         try:
-            run_config = compose_config(run_overrides(self.overrides, task, phase))
+            run_config = compose_config(run_overrides(self.overrides, task, phase, extra))
             coeffs = active_coeffs(run_config)
             consumer = build_consumer(run_config, self.run_id)
         except Exception as exc:  # noqa: BLE001 - bad task/config must not kill the session
@@ -655,10 +687,13 @@ class SessionDaemon:
         """Per-camera supervision: report down cameras, respawn them (paced).
 
         A camera is *down* when its process died, or when it stopped producing
-        fresh frames past its boot grace. Dead processes are respawned at most
-        every ``_CAMERA_RESPAWN_S`` — a camera that recovers (USB replug, driver
-        reset) rejoins the session automatically. Returns True when
-        ``state.cameras_down`` changed (the caller then rewrites the state file).
+        fresh frames past its boot grace. Both are respawned at most every
+        ``_CAMERA_RESPAWN_S``: a dead process directly; a stalled-but-alive one
+        is killed first — the ZED SDK never revives a handle whose device
+        dropped, so after an unplug the old process keeps failing ``grab()``
+        forever even once the camera is back on the bus, and only a fresh
+        ``open()`` picks it up. Returns True when ``state.cameras_down``
+        changed (the caller then rewrites the state file).
         """
         now = time.monotonic()
         down: list[str] = []
@@ -667,6 +702,8 @@ class SessionDaemon:
             producing = alive and self._camera_producing(unit)
             in_grace = alive and (now - unit.spawned_at) < _CAMERA_BOOT_GRACE_S
             if producing or in_grace:
+                if producing:
+                    unit.stalled_since = None
                 if producing and unit.announced_down:
                     unit.announced_down = False
                     log.info("camera node %s recovered — producing again", unit.node.name)
@@ -683,12 +720,22 @@ class SessionDaemon:
                     f"exited code {unit.proc.exitcode}" if not alive else "not producing",
                     _CAMERA_RESPAWN_S,
                 )
-            if not alive and now - unit.spawned_at >= _CAMERA_RESPAWN_S:
-                self._sweep_camera_streams(unit.node)
-                fresh = self._make_camera_unit(unit.node)
-                unit.proc, unit.stop_event = fresh.proc, fresh.stop_event
-                unit.spawned_at = fresh.spawned_at
-                log.info("respawned camera node %s", unit.node.name)
+            if alive:
+                if unit.stalled_since is None:
+                    unit.stalled_since = now
+                if now - unit.stalled_since < _CAMERA_RESPAWN_S:
+                    continue
+                log.warning("killing stalled camera node %s for respawn", unit.node.name)
+                unit.stop_event.set()
+                _escalate([unit.proc], cooperative_s=_CAMERA_KILL_GRACE_S)
+            elif now - unit.spawned_at < _CAMERA_RESPAWN_S:
+                continue
+            self._sweep_camera_streams(unit.node)
+            fresh = self._make_camera_unit(unit.node)
+            unit.proc, unit.stop_event = fresh.proc, fresh.stop_event
+            unit.spawned_at = fresh.spawned_at
+            unit.stalled_since = None
+            log.info("respawned camera node %s", unit.node.name)
         down.sort()
         if down != self.state.cameras_down:
             self.state.cameras_down = down

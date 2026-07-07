@@ -255,8 +255,16 @@ class SessionManager:
                 log.exception("session daemon stdin write failed")
                 return False
 
-    def start_run(self, phase: str, task: str) -> bool:
-        return self.send({"cmd": "start", "phase": phase, "task": task})
+    def start_run(
+        self, phase: str, task: str,
+        host: str | None = None, port: int | None = None,
+    ) -> bool:
+        cmd = {"cmd": "start", "phase": phase, "task": task}
+        if host is not None:
+            cmd["host"] = host
+        if port is not None:
+            cmd["port"] = port
+        return self.send(cmd)
 
     def stop_run(self) -> bool:
         return self.send({"cmd": "stop"})

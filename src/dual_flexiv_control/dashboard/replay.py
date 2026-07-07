@@ -271,8 +271,10 @@ class ReplayViewer:
 
     @property
     def web_url(self) -> str:
+        # renderer=webgl for the same reason as the metrics viewer's web_url:
+        # the WebGPU path is ~50x slower under Dawn's GL-compatibility mode.
         base = f"http://127.0.0.1:{self.web_port}"
-        return f"{base}/?url={quote(self.grpc_uri, safe='')}&persist=0"
+        return f"{base}/?url={quote(self.grpc_uri, safe='')}&persist=0&renderer=webgl"
 
 
 def grpc_port_from_env() -> int:

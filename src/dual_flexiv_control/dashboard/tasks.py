@@ -4,12 +4,13 @@ A **task** is a Hydra config file in the ``conf/task`` group (selected at runtim
 with ``task=<name>``): the natural-language goal, its dataset, and per-phase
 counts. A **rig** is a file in the ``conf/rig`` group (selected with
 ``rig=<name>``): which hardware exists — arms/cameras/FACTR servers + serials.
-The dashboard shows one dropdown per axis and launches
+The dashboard shows a Task dropdown, is pinned to one rig at launch
+(``dfc-dashboard --rig <name>``), and launches
 ``dual-flexiv-control task=<t> rig=<r> …``.
 
 We read the YAML directly with OmegaConf (already a project dependency; cheap and
 cwd-independent) rather than composing through Hydra. That is sufficient because
-task files carry their fields inline and a rig's dropdown entry only needs its
+task files carry their fields inline and a rig's entry only needs its
 name + description. If tasks ever grow ``defaults`` that must be merged to
 resolve these values, swap :func:`discover_tasks` to use ``hydra.compose``.
 """
@@ -51,7 +52,7 @@ class TaskInfo:
 
 @dataclass(frozen=True)
 class RigInfo:
-    """One rig in the dashboard's Rig dropdown (a ``conf/rig`` file)."""
+    """One launchable rig (a ``conf/rig`` file, picked via ``--rig <name>``)."""
 
     name: str
     """Config stem, passed as ``rig=<name>``."""

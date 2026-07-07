@@ -15,6 +15,8 @@ embedded viewer updates itself from the gRPC stream independently of these rerun
 
 from __future__ import annotations
 
+import os
+
 import streamlit as st
 
 # Absolute imports: Streamlit executes this file as a top-level script (no package
@@ -37,6 +39,7 @@ from dual_flexiv_control.dashboard.cameras import discover_camera_views
 from dual_flexiv_control.dashboard.cameras import get_frame
 from dual_flexiv_control.dashboard.cameras import read_camera_statuses
 from dual_flexiv_control.dashboard.editor import open_in_vscode
+from dual_flexiv_control.dashboard.ssh_hosts import discover_ssh_hosts
 from dual_flexiv_control.dashboard.tasks import RigInfo
 from dual_flexiv_control.dashboard.tasks import TaskInfo
 from dual_flexiv_control.dashboard.tasks import discover_rigs
@@ -65,6 +68,28 @@ _PAGE_CSS = """
 }
 </style>
 """
+
+#: Page background per session mode. VIEWING keeps the theme default (#0e1117,
+#: hsv 220° 39% 9%); COLLECTION is the same hue one value step up (~15%); EVAL is
+#: collection's value/saturation with the hue shifted purple (~280°).
+_MODE_BG = {"collection": "#181d27", "eval": "#211627"}
+
+
+def _apply_mode_background(view) -> None:
+    """Tint the whole page by session mode so the active mode reads at a glance.
+
+    ``saving`` keeps its run's tint (``view.phase`` stays set) so the color does
+    not snap back to viewing while the episode finalizes. The header is made
+    transparent so the tint runs edge to edge.
+    """
+    color = _MODE_BG.get(view.phase if view.state == "saving" else view.state)
+    if color is None:
+        return
+    st.markdown(
+        f"<style>.stApp {{ background-color: {color}; }} "
+        f'[data-testid="stHeader"] {{ background: transparent; }}</style>',
+        unsafe_allow_html=True,
+    )
 
 
 def _browser_url(url: str) -> str:
@@ -157,7 +182,7 @@ def _reset_services(registry: _runner.RunRegistry) -> bool:
 
 
 def _render_controls(
-    tasks: list[TaskInfo], rigs: list[RigInfo], registry: _runner.RunRegistry
+    tasks: list[TaskInfo], rig: RigInfo | None, registry: _runner.RunRegistry
 ) -> None:
 
     st.subheader("Experiment")
@@ -167,26 +192,24 @@ def _render_controls(
             "and reload."
         )
         return
-    if not rigs:
+    if rig is None:
         st.error("No rigs found in `conf/rig/`. Add one (copy `rig/bimanual.yaml`).")
         return
 
     view = registry.session_view()
 
     # Two orthogonal axes: the rig (what hardware exists — conf/rig) and the task
-    # (what is demonstrated/evaluated — conf/task). The session daemon holds the
-    # rig; changing it restarts the daemon, so it is locked while a run is active.
-    rig_names = [r.name for r in rigs]
-    default_rig = rig_names.index("bimanual") if "bimanual" in rig_names else 0
-    rig_name = st.selectbox(
-        "Rig", rig_names, index=default_rig, key="rig_name",
-        disabled=view.run_active,
+    # (what is demonstrated/evaluated — conf/task). The rig is fixed at launch
+    # (``dfc-dashboard --rig <name>``) — switching it means restarting the session
+    # daemon, which is too destructive to offer as a live control.
+    st.markdown(
+        f"Rig: **`{rig.name}`**",
         help=(
             "Hardware setup from conf/rig — arms, cameras, FACTR leaders, serials. "
-            "Changing it restarts the session (locked during a run)."
+            "Fixed for this dashboard's lifetime; relaunch with "
+            "`dfc-dashboard --rig <name>` (or the VSCode dashboard tasks) to switch."
         ),
     )
-    rig = next(r for r in rigs if r.name == rig_name)
     if rig.description:
         st.caption(rig.description)
 
@@ -215,17 +238,47 @@ def _render_controls(
     # refuses otherwise; disabling here just makes that visible up front).
     launchable = view.state == "viewing" and not view.cameras_down
 
-    launch_cols = st.columns(2)
-    if launch_cols[0].button(
+    if st.button(
         "▶ Collection", use_container_width=True, disabled=not launchable,
         help="Teleoperated demonstration gathering (real recording run).",
     ):
-        _launch(registry, task, "collection", rig_name)
-    if launch_cols[1].button(
-        "▶ Eval", type="primary", use_container_width=True, disabled=not launchable,
+        _launch(registry, task, "collection", rig.name)
+
+    # One compact row: labels collapsed (the column is narrow), meaning carried
+    # by tooltips + the resolution caption underneath.
+    eval_cols = st.columns([1.4, 1.2, 0.8], vertical_alignment="center")
+    by_alias = {h.alias: h.address for h in discover_ssh_hosts()}
+    host_choice = eval_cols[1].selectbox(
+        "Policy host", ["default", *by_alias], key="eval_policy_host",
+        label_visibility="collapsed",
+        help=(
+            "Policy server for this eval run (overrides policy.host with the "
+            "Host's real address). Options come from ~/.ssh/config; "
+            "'default' uses the task's policy config."
+        ),
+    )
+    host = by_alias.get(host_choice)
+    port_raw = eval_cols[2].text_input(
+        "Policy port", key="eval_policy_port", placeholder="port",
+        label_visibility="collapsed",
+        help=(
+            "Policy server port for this eval run (overrides policy.port). "
+            "Blank uses the task's policy config."
+        ),
+    )
+    port, port_error = _parse_port(port_raw)
+    if eval_cols[0].button(
+        "▶ Eval", type="primary", use_container_width=True,
+        disabled=not launchable or port_error is not None,
         help="Online policy rollout (needs the policy server reachable).",
     ):
-        _launch(registry, task, "eval", rig_name)
+        _launch(registry, task, "eval", rig.name, host=host, port=port)
+    if port_error:
+        st.caption(f":red[{port_error}]")
+    elif host is not None or port is not None:
+        st.caption(
+            f":gray[policy → {host or 'config host'}:{port or 'config port'}]"
+        )
 
     st.caption("Each launch runs a single episode.")
 
@@ -291,10 +344,27 @@ def _camera_status_rows() -> None:
         _render_camera_row(s)
 
 
-def _launch(registry: _runner.RunRegistry, task: TaskInfo, phase: str, rig: str) -> None:
+def _parse_port(raw: str) -> tuple[int | None, str | None]:
+    """Parse the eval port box into ``(port, error)``.
+
+    Blank means "use the task's policy config" — ``(None, None)``. A non-blank
+    value must be a valid TCP port or the launch is blocked with the error.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None, None
+    if not raw.isdigit() or not 0 < int(raw) < 65536:
+        return None, f"port must be a number in 1–65535, got {raw!r}"
+    return int(raw), None
+
+
+def _launch(
+    registry: _runner.RunRegistry, task: TaskInfo, phase: str, rig: str,
+    host: str | None = None, port: int | None = None,
+) -> None:
     """Launch a run, surfacing a refused launch (e.g. one is still saving) inline."""
     try:
-        registry.launch(task, phase, rig)
+        registry.launch(task, phase, rig, host=host, port=port)
     except RuntimeError as exc:
         st.error(str(exc), icon="⚠️")
         return
@@ -782,18 +852,35 @@ def _render_replay_panel(ds) -> None:
     st.iframe(_browser_url(viewer.web_url), height=VIEWER_HEIGHT_PX)
 
 
-def _sync_rig() -> None:
-    """Pin every dashboard compose (arms/cameras/storage) to the selected rig.
+def _resolve_rig(rigs: list[RigInfo]) -> RigInfo | None:
+    """Pin every dashboard compose (arms/cameras/storage) to the launch rig.
 
-    Runs before any discovery in :func:`main`, so a rig change made in the
-    selectbox (which triggers a full rerun) takes effect on the same pass —
-    the arm-status rows, camera tab, and storage root all follow.
+    The rig is a launch option (``dfc-dashboard --rig <name>``, carried in the
+    ``DFC_DASHBOARD_RIG`` env var) — it never changes while the dashboard runs,
+    so switching rigs means relaunching (rig changes restart the session daemon,
+    which is too destructive for a live control). With no option set, prefers
+    ``bimanual``, else the first rig. An unknown name (the launcher validates,
+    but the env can be set directly) surfaces a banner and falls back.
     """
-    rig = st.session_state.get("rig_name")
-    if rig and rig != _arms.active_rig():
-        _arms.set_active_rig(rig)
+    if not rigs:
+        return None
+    names = [r.name for r in rigs]
+    wanted = os.environ.get("DFC_DASHBOARD_RIG", "").strip()
+    if wanted and wanted not in names:
+        st.error(
+            f"Unknown rig `{wanted}` (from `DFC_DASHBOARD_RIG` / `--rig`) — "
+            f"expected one of: {', '.join(names)}. Falling back to the default.",
+            icon="🛠️",
+        )
+        wanted = ""
+    name = wanted or ("bimanual" if "bimanual" in names else names[0])
+    # set_active_rig drops the compose cache, so only pin when it actually changes
+    # (this runs on every Streamlit rerun).
+    if name != _arms.active_rig():
+        _arms.set_active_rig(name)
         _cameras.reset()
         _storage.reset()
+    return next(r for r in rigs if r.name == name)
 
 
 def main() -> None:
@@ -805,20 +892,16 @@ def main() -> None:
     registry = _registry()
     _show_run_alert()
     tasks = discover_tasks()
-    rigs = discover_rigs()
-    # Seed the rig BEFORE the first session spawn, so the daemon starts on the same
-    # rig the selectbox will show (otherwise the first selectbox render would flip
-    # the rig and needlessly restart a just-spawned daemon).
-    if "rig_name" not in st.session_state and rigs:
-        names = [r.name for r in rigs]
-        st.session_state["rig_name"] = "bimanual" if "bimanual" in names else names[0]
-    _sync_rig()
+    # Pin the launch rig BEFORE the first session spawn, so the daemon starts on
+    # the rig the whole dashboard composes against.
+    rig = _resolve_rig(discover_rigs())
     # The session daemon runs for the dashboard's lifespan: spawn it now (no-op when
     # already matching), restart it when the rig or runtime.sim changed.
     try:
         registry.ensure_session(_arms.active_rig(), _arms.runtime_is_sim())
     except Exception as exc:  # noqa: BLE001 - a broken conf must not kill the page
         st.error(f"Session daemon failed to start: {exc}", icon="🛑")
+    _apply_mode_background(registry.session_view())
     # A rig YAML edit can break composition (e.g. a camera left in `defaults` but
     # removed from the inline block -> MISSING placement). That must surface as a
     # banner the operator can act on — never a dead page with the error in a log.
@@ -827,17 +910,17 @@ def main() -> None:
         compose_error = None
     except Exception as exc:  # noqa: BLE001 - broken conf must stay visible + recoverable
         cameras = []
-        rig = _arms.active_rig() or "(default)"
+        rig_label = _arms.active_rig() or "(default)"
         compose_error = (
-            f"Config for rig `{rig}` failed to compose — fix its YAML in `conf/rig/` "
-            f"(or pick another rig) and reload.\n\n```\n{exc}\n```"
+            f"Config for rig `{rig_label}` failed to compose — fix its YAML in "
+            f"`conf/rig/` (or relaunch with another rig) and reload.\n\n```\n{exc}\n```"
         )
     if compose_error:
         st.error(compose_error, icon="🛠️")
 
     controls, panel = st.columns([1, 3], gap="large")
     with controls:
-        _render_controls(tasks, rigs, registry)
+        _render_controls(tasks, rig, registry)
     with panel:
         tab_metrics, tab_camera, tab_storage, tab_logs = st.tabs(
             ["📊 Metrics", "📷 Camera", "💾 Storage", "📜 Logs"]

@@ -93,8 +93,9 @@ _ACTIVE_RIG: str | None = None
 def set_active_rig(rig: str | None) -> None:
     """Select the rig every dashboard compose uses; drops the cached snapshot.
 
-    The dashboard's Rig dropdown calls this on change; ``cameras.reset()`` /
-    ``storage.reset()`` must be called alongside so their composes follow too.
+    The dashboard pins this once at startup from its launch option
+    (``dfc-dashboard --rig <name>``); ``cameras.reset()`` / ``storage.reset()``
+    must be called alongside so their composes follow too.
     """
     global _ACTIVE_RIG, _SNAPSHOT
     with _LOCK:
