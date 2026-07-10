@@ -47,7 +47,11 @@ def test_classify_outcome_matrix():
     assert classify_outcome("collection", 0, stopping=False)[0] == "finished"
     assert classify_outcome("eval", 0, stopping=True)[0] == "stopped"
     assert classify_outcome("eval", 0, stopping=False)[0] == "finished"
+    assert classify_outcome("skill", 0, stopping=True)[0] == "stopped"
+    assert classify_outcome("skill", 0, stopping=False)[0] == "finished"
     assert classify_outcome("collection", 3, stopping=False)[0] == "crashed"
+    outcome, detail = classify_outcome("skill", 1, stopping=False)
+    assert outcome == "crashed" and "start pose" in detail
     outcome, detail = classify_outcome("collection", 2, stopping=True)
     assert outcome == "stopped-error" and "code 2" in detail
 
@@ -103,6 +107,8 @@ def _spawn_daemon(tmp_path) -> tuple[subprocess.Popen, Path, Path]:
         "runtime.sim=true",
         f"runtime.runtime_dir={runtime_dir}",
         f"recording.root={datasets}",
+        f"skill.root={tmp_path / 'skills'}",
+        "skill.start_timeout_s=15",
         "runtime.save_grace_s=60",
         "arms.left.control_enabled=true",
         "arms.left.control_rate_hz=100",
@@ -215,6 +221,38 @@ def test_session_daemon_full_lifecycle_sim(tmp_path):
         raw = _wait_state(runtime_dir, "viewing", 60.0, log_path)
         assert raw["last_outcome"]["outcome"] == "finished", raw["last_outcome"]
         assert raw["last_outcome"]["phase"] == "eval"
+
+        # -- skill: teach-and-repeat replay, finishes on its own ------------------
+        # Teach a short trajectory (as the dashboard's 🎓 Teach would save it);
+        # the sim arm tracks commanded q, so convergence + replay run through.
+        import numpy as np
+
+        from dual_flexiv_control import skills as skills_mod
+
+        traj = np.linspace(0.0, 0.2, 20)[:, None] * np.ones(7)
+        skills_mod.save_skill(
+            skills_mod.Skill(name="taught", fps=15.0, q={"left": traj}),
+            tmp_path / "skills",
+        )
+        _send(proc, {"cmd": "start", "phase": "skill", "skill": "taught"})
+        _wait_state(runtime_dir, "skill", 30.0, log_path)
+        assert read_state(runtime_dir)["task"] == "taught"  # labelled by skill
+        raw = _wait_state(runtime_dir, "viewing", 60.0, log_path)
+        assert raw["last_outcome"]["outcome"] == "finished", raw["last_outcome"]
+        assert raw["last_outcome"]["phase"] == "skill"
+
+        # -- an unknown skill is refused with a message; the session survives ----
+        _send(proc, {"cmd": "start", "phase": "skill", "skill": "no_such_skill"})
+        deadline = time.monotonic() + 15.0
+        msg = None
+        while time.monotonic() < deadline:
+            raw = read_state(runtime_dir)
+            msg = (raw or {}).get("message")
+            if msg:
+                break
+            time.sleep(0.2)
+        assert msg and "start failed" in msg and "no_such_skill" in msg
+        assert read_state(runtime_dir)["state"] == "viewing"
 
         # -- a bad task is refused with a message; the session survives ---------
         _send(proc, {"cmd": "start", "phase": "collection", "task": "no_such_task"})

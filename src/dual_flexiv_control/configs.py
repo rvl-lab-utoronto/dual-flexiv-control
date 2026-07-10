@@ -74,6 +74,13 @@ class JointImpedanceCfg:
     K_q: List[float] = field(default_factory=list)   # [DoF] stiffness [Nm/rad], <= K_q_nom
     Z_q: List[float] = field(default_factory=list)   # [DoF] damping ratio, [0.3, 0.8]
 
+    K_q_fraction: Optional[float] = None
+    """Stiffness as a fraction of the connected robot's own ``K_q_nom`` (uniform
+    across joints), resolved live at apply-time instead of a hand-picked absolute
+    ``K_q``. Takes precedence over ``K_q`` when set — the safer way to ask for
+    "a small fraction of however stiff this robot's joints nominally are" without
+    guessing per-model Nm/rad numbers (see :func:`very_compliant_coeffs`)."""
+
 
 @dataclass
 class CartesianImpedanceCfg:
@@ -138,7 +145,12 @@ class ControlCoeffsCfg:
 
     * NRT_JOINT_POSITION (qpos/qvel): uses ``max_joint_vel``/``max_joint_acc`` as
       the ``max_vel``/``max_acc`` args of ``SendJointPosition``. ``joint_impedance``
-      is NOT settable in this mode (only the JOINT_IMPEDANCE modes) and is ignored.
+      is NOT settable in this mode and is ignored.
+    * NRT_JOINT_IMPEDANCE (qpos over ``control/qpos_impedance`` instead of the
+      default ``control/qpos``): same ``SendJointPosition`` call, but the arm's
+      tracking authority comes from ``joint_impedance`` (``SetJointImpedance``)
+      rather than a fixed high-gain position loop — this is the only way to make
+      joint control genuinely *soft* (see :func:`very_compliant_coeffs`).
     * NRT_CARTESIAN_MOTION_FORCE (end_effector/eef_vel/force): SetCartesianImpedance,
       SetMaxContactWrench, SetNullSpacePosture apply; ``max_{linear,angular}_*``
       feed the scalar limit args of ``SendCartesianMotionForce``.
@@ -160,9 +172,12 @@ class ControlCoeffsCfg:
 
 # -- named coefficient presets (single source of truth; registered as ConfigStore
 #    options of the `control_coeffs` group, so `control_coeffs@task.eval.coeffs=compliant`
-#    style swaps keep working without any YAML). joint_impedance stays unset in all
-#    presets: SetJointImpedance is only valid in JOINT_IMPEDANCE modes, which no
-#    shipped control kind uses — per-phase joint aggressiveness is via motion limits.
+#    style swaps keep working without any YAML). joint_impedance stays unset in
+#    compliant/stiff/default: SetJointImpedance only takes effect under the
+#    NRT_JOINT_IMPEDANCE mode (``control/qpos_impedance``), not the default
+#    NRT_JOINT_POSITION qpos/qvel — per-phase joint aggressiveness there is via
+#    motion limits instead. very_compliant (below) is the one preset meant for
+#    that impedance-mode control kind.
 
 
 def compliant_coeffs() -> ControlCoeffsCfg:
@@ -223,6 +238,25 @@ def default_coeffs() -> ControlCoeffsCfg:
     )
 
 
+def very_compliant_coeffs() -> ControlCoeffsCfg:
+    """Insanely low joint stiffness — cautious first policy eval on real hardware.
+
+    Only meaningful paired with a control kind on the NRT_JOINT_IMPEDANCE mode
+    (``control/qpos_impedance``, not the default ``control/qpos``): ``K_q_fraction``
+    asks for a small fraction of the connected robot's own nominal joint stiffness
+    (resolved live, so it stays "insanely low" regardless of the exact Nm/rad this
+    robot model reports) rather than a hand-picked absolute ``K_q``. A bad action
+    from an unverified/non-finetuned checkpoint then barely resists being pushed
+    off target instead of tracking it with full authority. Motion limits are
+    slower than :func:`compliant_coeffs` for the same reason.
+    """
+    return ControlCoeffsCfg(
+        joint_impedance=JointImpedanceCfg(K_q_fraction=0.1, Z_q=[0.7] * 7),
+        max_joint_vel=1.0,
+        max_joint_acc=1.5,
+    )
+
+
 @dataclass
 class ControlCfg:
     """A control type: which RDK mode/method to use and the command schema.
@@ -239,6 +273,10 @@ class ControlCfg:
       end_effector  NRT_CARTESIAN_MOTION_FORCE SendCartesianMotionForce  (pose_d primary)
       eef_vel       NRT_CARTESIAN_MOTION_FORCE SendCartesianMotionForce  (twist_d primary; pose_d integrated)
       force         NRT_CARTESIAN_MOTION_FORCE SendCartesianMotionForce  (wrench_d primary)
+
+    ``qpos``'s command/streamed schema also backs ``control/qpos_impedance``, the
+    NRT_JOINT_IMPEDANCE variant used for genuinely soft joint tracking (pair it
+    with the ``very_compliant`` coeffs preset) — same table row, different ``mode``.
     """
 
     kind: str = MISSING          # qpos | qvel | end_effector | eef_vel | force
@@ -580,6 +618,44 @@ class PolicyCfg:
 
 
 @dataclass
+class SkillCfg:
+    """Teach-and-repeat skill replay (``runtime.phase=skill``).
+
+    A skill is a taught joint trajectory saved under :attr:`root` (see
+    :mod:`dual_flexiv_control.skills`); a skill run streams it back through the
+    normal ``qpos`` control path. Task-independent — skills live beside the
+    task/rig axes, so this is a top-level config, not a per-task template.
+    """
+
+    root: str = "skills"
+    """Directory holding saved skills; resolved absolute against the launch cwd."""
+
+    name: Optional[str] = None
+    """The skill to repeat (its file stem). Required for a skill run: set per run
+    with ``skill.name=<name>`` (the dashboard's Repeat button does this)."""
+
+    coeffs: ControlCoeffsCfg = field(default_factory=default_coeffs)
+    """Controller coefficients during a skill replay; the moderate preset by
+    default (tracking a known-good demonstrated path). Swap with
+    ``+control_coeffs@skill.coeffs=<preset>``."""
+
+    frequency_hz: Optional[float] = None
+    """Replay rate override; ``None`` replays at the fps the skill was taught at."""
+
+    start_tolerance: float = 0.1
+    """[rad] L-inf gate: the replay holds the first target until every driven
+    arm's measured ``q`` is within this of it (the arm-side bootstrap MoveJs
+    there first)."""
+
+    start_timeout_s: float = 60.0
+    """Abort the run if an arm has not reached the start pose within this window
+    (an E-stopped/halted arm must fail loudly, not freeze silently)."""
+
+    settle_s: float = 1.0
+    """How long the final target is held after the last frame before the run ends."""
+
+
+@dataclass
 class BrainCfg:
     """The main processing pipeline (consumer)."""
 
@@ -596,7 +672,7 @@ class RuntimeCfg:
     runtime_dir: str = "runtime"   # resolved to absolute against the launch cwd
     sim: bool = False              # use simulated sources (no hardware)
     duration_s: Optional[float] = None   # auto-stop after N seconds (None = run until Ctrl-C)
-    phase: str = "collection"      # collection | eval — selects which per-task coeffs the arms apply
+    phase: str = "collection"      # collection | eval | skill — selects the run's consumer + coeffs
     #: Shutdown window (s) granted to the recording node to finalize the in-progress
     #: episode's video encode before SIGKILL. Saving a long episode drains a
     #: multi-thousand-frame encode that far exceeds a hardware node's teardown, so
@@ -614,6 +690,7 @@ class Config:
     factr: FactrCfg = MISSING     # provided by the selected rig (composed from `factr`)
     task: TaskCfg = MISSING       # the active task (composed from the `task` group)
     policy: PolicyCfg = MISSING   # eval policy-server client (composed from the `policy` group)
+    skill: SkillCfg = field(default_factory=SkillCfg)  # teach-and-repeat replay (phase=skill)
     # Populated by the selected `rig` (package-directed defaults: arm@arms.left, ...).
     arms: Dict[str, ArmCfg] = field(default_factory=dict)
     # Likewise camera@cameras.<name> — set per rig.
@@ -637,6 +714,7 @@ def register_configs() -> None:
     cs.store(group="factr", name="base_factr", node=FactrCfg)
     cs.store(group="task", name="base_task", node=TaskCfg)
     cs.store(group="policy", name="base_policy", node=PolicyCfg)
+    cs.store(group="skill", name="base_skill", node=SkillCfg)
     cs.store(group="arm", name="base_arm", node=ArmCfg)
     cs.store(group="camera", name="base_camera", node=CameraCfg)
     cs.store(group="control", name="base_control", node=ControlCfg)
@@ -645,3 +723,4 @@ def register_configs() -> None:
     cs.store(group="control_coeffs", name="compliant", node=compliant_coeffs())
     cs.store(group="control_coeffs", name="stiff", node=stiff_coeffs())
     cs.store(group="control_coeffs", name="default", node=default_coeffs())
+    cs.store(group="control_coeffs", name="very_compliant", node=very_compliant_coeffs())

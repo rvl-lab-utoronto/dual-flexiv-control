@@ -102,6 +102,60 @@ def test_pack_action_force_holds_measured_pose():
         pack_action(ctrl, wrench)
 
 
+@pytest.mark.parametrize(
+    "kind,hk,signals",
+    [("qpos", "q", []), ("qvel", "q", ["q"]), ("end_effector", "eef", []),
+     ("eef_vel", "eef", ["eef"]), ("force", None, [])],
+)
+def test_horizon_kind_and_signals_per_kind(kind, hk, signals):
+    from dual_flexiv_control.control import horizon_kind
+    from dual_flexiv_control.control import horizon_signals
+
+    ctrl = _ctrl(kind)
+    assert horizon_kind(ctrl) == hk
+    assert horizon_signals(ctrl) == signals
+
+
+def test_estimate_chunk_end_per_kind():
+    """The chunk-end viz estimate: absolute kinds take the last action; velocity
+    kinds Euler-integrate from the measured baseline; force predicts nothing."""
+    from dual_flexiv_control.control import estimate_chunk_end
+
+    dt = 0.1
+    q0 = np.arange(7.0)
+    pose0 = np.array([0.1, 0.2, 0.3, 1.0, 0.0, 0.0, 0.0])
+
+    hk, v = estimate_chunk_end(_ctrl("qpos"), np.tile(np.arange(7.0), (4, 1)), dt)
+    assert hk == "q"
+    np.testing.assert_allclose(v, np.arange(7.0))
+
+    dq_chunk = np.ones((5, 7))
+    hk, v = estimate_chunk_end(_ctrl("qvel"), dq_chunk, dt, {"q": q0})
+    assert hk == "q"
+    np.testing.assert_allclose(v, q0 + 5 * dt)  # q0 + Σ dq·dt
+
+    pose_chunk = np.tile(np.array([0.4, 0.5, 0.6, 1.0, 0.0, 0.0, 0.0]), (3, 1))
+    hk, v = estimate_chunk_end(_ctrl("end_effector"), pose_chunk, dt)
+    assert hk == "eef"
+    np.testing.assert_allclose(v, [0.4, 0.5, 0.6])  # position part of the last pose_d
+
+    twist_chunk = np.tile(np.array([1.0, 2.0, 3.0, 9.0, 9.0, 9.0]), (2, 1))
+    hk, v = estimate_chunk_end(_ctrl("eef_vel"), twist_chunk, dt, {"eef": pose0})
+    assert hk == "eef"
+    np.testing.assert_allclose(v, pose0[:3] + np.array([1.0, 2.0, 3.0]) * 2 * dt)
+
+    assert estimate_chunk_end(_ctrl("force"), np.ones((3, 6)), dt) is None
+
+
+def test_estimate_chunk_end_needs_measured_baseline_for_velocity_kinds():
+    """A velocity chunk is relative: with no measured baseline there is nothing to
+    integrate from, so the estimate is None (side skipped, not fabricated)."""
+    from dual_flexiv_control.control import estimate_chunk_end
+
+    assert estimate_chunk_end(_ctrl("qvel"), np.ones((3, 7)), 0.1) is None
+    assert estimate_chunk_end(_ctrl("eef_vel"), np.ones((3, 6)), 0.1, {}) is None
+
+
 def test_normalize_gripper_passthrough_when_uncalibrated():
     from dual_flexiv_control.configs import JointConventionCfg
     from dual_flexiv_control.control import normalize_gripper
@@ -241,6 +295,63 @@ def test_send_control_safety_halt_covers_qpos_and_qvel():
             safety_check=True, tolerance=0.5,
         )
     np.testing.assert_array_equal(src._control_target, np.zeros(7))  # integrator NOT committed
+
+
+def test_start_control_switches_to_the_configured_mode_not_a_hardcoded_one():
+    """`qpos_impedance` must enter NRT_JOINT_IMPEDANCE, not the plain qpos mode."""
+    pytest.importorskip("flexivrdk")
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    import flexivrdk
+
+    from dual_flexiv_control.interfaces.flexiv.source import FlexivSource
+
+    src = FlexivSource("sim", dof=7)
+    src._robot = MagicMock()
+    rs = SimpleNamespace(q=np.zeros(7), tcp_pose=np.zeros(7))
+
+    with patch.object(FlexivSource, "_bootstrap_movej", return_value=True):
+        ok = src.start_control(
+            _ctrl("qpos_impedance"), ControlCoeffsCfg(), {"q_d": np.zeros(7)}, rs,
+        )
+    assert ok is True
+    src._robot.SwitchMode.assert_called_once_with(flexivrdk.Mode.NRT_JOINT_IMPEDANCE)
+
+
+def test_apply_coeffs_resolves_K_q_fraction_against_live_nominal_stiffness():
+    """`very_compliant`-style coeffs scale the robot's OWN K_q_nom, not a fixed number."""
+    pytest.importorskip("flexivrdk")
+    from unittest.mock import MagicMock
+
+    from dual_flexiv_control.configs import JointImpedanceCfg
+    from dual_flexiv_control.interfaces.flexiv.source import FlexivSource
+
+    src = FlexivSource("sim", dof=7)
+    src._robot = MagicMock()
+    src._robot.info.return_value.K_q_nom = [1000.0] * 7
+
+    coeffs = ControlCoeffsCfg(joint_impedance=JointImpedanceCfg(K_q_fraction=0.1, Z_q=[0.7] * 7))
+    src._apply_coeffs(_ctrl("qpos_impedance"), coeffs)
+
+    src._robot.SetJointImpedance.assert_called_once_with([100.0] * 7, [0.7] * 7)
+
+
+def test_apply_coeffs_falls_back_to_absolute_K_q_without_a_fraction():
+    pytest.importorskip("flexivrdk")
+    from unittest.mock import MagicMock
+
+    from dual_flexiv_control.configs import JointImpedanceCfg
+    from dual_flexiv_control.interfaces.flexiv.source import FlexivSource
+
+    src = FlexivSource("sim", dof=7)
+    src._robot = MagicMock()
+
+    coeffs = ControlCoeffsCfg(joint_impedance=JointImpedanceCfg(K_q=[50.0] * 7, Z_q=[0.7] * 7))
+    src._apply_coeffs(_ctrl("qpos_impedance"), coeffs)
+
+    src._robot.info.assert_not_called()  # no live query needed for an absolute K_q
+    src._robot.SetJointImpedance.assert_called_once_with([50.0] * 7, [0.7] * 7)
 
 
 def test_deadman_config_rejects_inverted_or_nonpositive_thresholds():

@@ -40,7 +40,7 @@ _EARLY_DEATH_S = 30.0
 _MAX_EARLY_DEATHS = 3
 
 #: Session states a run occupies (launches are refused while in one).
-RUN_STATES = ("collection", "eval", "saving")
+RUN_STATES = ("collection", "eval", "skill", "saving")
 
 
 @dataclass(frozen=True)
@@ -75,6 +75,25 @@ def _runtime_dir() -> str:
     """The runtime dir the daemon writes ``session.json`` under (shared cwd)."""
     rd = os.environ.get("DFC_RUNTIME_DIR", "runtime")
     return rd if os.path.isabs(rd) else os.path.join(os.getcwd(), rd)
+
+
+def _new_session_log_path() -> str:
+    """A persistent, dashboard-discoverable log file for one daemon lifetime.
+
+    Lives under the outputs root (where CLI runs land) instead of a ``/tmp``
+    tempfile, so :func:`~.logs.discover_logs` lists it in the Logs tab even after
+    the daemon is gone — a ``/tmp`` file is only reachable while it is the
+    *current* daemon (via :func:`~.logs.live_daemon_log`), so every respawn used
+    to strand the previous log. One dir per spawn; ``mkdtemp`` keeps the name
+    unique when two daemons spawn in the same second.
+    """
+    from dual_flexiv_control.dashboard import logs as _logs
+
+    root = _logs.outputs_root()
+    root.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir = tempfile.mkdtemp(prefix=f"session_{ts}_", dir=str(root))
+    return os.path.join(run_dir, "session.log")
 
 
 def _daemon_cmd(rig: str | None, sim: bool) -> list[str]:
@@ -176,8 +195,8 @@ class SessionManager:
 
     def _spawn_locked(self, rig: str | None, sim: bool) -> None:
         cmd = _daemon_cmd(rig, sim)
-        fd, self._log_path = tempfile.mkstemp(prefix="dfc-session-", suffix=".log")
-        logf = os.fdopen(fd, "w")
+        self._log_path = _new_session_log_path()
+        logf = open(self._log_path, "w")
         log.info("spawning session daemon: %s (log %s)", " ".join(cmd), self._log_path)
         try:
             # start_new_session: the daemon must survive Streamlit's own signal
@@ -256,14 +275,19 @@ class SessionManager:
                 return False
 
     def start_run(
-        self, phase: str, task: str,
+        self, phase: str, task: str, policy: str | None = None,
         host: str | None = None, port: int | None = None,
+        skill: str | None = None,
     ) -> bool:
         cmd = {"cmd": "start", "phase": phase, "task": task}
+        if policy is not None:
+            cmd["policy"] = policy
         if host is not None:
             cmd["host"] = host
         if port is not None:
             cmd["port"] = port
+        if skill is not None:
+            cmd["skill"] = skill
         return self.send(cmd)
 
     def stop_run(self) -> bool:

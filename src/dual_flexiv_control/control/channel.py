@@ -140,6 +140,71 @@ def pack_action(ctrl_cfg, primary_value, held: dict | None = None) -> np.ndarray
     return pack_streamed(ctrl_cfg, fields)
 
 
+#: What a chunk-end horizon estimate yields per control kind (viz): ``"q"`` — a
+#: joint config (poseable ghost); ``"eef"`` — a TCP position only (trace, no ghost
+#: without IK). ``force`` is absent: a wrench implies no kinematic displacement.
+_HORIZON_KIND = {
+    "qpos": "q",
+    "qvel": "q",
+    "end_effector": "eef",
+    "eef_vel": "eef",
+}
+
+#: Measured proprio signal each kind's estimate integrates from (chunk sums are
+#: relative): ``qvel`` needs the current ``q``, ``eef_vel`` the current ``eef``
+#: pose. Absolute kinds (``qpos``/``end_effector``) need no baseline.
+_HORIZON_BASE = {"qvel": "q", "eef_vel": "eef"}
+
+
+def horizon_kind(ctrl_cfg) -> str | None:
+    """What :func:`estimate_chunk_end` yields for this kind: ``"q"`` (a joint
+    config), ``"eef"`` (a TCP position), or None (no kinematic prediction)."""
+    return _HORIZON_KIND.get(ctrl_cfg.kind)
+
+
+def horizon_signals(ctrl_cfg) -> list[str]:
+    """Proprio signals :func:`estimate_chunk_end` needs measured for this kind."""
+    sig = _HORIZON_BASE.get(ctrl_cfg.kind)
+    return [sig] if sig is not None else []
+
+
+def estimate_chunk_end(ctrl_cfg, primary_chunk, dt: float, measured: dict | None = None):
+    """Estimate where an action chunk lands the arm, for visualization.
+
+    ``primary_chunk`` is the chunk's primary-field columns ``(horizon, action_dim)``
+    (the :func:`action_field` slice of every action); ``dt`` is the seconds per
+    action step; ``measured`` maps the signals from :func:`horizon_signals` to their
+    latest measured values. Returns ``(horizon_kind, vector)`` — a ``(dof,)`` joint
+    config for ``"q"``, a ``(3,)`` base-frame TCP position for ``"eef"`` — or None
+    when the kind predicts no motion (``force``) or a needed measured baseline is
+    missing (a velocity chunk is relative; there is nothing to integrate from).
+
+    Velocity kinds are integrated forward assuming each action is held for one
+    step (Euler) — an *estimate* of the rollout, exact only if the arm tracks
+    perfectly at the loop rate.
+    """
+    kind = _HORIZON_KIND.get(ctrl_cfg.kind)
+    if kind is None:
+        return None
+    chunk = np.asarray(primary_chunk, dtype=np.float64)
+    measured = measured or {}
+    if ctrl_cfg.kind == "qpos":
+        return ("q", chunk[-1].copy())
+    if ctrl_cfg.kind == "qvel":
+        q = measured.get("q")
+        if q is None:
+            return None
+        return ("q", np.asarray(q, dtype=np.float64) + chunk.sum(axis=0) * dt)
+    if ctrl_cfg.kind == "end_effector":
+        return ("eef", chunk[-1, :3].copy())  # pose_d = [x y z qw qx qy qz]
+    # eef_vel: integrate the twist's linear part from the measured TCP position.
+    pose = measured.get("eef")
+    if pose is None:
+        return None
+    p0 = np.asarray(pose, dtype=np.float64)[:3]  # eef stream = [x y z qw qx qy qz]
+    return ("eef", p0 + chunk[:, :3].sum(axis=0) * dt)
+
+
 def control_specs(side: str, ctrl_cfg) -> dict[str, StreamSpec]:
     """Build the ``{SETPOINT, COMMAND}`` channel specs for one arm's control."""
     ch = ctrl_cfg.channel

@@ -184,6 +184,10 @@ def test_unknown_schema_rejected():
 
 def test_acme_schema_request_structure():
     cfg = _config("policy=acme")
+    # Pin the wrist slot to the real wrist cam so the per-slot resolution checks
+    # stay meaningful regardless of the shipped default (which maps the wrist
+    # slot to static_left for rigs without a wrist camera).
+    cfg.policy.acme_image_keys["wrist_image_left"] = "wrist_left"
     obs = _observer(cfg).build(_full_observation(cfg))
     req = build_schema(cfg.policy).request(obs)
     assert set(req["images"]) == {
@@ -305,6 +309,61 @@ def test_build_policy_rejects_unknown_kind():
     cfg.policy.kind = "nonsense"
     with pytest.raises(ValueError):
         build_policy(cfg.policy, ActionLayout(cfg.arms, ["left"]), _observer(cfg))
+
+
+class _PassthroughSchema:
+    def request(self, obs):
+        return {"obs": obs}
+
+    def actions(self, response):
+        return np.zeros((2, 3))
+
+
+class _FakeTransport:
+    def __init__(self):
+        self.fail = False
+
+    def infer(self, payload):
+        if self.fail:
+            raise PolicyError("server down")
+        return {"actions": []}
+
+    def close(self):
+        pass
+
+
+def test_remote_policy_emits_comm_events():
+    """SENT then RECV per request (matching seq); a failed request emits ERROR."""
+    from dual_flexiv_control.policy.client import COMM_ERROR
+    from dual_flexiv_control.policy.client import COMM_RECV
+    from dual_flexiv_control.policy.client import COMM_SENT
+    from dual_flexiv_control.policy.client import RemotePolicy
+
+    events = []
+    transport = _FakeTransport()
+    policy = RemotePolicy(
+        _PassthroughSchema(), transport,
+        on_comm=lambda kind, seq, elapsed: events.append((kind, seq, elapsed)),
+    )
+    policy.infer({})
+    assert [(k, s) for k, s, _ in events] == [(COMM_SENT, 1), (COMM_RECV, 1)]
+    assert events[0][2] == 0.0 and events[1][2] >= 0.0
+
+    transport.fail = True
+    with pytest.raises(PolicyError):
+        policy.infer({})
+    assert [(k, s) for k, s, _ in events[2:]] == [(COMM_SENT, 2), (COMM_ERROR, 2)]
+
+
+def test_remote_policy_comm_hook_failure_is_not_fatal():
+    from dual_flexiv_control.policy.client import RemotePolicy
+
+    def broken_hook(kind, seq, elapsed):
+        raise RuntimeError("viz exploded")
+
+    policy = RemotePolicy(_PassthroughSchema(), _FakeTransport(), on_comm=broken_hook)
+    chunk = policy.infer({})  # must not raise
+    assert chunk.shape == (2, 3)
 
 
 # --------------------------------------------------------------------------- #
@@ -476,8 +535,8 @@ def test_loop_holds_on_policy_error_then_recovers():
 
 
 def test_loop_announces_horizon_end_target_per_inference():
-    """on_chunk gets the FULL chunk's last q_d (policy intent), once per inference —
-    even when replan_steps executes only a prefix of the chunk."""
+    """on_chunk gets the FULL chunk's estimated end state (policy intent), once per
+    inference — even when replan_steps executes only a prefix of the chunk."""
     cfg = _config()
     layout = ActionLayout(cfg.arms, ["left"])
     brain = _FakeBrain(cfg)
@@ -488,8 +547,88 @@ def test_loop_announces_horizon_end_target_per_inference():
     loop.run(_StopAfter(100))
     assert len(announced) == policy.calls == 3
     assert set(announced[0]) == {"left"}
+    hk, vec = announced[0]["left"]
+    assert hk == "q"
     # scripted chunk rows are all arange(dim): last row's q_d = first 7 values
-    np.testing.assert_allclose(announced[0]["left"], np.arange(7.0))
+    np.testing.assert_allclose(vec, np.arange(7.0))
+
+
+def test_loop_announces_integrated_horizon_for_qvel():
+    """qvel has no joint target in the chunk: the horizon estimate integrates the
+    velocity actions forward from the measured q (Euler, one step per action)."""
+    cfg = _config("control@arms.left.control=qvel")
+    layout = ActionLayout(cfg.arms, ["left"])
+    brain = _FakeBrain(cfg)
+    policy = _ScriptedPolicy(layout.dim, horizon=3)
+    announced = []
+    loop = _loop(cfg, brain, policy, layout, num_timesteps=3, replan_steps=0)
+    loop._on_chunk = announced.append
+    loop.run(_StopAfter(100))
+    hk, vec = announced[0]["left"]
+    assert hk == "q"
+    # snapshot's left/q = arange(7); every dq_d row = arange(7); dt = 1/1000
+    np.testing.assert_allclose(vec, np.arange(7.0) * (1.0 + 3 * 1e-3))
+
+
+def test_loop_announces_eef_horizon_for_end_effector():
+    """Cartesian kinds predict a TCP position, not a joint config: the chunk-end
+    pose_d's position is announced tagged \"eef\"."""
+    cfg = _config("control@arms.left.control=end_effector")
+    layout = ActionLayout(cfg.arms, ["left"])
+    brain = _FakeBrain(cfg)
+    policy = _ScriptedPolicy(layout.dim, horizon=3)
+    announced = []
+    loop = _loop(cfg, brain, policy, layout, num_timesteps=3, replan_steps=0)
+    loop._on_chunk = announced.append
+    loop.run(_StopAfter(100))
+    hk, vec = announced[0]["left"]
+    assert hk == "eef"
+    np.testing.assert_allclose(vec, np.arange(3.0))  # pose_d = arange(7): [x y z ...]
+
+
+def test_loop_announces_nothing_for_force():
+    """A wrench chunk implies no kinematic displacement: no horizon prediction
+    (rather than a fabricated one)."""
+    cfg = _config("control@arms.left.control=force")
+    layout = ActionLayout(cfg.arms, ["left"])
+    measured_pose = np.array([0.1, 0.2, 0.3, 1.0, 0.0, 0.0, 0.0])
+
+    class _BrainWithEef(_FakeBrain):
+        def observe(self):
+            snap = _full_observation(self._cfg)
+            snap["left/eef"] = _samples(measured_pose)
+            return snap
+
+    brain = _BrainWithEef(cfg)
+    policy = _ScriptedPolicy(layout.dim, horizon=3)
+    announced = []
+    loop = _loop(cfg, brain, policy, layout, num_timesteps=3, replan_steps=0)
+    loop._on_chunk = announced.append
+    loop.run(_StopAfter(100))
+    assert announced == []
+
+
+def test_loop_predicts_without_driving_when_no_control_arms():
+    """Viz is decoupled from actuation: a dry run (no control-enabled arm) still
+    announces horizon predictions for every layout side, but posts no setpoint."""
+    cfg = _config()
+    layout = ActionLayout(cfg.arms, ["left", "right"])
+    brain = _FakeBrain(cfg)
+    policy = _ScriptedPolicy(layout.dim, horizon=4)
+    announced = []
+    loop = EvalLoop(
+        brain, _observer(cfg), policy, layout,
+        control_arms={},
+        frequency_hz=1000.0, num_timesteps=4, replan_steps=0,
+        on_chunk=announced.append,
+        horizon_arms={"left": cfg.arms["left"], "right": cfg.arms["right"]},
+    )
+    loop.run(_StopAfter(100))
+    assert brain.commands == []
+    assert set(announced[0]) == {"left", "right"}
+    hk, vec = announced[0]["right"]
+    assert hk == "q"
+    np.testing.assert_allclose(vec, np.arange(8.0, 15.0))  # right q_d slice of arange(16)
 
 
 def test_loop_survives_failing_horizon_hook():
@@ -540,3 +679,7 @@ def test_acme_policy_config_composes():
     assert cfg.policy.port == 53805
     assert cfg.policy.qpos_slice == [0, 7]
     assert cfg.policy.acme_image_keys["exterior_image_1_left"] == "static_left"
+    # acme.yaml overrides the wrist slot onto the static cam (default rigs have no
+    # wrist camera); the merge keeps the exterior slots from the structured default.
+    assert cfg.policy.acme_image_keys["wrist_image_left"] == "static_left"
+    assert cfg.policy.acme_image_keys["exterior_image_2_left"] == "static_right"

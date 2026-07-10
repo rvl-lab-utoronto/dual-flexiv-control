@@ -40,7 +40,7 @@ from .tasks import TaskInfo
 
 log = logging.getLogger(__name__)
 
-PHASES = ("collection", "eval")
+PHASES = ("collection", "eval", "skill")
 
 #: Mirror loop rate (matches the recording rate; FACTR is polled per tick).
 _MIRROR_HZ = 15.0
@@ -142,6 +142,8 @@ class RunRegistry:
             )
         if view.state == "eval":
             return CollectionStatus("running", "policy rollout in progress.")
+        if view.state == "skill":
+            return CollectionStatus("running", "skill replay in progress.")
         return None
 
     def take_alert(self) -> dict | None:
@@ -181,21 +183,8 @@ class RunRegistry:
 
     # -- launch / stop ---------------------------------------------------------------
 
-    def launch(
-        self, task: TaskInfo, phase: str, rig: str = "bimanual",
-        host: str | None = None, port: int | None = None,
-    ) -> None:
-        """Ask the daemon to start ``phase`` for ``task``; raises on a refusal.
-
-        The daemon composes ``task=<name>`` itself (validating it), hands the
-        phase's coefficients to the arms, and spawns the real consumer — the same
-        node the CLI runs. ``rig`` is the *session's* rig; a mismatch means the
-        session needs a restart (surfaced, not silently absorbed). ``host`` /
-        ``port`` (eval only) override ``policy.host`` / ``policy.port`` for
-        this run; None keeps the task's policy config.
-        """
-        if phase not in PHASES:
-            raise ValueError(f"unknown phase {phase!r} (expected one of {PHASES})")
+    def _check_launchable(self, rig: str) -> None:
+        """Raise a ``RuntimeError`` describing why nothing can launch right now."""
         view = self.manager.view()
         if view.run_active:
             raise RuntimeError(
@@ -214,12 +203,45 @@ class RunRegistry:
                 f"the session holds rig {view.rig!r} but {rig!r} is selected — wait "
                 "for the session to restart onto the new rig, then launch"
             )
-        if not self.manager.start_run(phase, task.name, host=host, port=port):
+
+    def launch(
+        self, task: TaskInfo, phase: str, rig: str = "bimanual",
+        policy: str | None = None, host: str | None = None, port: int | None = None,
+    ) -> None:
+        """Ask the daemon to start ``phase`` for ``task``; raises on a refusal.
+
+        The daemon composes ``task=<name>`` itself (validating it), hands the
+        phase's coefficients to the arms, and spawns the real consumer — the same
+        node the CLI runs. ``rig`` is the *session's* rig; a mismatch means the
+        session needs a restart (surfaced, not silently absorbed). ``policy`` /
+        ``host`` / ``port`` (eval only) override the ``policy`` group selection
+        and ``policy.host`` / ``policy.port`` for this run; None keeps the
+        task's policy config.
+        """
+        if phase not in PHASES:
+            raise ValueError(f"unknown phase {phase!r} (expected one of {PHASES})")
+        self._check_launchable(rig)
+        if not self.manager.start_run(phase, task.name, policy=policy, host=host, port=port):
             raise RuntimeError("could not reach the session daemon — see the Logs tab")
         detail = ""
-        if host is not None or port is not None:
-            detail = f" · policy {host or 'config-host'}:{port or 'config-port'}"
-        _log_event(f"launch {phase} · task={task.name} · rig={view.rig or rig}{detail}")
+        if policy is not None or host is not None or port is not None:
+            detail = (
+                f" · policy {policy or 'config-type'}"
+                f" @ {host or 'config-host'}:{port or 'config-port'}"
+            )
+        _log_event(f"launch {phase} · task={task.name} · rig={rig}{detail}")
+
+    def launch_skill(self, skill: str, rig: str) -> None:
+        """Ask the daemon to repeat a taught skill; raises on a refusal.
+
+        A skill run is task-independent (the daemon composes the default task to
+        satisfy the schema) and camera-independent (only arm proprio is observed),
+        so the only gates are the shared launchability ones.
+        """
+        self._check_launchable(rig)
+        if not self.manager.start_run("skill", "default", skill=skill):
+            raise RuntimeError("could not reach the session daemon — see the Logs tab")
+        _log_event(f"launch skill · {skill} · rig={rig}")
 
     def stop_active(self) -> None:
         """Ask the daemon to stop the active run (non-blocking; episode saves)."""
@@ -271,6 +293,7 @@ _MODE_READMES = {
     ),
     "collection": "_**Collection** — teleop demo recording; live mirror of the run._",
     "eval": "_**Eval** — policy rollout; purple ghost = the policy's horizon target._",
+    "skill": "_**Skill** — teach-and-repeat replay; purple ghost = the skill's end pose._",
     "saving": "_**Saving** — finalizing the episode's video encode…_",
 }
 
@@ -304,6 +327,69 @@ def _style_eef_pos_series(sides) -> None:
             ),
             static=True,
         )
+
+
+def _style_policy_comm_series() -> None:
+    """Name + colour the policy-server comm series once (static styling)."""
+    for series, color in zip(blueprints.POLICY_COMM_SERIES, blueprints.POLICY_COMM_COLORS):
+        rr.log(
+            blueprints.policy_comm_path(series),
+            rr.SeriesLines(names=[series.replace("_", "-")], colors=[color]),
+            static=True,
+        )
+    rr.log(
+        blueprints.POLICY_LATENCY_PATH,
+        rr.SeriesPoints(names=["round trip (ms)"], colors=[[180, 120, 240]]),
+        static=True,
+    )
+
+
+def _log_policy_comm(state: dict, t0_ns: int, now_t: float) -> None:
+    """Mirror new policy-server comm events into the metrics recording.
+
+    Reads the eval run's ``eval/policy_comm`` stream (None outside eval runs) and
+    logs each not-yet-surfaced event at its TRUE position on the viewer timeline
+    (the ring's per-sample monotonic timestamps share the mirror's clock):
+    cumulative sent/received/error counters, a 0/1 in-flight square wave between
+    a send and its response, and a round-trip latency point per completed
+    request. ``state`` persists across ticks (next ring seq to surface +
+    counters); the stream disappearing (run over) resets it so the next eval
+    starts its counters at zero. Restores the tick's ambient time before
+    returning.
+    """
+    from .arms import read_live_policy_comm
+    from ..policy.client import COMM_RECV
+    from ..policy.client import COMM_SENT
+
+    comm = read_live_policy_comm()
+    if comm is None or comm.n == 0:
+        if comm is None and state["next_seq"] > 0:
+            state.update(next_seq=0, sent=0, received=0, errors=0)
+        return
+    # Ring restarted under us (a new run's stream): the newest seq fell BELOW the
+    # last surfaced one (next_seq - 1; equal just means nothing new yet).
+    if int(comm.seq[-1]) + 1 < state["next_seq"]:
+        state.update(next_seq=0, sent=0, received=0, errors=0)
+    fresh = comm.seq >= state["next_seq"]
+    if not fresh.any():
+        return
+    for row, ev_t_ns in zip(comm.data[fresh], comm.t_ns[fresh]):
+        kind, elapsed_s = float(row[0]), float(row[2])
+        rr.set_time("elapsed", duration=max(0.0, (int(ev_t_ns) - t0_ns) / 1e9))
+        if kind == COMM_SENT:
+            state["sent"] += 1
+            rr.log(blueprints.policy_comm_path("sent"), rr.Scalars([state["sent"]]))
+            rr.log(blueprints.policy_comm_path("in_flight"), rr.Scalars([1.0]))
+            continue
+        ok = kind == COMM_RECV
+        counter = "received" if ok else "errors"
+        state[counter] += 1
+        rr.log(blueprints.policy_comm_path(counter), rr.Scalars([state[counter]]))
+        rr.log(blueprints.policy_comm_path("in_flight"), rr.Scalars([0.0]))
+        if ok:
+            rr.log(blueprints.POLICY_LATENCY_PATH, rr.Scalars([elapsed_s * 1000.0]))
+    state["next_seq"] = int(comm.seq[-1]) + 1
+    rr.set_time("elapsed", duration=now_t)  # back to the tick's ambient time
 
 
 def _log_tail(path: str | None, n: int = _ERROR_TAIL_LINES) -> str | None:
@@ -459,7 +545,8 @@ class SessionMirror:
     All real data, read-only: arm proprio + status from shared memory (published
     by the session's idle or controlling arms), FACTR leaders over HTTP, the 3D
     robot scene (solid = measured ``<side>/q``, translucent = commanded-teleop
-    ghost, purple = eval horizon target from ``eval/<side>/q_horizon``). A stream
+    ghost, purple = eval horizon prediction from ``eval/<side>/q_horizon`` — a
+    posed ghost — or ``eval/<side>/eef_horizon`` — a predicted-EEF trace). A stream
     nobody publishes leaves its row empty and its arm still — the viewer never
     shows motion the system isn't making. It also switches the viewer layout +
     README whenever the session's mode changes, so VIEWING/COLLECTION/EVAL each
@@ -505,17 +592,24 @@ class SessionMirror:
 
     def _run_inner(self, stop: threading.Event) -> None:
         from .arms import discover_conventions
+        from .arms import read_live_horizon_eef
         from .arms import read_live_horizon_q
         from .arms import read_live_stream
 
         dt = 1.0 / _MIRROR_HZ
         _style_eef_pos_series(blueprints.SIDES)
+        _style_policy_comm_series()
         factr_client = _open_factr_client()
         factr_errored: set[str] = set()
         conventions = discover_conventions()
         robot_rec = robot_view.robot_recording()
         live_q: dict = {}      # last-known real measured q per side
+        live_eef: dict = {}    # last-known measured TCP position [x y z] per side
         horizon_q: dict = {}   # eval horizon-end q target per side (eval runs only)
+        horizon_eef: dict = {} # eval horizon-end TCP position per side (cartesian kinds)
+        # Policy-server comm mirroring (eval runs only): next ring seq to surface
+        # + the cumulative packet counters plotted below the robot metrics.
+        comm_state = {"next_seq": 0, "sent": 0, "received": 0, "errors": 0}
         plot_every = max(1, round(_MIRROR_HZ / 5.0))   # mirror plots ~5 Hz (each read attaches shm)
         state_every = max(1, round(_MIRROR_HZ))        # poll session.json ~1 Hz
         layout_key: tuple | None = None
@@ -543,18 +637,28 @@ class SessionMirror:
                         if v is None:
                             if suffix == "q":
                                 live_q.pop(side, None)  # producer gone → freeze this arm
+                            elif suffix == "eef":
+                                live_eef.pop(side, None)
                             continue
                         vec = np.asarray(v, dtype=float)
                         if take is not None:
                             vec = vec[:take]
                         if suffix == "q" and len(vec) >= 7:
                             live_q[side] = vec[:7]
+                        elif suffix == "eef" and len(vec) >= 3:
+                            live_eef[side] = vec[:3]  # base-frame TCP position
                         rr.log(blueprints.proprio_path(row, side), rr.Scalars(vec.tolist()))
                     h = read_live_horizon_q(side)
                     if h is not None and len(h) >= 7:
                         horizon_q[side] = np.asarray(h, dtype=float)[:7]
                     else:
                         horizon_q.pop(side, None)
+                    he = read_live_horizon_eef(side)
+                    if he is not None and len(he) >= 3:
+                        horizon_eef[side] = np.asarray(he, dtype=float)[:3]
+                    else:
+                        horizon_eef.pop(side, None)
+                _log_policy_comm(comm_state, t0_ns, t)
 
             leader_samples = (
                 _log_factr_leaders(factr_client, factr_errored) if factr_client is not None else {}
@@ -563,8 +667,11 @@ class SessionMirror:
                 real_q = dict(live_q)
                 ghost_q = _ghost_configs(leader_samples, conventions)
                 robot_view.update_poses(robot_rec, real_q, ghost_q, t)
-                if horizon_q:
-                    robot_view.update_horizon_targets(robot_rec, horizon_q, real_q, t)
+                if horizon_q or horizon_eef:
+                    robot_view.update_horizon_targets(
+                        robot_rec, horizon_q, real_q, t,
+                        target_eef=horizon_eef, real_eef=live_eef,
+                    )
                 else:
                     robot_view.clear_horizon_targets(robot_rec)
             step += 1

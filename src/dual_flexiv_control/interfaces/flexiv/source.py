@@ -192,13 +192,17 @@ class FlexivSource:
         kind = ctrl_cfg.kind
 
         if kind in ("qpos", "qvel"):
+            # `ctrl_cfg.mode` is NRT_JOINT_POSITION for the default qpos/qvel
+            # configs, or NRT_JOINT_IMPEDANCE for `qpos_impedance` (low-authority
+            # joint tracking via SetJointImpedance in _apply_coeffs below) — both
+            # drive through the same SendJointPosition call in send_control().
             if kind == "qpos":
                 # Smooth MoveJ to the first commanded pose to avoid a startup jump.
                 if not self._bootstrap_movej(first_fields["q_d"], abort):
                     return False
-                robot.SwitchMode(mode.NRT_JOINT_POSITION)
+                robot.SwitchMode(getattr(mode, ctrl_cfg.mode))
             else:  # qvel: start integrating from the measured joint positions
-                robot.SwitchMode(mode.NRT_JOINT_POSITION)
+                robot.SwitchMode(getattr(mode, ctrl_cfg.mode))
                 self._control_target = np.asarray(rs.q, dtype=np.float64).copy()
         elif kind in ("end_effector", "eef_vel", "force"):
             robot.SwitchMode(mode.NRT_CARTESIAN_MOTION_FORCE)
@@ -258,8 +262,16 @@ class FlexivSource:
                 coord = getattr(flexivrdk.CoordType, ctrl_cfg.force_control_frame.root_coord)
                 robot.SetForceControlFrame(coord, ctrl_cfg.force_control_frame.T_in_root)
         elif ctrl_cfg.mode == "NRT_JOINT_IMPEDANCE":
-            if coeffs.joint_impedance is not None:
-                robot.SetJointImpedance(coeffs.joint_impedance.K_q, coeffs.joint_impedance.Z_q)
+            imp = coeffs.joint_impedance
+            if imp is not None:
+                if imp.K_q_fraction is not None:
+                    # Fraction of THIS robot's own nominal stiffness, read live —
+                    # avoids hard-coding an absolute Nm/rad guess per arm model.
+                    nom = robot.info().K_q_nom
+                    K_q = [float(imp.K_q_fraction) * float(k) for k in nom]
+                else:
+                    K_q = imp.K_q
+                robot.SetJointImpedance(K_q, imp.Z_q)
         # NRT_JOINT_POSITION (qpos/qvel): no impedance setter applies; dq_max/ddq_max
         # ride on every SendJointPosition call instead.
 

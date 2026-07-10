@@ -1,0 +1,22 @@
+defaults:
+  - base_control
+  - _self_
+
+# Joint position control under LOW-AUTHORITY joint impedance — same command
+# schema and SendJointPosition(q_d, dq_d, dq_max, ddq_max) call as `qpos`, but
+# flexivrdk 1.8: SwitchMode(NRT_JOINT_IMPEDANCE) instead of NRT_JOINT_POSITION,
+# so tracking stiffness comes from SetJointImpedance(K_q, Z_q) (the active
+# phase's `control_coeffs.joint_impedance`) rather than a fixed high-gain
+# position loop. Meaningless without a joint_impedance coeffs preset — pair
+# with `very_compliant` for a policy's first pass on real hardware, e.g.:
+#   control@arms.left.control=qpos_impedance
+#   '+control_coeffs@task.eval.coeffs=very_compliant'
+kind: qpos
+mode: NRT_JOINT_IMPEDANCE
+send_fn: SendJointPosition
+command:                # SendJointPosition args -> dim (== arm DoF)
+  q_d: 7               # target joint positions    [rad]
+  dq_d: 7              # target joint velocities    [rad/s] (feedforward)
+  dq_max: 7            # max joint velocity         [rad/s]   (static, from coeffs)
+  ddq_max: 7           # max joint acceleration     [rad/s^2] (static, from coeffs)
+streamed: [q_d, dq_d]  # posted per tick on the setpoint channel (dim 14)

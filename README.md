@@ -156,6 +156,7 @@ per tick (the rest are static limits from the coeffs). All paths are **NRT**
 | Controller | RDK mode | send fn | streamed (per-tick) |
 |---|---|---|---|
 | `qpos` | `NRT_JOINT_POSITION` | `SendJointPosition` | `q_d`, `dq_d` |
+| `qpos_impedance` | `NRT_JOINT_IMPEDANCE` | `SendJointPosition` | `q_d`, `dq_d` (low-authority tracking; needs a `joint_impedance` coeffs preset) |
 | `qvel` | `NRT_JOINT_POSITION` | `SendJointPosition` | `dq_d` (arm integrates `q_d`) |
 | `end_effector` | `NRT_CARTESIAN_MOTION_FORCE` | `SendCartesianMotionForce` | `pose_d`, `twist_d` |
 | `eef_vel` | `NRT_CARTESIAN_MOTION_FORCE` | `SendCartesianMotionForce` | `twist_d` (arm integrates `pose_d`) |
@@ -164,7 +165,7 @@ per tick (the rest are static limits from the coeffs). All paths are **NRT**
 **Controller coefficients** (impedances + motion limits) default per phase from
 the schema — `task.collection.coeffs` is **compliant** (soft teleop) and
 `task.eval.coeffs` is **stiff** (precise tracking). The named presets
-(`compliant`/`stiff`/`default`) are registered in
+(`compliant`/`stiff`/`default`/`very_compliant`) are registered in
 [configs.py](src/dual_flexiv_control/configs.py) (single source of truth — no YAML
 files); swap one per phase with an appended group override, e.g.
 `'+control_coeffs@task.eval.coeffs=compliant'`, or tune fields directly
@@ -172,6 +173,21 @@ files); swap one per phase with an appended group override, e.g.
 selects which set the arms apply. The arm applies, after `SwitchMode`, only the
 coeffs its mode accepts (e.g. cartesian impedance for the Cartesian kinds;
 `dq_max`/`ddq_max` for the joint kinds).
+
+`qpos`'s `NRT_JOINT_POSITION` mode has no compliance knob at all (it is always a
+fixed high-gain position loop) — genuinely low joint stiffness needs the
+`qpos_impedance` control kind instead, paired with the `very_compliant` preset
+(`joint_impedance.K_q_fraction` — a small fraction of the connected arm's own
+nominal stiffness, resolved live rather than a hard-coded Nm/rad guess). Handy
+for a cautious first real-hardware pass of an unverified policy checkpoint:
+
+```bash
+dual-flexiv-control rig=left_only runtime.phase=eval policy=acme \
+    policy.host=<host> policy.port=<port> \
+    control@arms.left.control=qpos_impedance \
+    '+control_coeffs@task.eval.coeffs=very_compliant' \
+    arms.left.control_enabled=true
+```
 
 ### Teleoperation (FACTR → follower)
 
@@ -237,8 +253,9 @@ The **left column** drives experiments — pick a **rig** (`conf/rig`) and a
 **task** (`conf/task`), ✏️ open either YAML in VSCode, then launch **Collection**
 or **Eval**. Switching the rig restarts the session onto that hardware set (and
 re-points the arm-status rows, camera tab, and storage root). The **right area**
-is tabbed: **📊 Metrics** embeds a live Rerun web viewer (live in every mode,
-including VIEWING); **📷 Camera** shows a live view of any camera stream
+is tabbed: **📊 Viewer** embeds a live Rerun web viewer (live in every mode,
+including VIEWING) topped by the teach-and-repeat bar (pick a taught skill,
+**▶ Repeat**, ✏️ rename, 🗑 delete); **📷 Camera** shows a live view of any camera stream
 (`cam/<camera>/<view>`, streaming continuously while the session is up);
 **💾 Storage** lists recorded episodes with replay and (bulk) delete.
 
@@ -255,24 +272,42 @@ viewer streams live over gRPC, so metrics update in the browser without a
 Streamlit rerun.
 
 ```
- ┌──────────────┬─[ 📊 Metrics ]─[ 📷 Camera ]─[ 💾 Storage ]─┐
- │  Rig:  [▼]   │   ┌────────────┬───────────────┐            │
- │  Task: [▼]   │   │  3D robot  │ proprio series│            │  Metrics → live 3D scene + plots
- │  ✏️ YAML  ✏️  │   │  scene     │ FACTR leaders │            │  Camera  → live cam/<cam>/<view>
- │  ▶ Collection│   └────────────┴───────────────┘            │  Storage → episodes: ▶ replay, 🗑 delete
- │  ▶ Eval      │                                             │
+ ┌──────────────┬─[ 📊 Viewer ]──[ 📷 Camera ]─[ 💾 Storage ]─┐
+ │  Rig:  [▼]   │  Skill: [▼]  ▶ Repeat  🗑                   │
+ │  Task: [▼]   │   ┌────────────┬───────────────┐            │
+ │  ✏️ YAML  ✏️  │   │  3D robot  │ proprio series│            │  Viewer  → skills bar + live 3D scene/plots
+ │  ▶ Collection│   │  scene     │ FACTR leaders │            │  Camera  → live cam/<cam>/<view>
+ │  ▶ Eval      │   └────────────┴───────────────┘            │  Storage → episodes: ▶ replay, 🎓 teach, 🗑 delete
  │  Running ▣   │                                             │
  └──────────────┴─────────────────────────────────────────────┘
 ```
 
 **Collection** and **Eval** run the real consumers inside the session; the
-Metrics tab mirrors live proprio/FACTR/3D-scene in every mode, and run outcomes
+Viewer tab mirrors live proprio/FACTR/3D-scene in every mode, and run outcomes
 surface as popups (episode saved / crash with log tail). Stop is asynchronous —
 the consumer gets `runtime.save_grace_s` to finalize the episode video while the
 arms return to VIEWING. The one-shot CLI (`dual-flexiv-control
-runtime.phase=collection|eval`) still works standalone, spawning and tearing
-down its own hardware nodes; the headless session daemon does too
+runtime.phase=collection|eval|skill`) still works standalone, spawning and
+tearing down its own hardware nodes; the headless session daemon does too
 (`dfc-session rig=<r>`, commands on stdin).
+
+### Teach and repeat (skills)
+
+A **skill** is a taught joint trajectory saved as one JSON file under
+`skills/` (`skill.root`). Teach type 1 works **from a recorded episode**: every
+episode row in the Storage tab has a **🎓 Teach** button (beside ▶ replay) — one
+click extracts the episode's *measured* joint trajectory (plus the recorded
+gripper channel) straight from the dataset's proprio columns (no video decode)
+and saves it as `<dataset>-ep<index>`. The Viewer tab's bar then
+repeats it: **▶ Repeat** launches a `skill` run through the session daemon — the
+arm gets the `skill.coeffs` controller coefficients, MoveJ-bootstraps to the
+skill's start pose, and retraces the trajectory as `qpos` setpoints at the
+taught fps through the normal control channel (deadman, L-inf safety gate,
+dropout watchdog, and E-stop all apply; purple ghost = the skill's end pose).
+flexivrdk 1.8 has no native record-and-replay API (plans are authored in Flexiv
+Elements), so replaying through the existing control path — with all of its
+guardrails — is deliberate. Also usable headless:
+`dual-flexiv-control runtime.phase=skill skill.name=<name>`.
 
 ## Use the brain API directly
 

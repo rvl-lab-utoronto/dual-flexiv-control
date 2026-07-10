@@ -66,6 +66,22 @@ PROPRIO_DIMS = {"eef_pos": 3, "q": 7, "dq": 7, "tau": 7, "wrench": 6, "eef": 7, 
 EEF_POS_COMPONENTS: tuple[str, ...] = ("x", "y", "z")
 EEF_POS_COLORS = [[220, 70, 70], [70, 200, 70], [70, 120, 240]]
 
+# -- policy-server comms (eval runs) -----------------------------------------
+
+#: Policy-server communication entities (eval only), fed by the mirror from the
+#: run's ``eval/policy_comm`` stream. ``packets`` holds the cumulative
+#: sent/received/error counters plus the 0/1 in-flight square wave (each step is
+#: one packet event at its true time); ``latency`` the per-request round trip.
+POLICY_COMM_ROOT = "policy/comm"
+POLICY_LATENCY_PATH = "policy/latency"
+POLICY_COMM_SERIES: tuple[str, ...] = ("sent", "received", "errors", "in_flight")
+POLICY_COMM_COLORS = [[70, 120, 240], [70, 200, 70], [220, 70, 70], [160, 160, 160]]
+
+
+def policy_comm_path(series: str) -> str:
+    """Entity for one comm counter, e.g. ``policy/comm/sent``."""
+    return f"{POLICY_COMM_ROOT}/{series}"
+
 
 def robot_view(name: str = ROBOT_VIEW_NAME) -> rrb.Spatial3DView:
     """The robot 3D scene view (shared by the run + welcome layouts).
@@ -119,9 +135,10 @@ def for_phase(phase: str, task_name: str | None = None) -> rrb.Blueprint:
     with no run active, so the same proprio grid applies (its rows simply follow
     whatever the hardware is doing).
     """
-    if phase not in ("eval", "collection", "viewing"):
+    if phase not in ("eval", "collection", "skill", "viewing"):
         raise ValueError(
-            f"unknown phase {phase!r} (expected 'eval', 'collection' or 'viewing')"
+            f"unknown phase {phase!r} (expected 'eval', 'collection', 'skill' "
+            "or 'viewing')"
         )
     return _proprio_blueprint(phase, task_name)
 
@@ -164,28 +181,57 @@ def _factr_column(side: str) -> rrb.Vertical:
     )
 
 
+def _policy_comm_row() -> rrb.Horizontal:
+    """Policy-server comm panels (eval): packet activity beside round-trip latency.
+
+    The packets panel steps its counters at each send/receive (with a 0/1
+    in-flight wave marking the gap between them); the latency panel plots one
+    round-trip point per completed request.
+    """
+    return rrb.Horizontal(
+        rrb.TimeSeriesView(
+            origin=f"/{POLICY_COMM_ROOT}",
+            name="Policy server — packets (sent · received · errors · in-flight)",
+        ),
+        rrb.TimeSeriesView(
+            origin=f"/{POLICY_LATENCY_PATH}",
+            name="Policy server — round-trip latency (ms)",
+        ),
+        name="Policy server comms",
+    )
+
+
 def _proprio_blueprint(phase: str, task_name: str | None) -> rrb.Blueprint:
-    """Robot 3D scene beside per-arm columns: FACTR leaders over followers (left | right)."""
+    """Robot 3D scene beside per-arm columns: FACTR leaders over followers (left | right).
+
+    Eval adds a policy-server comms row (packet activity + round-trip latency)
+    below the robot metrics.
+    """
     title = ROBOT_VIEW_NAME
     if task_name:
         title = f"{title} — {task_name} · {phase}"
+    rows = [
+        # FACTR leaders (teleop input) on top, follower proprio below.
+        rrb.Horizontal(
+            _factr_column("left"), _factr_column("right"), name="FACTR leaders"
+        ),
+        rrb.Horizontal(
+            _arm_column("left", PROPRIO_SERIES),
+            _arm_column("right", PROPRIO_SERIES),
+        ),
+    ]
+    row_shares = [3, 8]
+    if phase == "eval":
+        rows.append(_policy_comm_row())
+        row_shares.append(2)
+    rows.append(rrb.TextLogView(origin=f"/{EVENTS}", name="Events"))
+    row_shares.append(1)
     return rrb.Blueprint(
         rrb.Horizontal(
             # 3D shows both arms on the pedestal (measured/ghost); time series split per arm.
             robot_view(title),
-            rrb.Vertical(
-                # FACTR leaders (teleop input) on top, follower proprio below.
-                rrb.Horizontal(
-                    _factr_column("left"), _factr_column("right"), name="FACTR leaders"
-                ),
-                rrb.Horizontal(
-                    _arm_column("left", PROPRIO_SERIES),
-                    _arm_column("right", PROPRIO_SERIES),
-                ),
-                rrb.TextLogView(origin=f"/{EVENTS}", name="Events"),
-                row_shares=[3, 8, 1],
-            ),
-            column_shares=[2, 3],
+            rrb.Vertical(*rows, row_shares=row_shares),
+            column_shares=[4, 1],
         ),
         collapse_panels=True,
     )
@@ -213,7 +259,7 @@ def eval_probe_blueprint(task_name: str | None = None) -> rrb.Blueprint:
                 rrb.TextLogView(origin=f"/{EVENTS}", name="Events"),
                 row_shares=[6, 1],
             ),
-            column_shares=[2, 3],
+            column_shares=[4, 1],
         ),
         collapse_panels=True,
     )
@@ -225,7 +271,7 @@ def welcome_blueprint() -> rrb.Blueprint:
         rrb.Horizontal(
             robot_view(),
             rrb.TextDocumentView(origin=f"/{README}", name="Dashboard"),
-            column_shares=[2, 3],
+            column_shares=[4, 1],
         ),
         collapse_panels=True,
     )

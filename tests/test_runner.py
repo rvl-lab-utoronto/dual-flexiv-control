@@ -70,8 +70,8 @@ class FakeManager:
     def ensure(self, rig, sim):
         return False
 
-    def start_run(self, phase, task, host=None, port=None):
-        self.commands.append(("start", phase, task, host, port))
+    def start_run(self, phase, task, policy=None, host=None, port=None, skill=None):
+        self.commands.append(("start", phase, task, policy, host, port, skill))
         return True
 
     def stop_run(self):
@@ -92,13 +92,36 @@ def _registry(**view_kwargs):
 def test_launch_sends_start_command_from_viewing():
     registry, mgr = _registry()
     registry.launch(_task(), "collection", rig="bimanual")
-    assert mgr.commands == [("start", "collection", "fake", None, None)]
+    assert mgr.commands == [("start", "collection", "fake", None, None, None, None)]
 
 
-def test_launch_forwards_eval_policy_host_and_port():
+def test_launch_forwards_eval_policy_overrides():
     registry, mgr = _registry()
-    registry.launch(_task(), "eval", rig="bimanual", host="100.92.86.90", port=8000)
-    assert mgr.commands == [("start", "eval", "fake", "100.92.86.90", 8000)]
+    registry.launch(_task(), "eval", rig="bimanual",
+                    policy="acme", host="100.92.86.90", port=53866)
+    assert mgr.commands == [
+        ("start", "eval", "fake", "acme", "100.92.86.90", 53866, None)
+    ]
+
+
+def test_launch_skill_sends_start_command():
+    registry, mgr = _registry()
+    registry.launch_skill("pick-ep0", rig="bimanual")
+    assert mgr.commands == [("start", "skill", "default", None, None, None, "pick-ep0")]
+
+
+def test_launch_skill_shares_the_launch_gates():
+    registry, mgr = _registry()
+    mgr.set_view(state="skill", task="pick-ep0", phase="skill")
+    with pytest.raises(RuntimeError, match="still active"):
+        registry.launch_skill("pick-ep0", rig="bimanual")
+    mgr.set_view(state="down")
+    with pytest.raises(RuntimeError, match="not running"):
+        registry.launch_skill("pick-ep0", rig="bimanual")
+    mgr.set_view(state="viewing")
+    with pytest.raises(RuntimeError, match="rig"):
+        registry.launch_skill("pick-ep0", rig="bench")
+    assert mgr.commands == []
 
 
 def test_launch_refused_while_run_active():
@@ -156,6 +179,11 @@ def test_active_and_status_follow_the_session_state():
     mgr.set_view(state="eval", phase="eval")
     cs = registry.collection_status()
     assert cs is not None and cs.state == "running" and "rollout" in cs.detail
+
+    mgr.set_view(state="skill", phase="skill")
+    cs = registry.collection_status()
+    assert cs is not None and cs.state == "running" and "skill" in cs.detail
+    assert registry.active() is not None  # a skill run counts as active
 
 
 def test_stop_active_sends_stop():
@@ -254,3 +282,60 @@ def test_running_status_surfaces_collection_heartbeat(tmp_path):
     cs = registry.collection_status()
     assert cs is not None and cs.state == "running"
     assert "42 frames" in cs.detail
+
+
+def test_log_policy_comm_counts_events_and_resets_between_runs(monkeypatch):
+    """The mirror's comm logger: counters step per event at true event times,
+    only not-yet-surfaced ring samples are logged, and the stream disappearing
+    (run over) resets the counters for the next eval."""
+    import numpy as np
+
+    from dual_flexiv_control.dashboard import arms
+    from dual_flexiv_control.dashboard import runner
+    from dual_flexiv_control.streams.ring import Samples
+
+    logged = []
+    monkeypatch.setattr(runner.rr, "log", lambda path, val, **kw: logged.append((path, val)))
+    monkeypatch.setattr(runner.rr, "set_time", lambda name, duration=None: None)
+    monkeypatch.setattr(runner.rr, "Scalars", lambda values: list(values))
+
+    feed = {"value": None}
+    monkeypatch.setattr(
+        arms, "read_live_policy_comm", lambda runtime_dir=None: feed["value"]
+    )
+
+    state = {"next_seq": 0, "sent": 0, "received": 0, "errors": 0}
+
+    # sent -> received (200 ms round trip)
+    feed["value"] = Samples(
+        data=np.array([[0.0, 1.0, 0.0], [1.0, 1.0, 0.2]]),
+        t_ns=np.array([100, 300], np.int64),
+        seq=np.array([0, 1], np.int64),
+    )
+    runner._log_policy_comm(state, t0_ns=0, now_t=5.0)
+    assert state == {"next_seq": 2, "sent": 1, "received": 1, "errors": 0}
+    assert ("policy/comm/sent", [1]) in logged
+    assert ("policy/comm/received", [1]) in logged
+    assert ("policy/comm/in_flight", [1.0]) in logged
+    assert ("policy/comm/in_flight", [0.0]) in logged
+    assert (runner.blueprints.POLICY_LATENCY_PATH, [pytest.approx(200.0)]) in logged
+
+    # Same ring again: everything already surfaced -> nothing new logged.
+    logged.clear()
+    runner._log_policy_comm(state, t0_ns=0, now_t=6.0)
+    assert logged == []
+
+    # Run over: stream gone -> counters reset for the next eval.
+    feed["value"] = None
+    runner._log_policy_comm(state, t0_ns=0, now_t=7.0)
+    assert state == {"next_seq": 0, "sent": 0, "received": 0, "errors": 0}
+
+    # Next eval: a fresh ring starting at seq 0, whose request errors out.
+    feed["value"] = Samples(
+        data=np.array([[0.0, 1.0, 0.0], [2.0, 1.0, 1.5]]),
+        t_ns=np.array([900, 2400], np.int64),
+        seq=np.array([0, 1], np.int64),
+    )
+    runner._log_policy_comm(state, t0_ns=0, now_t=8.0)
+    assert state == {"next_seq": 2, "sent": 1, "received": 0, "errors": 1}
+    assert ("policy/comm/errors", [1]) in logged

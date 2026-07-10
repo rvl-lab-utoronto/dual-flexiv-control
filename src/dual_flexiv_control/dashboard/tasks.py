@@ -28,6 +28,7 @@ import dual_flexiv_control
 CONF_DIR = Path(dual_flexiv_control.__file__).resolve().parent / "conf"
 TASK_GROUP_DIR = CONF_DIR / "task"
 RIG_GROUP_DIR = CONF_DIR / "rig"
+POLICY_GROUP_DIR = CONF_DIR / "policy"
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,20 @@ def discover_rigs(rig_dir: Path = RIG_GROUP_DIR) -> list[RigInfo]:
     return [
         RigInfo(name=path.stem, description=_head_comment(path), path=path)
         for path in sorted(rig_dir.glob("*.yaml"))
+    ]
+
+
+def discover_policies(policy_dir: Path = POLICY_GROUP_DIR) -> list[str]:
+    """Every selectable policy type in the ``conf/policy`` group, sorted by name.
+
+    These are the eval launcher's ``policy=<name>`` choices (which client/schema
+    talks to the policy server — e.g. acme's multipart HTTP vs openpi's
+    websocket). ``base_policy`` (the schema parent the real entries extend) is
+    not selectable and is skipped.
+    """
+    return [
+        path.stem for path in sorted(policy_dir.glob("*.yaml"))
+        if path.stem != "base_policy"
     ]
 
 

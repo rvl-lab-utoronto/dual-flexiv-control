@@ -348,19 +348,54 @@ class Policy(Protocol):
     def close(self) -> None: ...
 
 
-class RemotePolicy:
-    """A remote policy server = wire schema (payload shape) + transport."""
+#: Comm-event kinds emitted by :class:`RemotePolicy`'s ``on_comm`` hook (floats:
+#: they travel as the first element of a float64 shared-memory sample).
+COMM_SENT = 0.0     # request handed to the transport (packet leaving)
+COMM_RECV = 1.0     # response received (round trip complete)
+COMM_ERROR = 2.0    # request failed (timeout / refused / server error)
 
-    def __init__(self, schema, transport) -> None:
+
+class RemotePolicy:
+    """A remote policy server = wire schema (payload shape) + transport.
+
+    ``on_comm`` is an optional viz hook, ``(kind, seq, elapsed_s) -> None``:
+    :data:`COMM_SENT` as the encoded request goes to the transport (elapsed 0),
+    then :data:`COMM_RECV` (round-trip seconds) or :data:`COMM_ERROR` (seconds
+    until failure) for the same ``seq``. Purely observational — a hook failure
+    never disturbs inference.
+    """
+
+    def __init__(self, schema, transport, on_comm=None) -> None:
         self._schema = schema
         self._transport = transport
+        self._on_comm = on_comm
+        self._seq = 0
 
     @property
     def server_metadata(self) -> dict:
         return getattr(self._transport, "server_metadata", {})
 
+    def _emit(self, kind: float, seq: int, elapsed_s: float) -> None:
+        if self._on_comm is None:
+            return
+        try:
+            self._on_comm(kind, seq, elapsed_s)
+        except Exception:  # noqa: BLE001 - viz hook only
+            log.exception("policy comm hook failed (inference unaffected)")
+
     def infer(self, obs: dict) -> np.ndarray:
-        return self._schema.actions(self._transport.infer(self._schema.request(obs)))
+        payload = self._schema.request(obs)
+        self._seq += 1
+        seq = self._seq
+        t0 = time.monotonic()
+        self._emit(COMM_SENT, seq, 0.0)
+        try:
+            response = self._transport.infer(payload)
+        except Exception:
+            self._emit(COMM_ERROR, seq, time.monotonic() - t0)
+            raise
+        self._emit(COMM_RECV, seq, time.monotonic() - t0)
+        return self._schema.actions(response)
 
     def close(self) -> None:
         self._transport.close()
@@ -395,13 +430,15 @@ class HoldPolicy:
         pass
 
 
-def build_policy(cfg, layout, observer, stop_event=None) -> Policy:
+def build_policy(cfg, layout, observer, stop_event=None, on_comm=None) -> Policy:
     """The configured :class:`Policy` for an eval run.
 
     ``cfg`` is a :class:`~dual_flexiv_control.configs.PolicyCfg`; ``layout`` an
     :class:`~.actions.ActionLayout`; ``observer`` an
     :class:`~.observation.ObservationBuilder` (the hold policy needs its state
     layout). Remote construction blocks until the server is reachable.
+    ``on_comm`` (remote only) observes server round trips — see
+    :class:`RemotePolicy`; the serverless hold policy has no comms to report.
     """
     from .schema import build_schema  # noqa: PLC0415 - avoid import cycle at module load
 
@@ -414,7 +451,9 @@ def build_policy(cfg, layout, observer, stop_event=None) -> Policy:
             ) from exc
         return HoldPolicy(layout, q_slices)
     if cfg.kind == "remote":
-        return RemotePolicy(build_schema(cfg), _build_transport(cfg, stop_event))
+        return RemotePolicy(
+            build_schema(cfg), _build_transport(cfg, stop_event), on_comm=on_comm
+        )
     raise ValueError(f"unknown policy.kind {cfg.kind!r} (expected 'remote' or 'hold')")
 
 

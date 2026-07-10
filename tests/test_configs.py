@@ -127,6 +127,14 @@ def test_all_control_schemas_present_and_shaped():
     assert qvel.mode == "NRT_JOINT_POSITION"
     assert list(qvel.streamed) == ["dq_d"]
 
+    # qpos_impedance -> same schema as qpos, but NRT_JOINT_IMPEDANCE (low-authority
+    # tracking via SetJointImpedance instead of a fixed high-gain position loop)
+    qpos_imp = ctrl("qpos_impedance")
+    assert qpos_imp.mode == "NRT_JOINT_IMPEDANCE"
+    assert qpos_imp.send_fn == "SendJointPosition"
+    assert dict(qpos_imp.command) == dict(qpos.command)
+    assert list(qpos_imp.streamed) == list(qpos.streamed)
+
     # end_effector -> NRT_CARTESIAN_MOTION_FORCE / SendCartesianMotionForce(pose, wrench, velocity, ...)
     eef = ctrl("end_effector")
     assert eef.mode == "NRT_CARTESIAN_MOTION_FORCE"
@@ -159,6 +167,21 @@ def test_per_phase_control_coeffs_default_compliant_vs_stiff():
     # joint motion limits feed SendJointPosition max_vel/max_acc args
     assert coll.max_joint_vel == pytest.approx(1.5)
     assert ev.max_joint_vel == pytest.approx(2.5)
+
+
+def test_very_compliant_coeffs_preset_uses_fraction_of_nominal_stiffness():
+    # `very_compliant` asks for a small FRACTION of the live robot's own K_q_nom
+    # (resolved at apply-time; see FlexivSource._apply_coeffs) rather than a
+    # hard-coded absolute K_q, so it stays "insanely low" for any arm model.
+    cfg = _compose(
+        "control@arms.left.control=qpos_impedance",
+        "+control_coeffs@task.eval.coeffs=very_compliant",
+    )
+    imp = cfg.task.eval.coeffs.joint_impedance
+    assert imp is not None
+    assert 0.0 < imp.K_q_fraction < 0.3  # a small slice of nominal, not "None"/absolute
+    assert not imp.K_q  # no absolute K_q hard-coded alongside the fraction
+    assert cfg.task.eval.coeffs.max_joint_vel < cfg.task.eval.coeffs.max_joint_acc
 
 
 def test_control_coeffs_override_and_phase_selector():

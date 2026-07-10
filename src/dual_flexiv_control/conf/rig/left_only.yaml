@@ -16,8 +16,10 @@ defaults:
 
 arms:
   left:
+    convention: { offsets_deg: [0, -80, 90, 80, 90, 90.00, 0], sign_flip_joints: [2, 5] }
     name: "Lauer"
     serial: Rizon4s-062841
+    control_enabled: true
     # convention: { gripper_open: 0.0, gripper_closed: 1.2 }  # see rig/bimanual.yaml
 
 cameras:

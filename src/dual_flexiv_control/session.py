@@ -17,10 +17,11 @@ session drops back to VIEWING with the hardware untouched.
 **Protocol** (dashboard ↔ daemon):
 
 * commands — JSON lines on **stdin**: ``{"cmd": "start", "phase": "collection",
-  "task": "<name>"}`` (eval may add ``"host": <str>`` and/or ``"port": <int>``
-  to point at a different policy server), ``{"cmd": "stop"}``, ``{"cmd":
-  "shutdown"}``. stdin EOF == shutdown, so a dead dashboard can never leave an
-  orphaned daemon holding robots.
+  "task": "<name>"}`` (eval may add ``"policy": <conf/policy name>``,
+  ``"host": <str>``, and/or ``"port": <int>`` to point at a different policy
+  server; a ``"skill"`` phase takes ``"skill": <saved skill name>`` instead of a
+  task), ``{"cmd": "stop"}``, ``{"cmd": "shutdown"}``. stdin EOF == shutdown,
+  so a dead dashboard can never leave an orphaned daemon holding robots.
 * state — ``<runtime_dir>/session.json``, atomically replaced (same pattern as the
   stream-manifest registry): current mode, active run, a heartbeat timestamp, and
   the last run's outcome. The dashboard polls it.
@@ -76,9 +77,10 @@ log = logging.getLogger(__name__)
 VIEWING = "viewing"
 COLLECTION = "collection"
 EVAL = "eval"
+SKILL = "skill"
 SAVING = "saving"
 
-PHASES = (COLLECTION, EVAL)
+PHASES = (COLLECTION, EVAL, SKILL)
 
 #: Main supervise-loop cadence.
 _TICK_S = 0.05
@@ -134,15 +136,26 @@ def classify_outcome(phase: str, exitcode: int | None, stopping: bool) -> tuple[
         if stopping:
             if phase == COLLECTION:
                 return "saved", "collection stopped — episode saved to the dataset."
+            if phase == SKILL:
+                return "stopped", "skill replay stopped."
             return "stopped", "eval stopped."
         if phase == COLLECTION:
             return "finished", "collection finished (target episodes reached)."
+        if phase == SKILL:
+            return "finished", "skill replay finished."
         return "finished", "eval finished (rollout horizon reached)."
     if stopping:
         return (
             "stopped-error",
             f"run stopped but exited abnormally (code {exitcode}); "
             "a collection episode may not have saved.",
+        )
+    if phase == SKILL:
+        return (
+            "crashed",
+            f"skill replay failed (exit code {exitcode}) — e.g. the arm never "
+            "reached the skill's start pose (E-stop/fault/safety halt), or a "
+            "source failed.",
         )
     return (
         "crashed",
@@ -477,8 +490,22 @@ class SessionDaemon:
         if self.run is not None:
             self.state.message = "a run is already active — stop it first"
             return
+        # A skill replay is task-independent; any composable task satisfies the
+        # schema, so a missing task just takes the default.
+        if phase == SKILL and not task:
+            task = "default"
         if phase not in PHASES or not task:
             self.state.message = f"bad start command (phase={phase!r}, task={task!r})"
+            return
+        skill_name = cmd.get("skill")
+        if skill_name is not None and not (
+            isinstance(skill_name, str) and skill_name
+            and all(c.isalnum() or c in "._-" for c in skill_name)
+        ):
+            self.state.message = f"bad start command (skill={skill_name!r})"
+            return
+        if phase == SKILL and not skill_name:
+            self.state.message = "bad start command (a skill run needs a skill name)"
             return
         port = cmd.get("port")
         if port is not None and not (isinstance(port, int) and 0 < port < 65536):
@@ -491,16 +518,24 @@ class SessionDaemon:
         ):
             self.state.message = f"bad start command (host={host!r})"
             return
+        policy = cmd.get("policy")
+        if policy is not None and not (
+            isinstance(policy, str) and policy
+            and all(c.isalnum() or c in "._-" for c in policy)
+        ):
+            self.state.message = f"bad start command (policy={policy!r})"
+            return
         busy = self._arms_still_in_control()
         if busy:
             self.state.message = (
                 f"arm(s) still winding down a control session: {sorted(busy)} — retry shortly"
             )
             return
-        if self.state.cameras_down:
+        if self.state.cameras_down and phase != SKILL:
             # Recording/eval sample every rig camera; a missing view would stall
             # the run at frame 0 (or record holes). Refuse with the reason —
             # "still starting" (boot window) reads differently from "down".
+            # A skill replay observes only arm proprio, so it is not camera-gated.
             names = ", ".join(self.state.cameras_down)
             booting_only = all(
                 not unit.announced_down
@@ -519,13 +554,20 @@ class SessionDaemon:
                 )
             return
         extra = []
+        if policy is not None:
+            # The group selection first: policy.host/port refine the chosen type.
+            extra.append(f"policy={policy}")
         if host is not None:
             extra.append(f"policy.host={host}")
         if port is not None:
             extra.append(f"policy.port={port}")
+        if phase == SKILL:
+            extra.append(f"skill.name={skill_name}")
         try:
             run_config = compose_config(run_overrides(self.overrides, task, phase, extra))
             coeffs = active_coeffs(run_config)
+            # For a skill run this also loads the skill file, so a missing/corrupt
+            # skill surfaces here as a refused start, not a crashed run.
             consumer = build_consumer(run_config, self.run_id)
         except Exception as exc:  # noqa: BLE001 - bad task/config must not kill the session
             log.exception("start %s task=%s failed to compose", phase, task)
@@ -535,23 +577,40 @@ class SessionDaemon:
             s for s, arm in run_config.arms.items()
             if arm.control_enabled and s in self.session_qs
         ]
+        # A consumer that declares which sides it will feed (a skill drives only
+        # the taught sides) narrows the EnterControl fan-out: an arm handed a
+        # control session nobody feeds would just time out waiting for setpoints.
+        drive_sides = getattr(consumer, "drive_sides", None)
+        if drive_sides is not None:
+            command_sides = [s for s in command_sides if s in drive_sides]
+            if not command_sides:
+                self.state.message = (
+                    f"skill {skill_name!r} has no driveable side on this rig — it "
+                    "needs a control-enabled arm (qpos control) matching the "
+                    "skill's taught side(s)"
+                )
+                return
         for side in command_sides:
             self.session_qs[side].put(EnterControl(coeffs=coeffs, phase=phase))
         stop_event = self.ctx.Event()
         proc = self.ctx.Process(target=run_node, args=(consumer, stop_event), name=consumer.name)
         proc.start()
+        # A skill run is labelled by its skill (the composed task is incidental).
+        label = skill_name if phase == SKILL else task
         self.run = _ActiveRun(
-            phase=phase, task=task, proc=proc,
+            phase=phase, task=label, proc=proc,
             stop_event=stop_event, command_sides=command_sides,
         )
         self.state.state = phase
-        self.state.task = task
+        self.state.task = label
         self.state.phase = phase
         self.state.run_seq += 1
         self.state.run_started_ts = time.time()
         self.state.message = None
-        log.info("run %d: %s task=%s (consumer pid %s; commanding %s)",
-                 self.state.run_seq, phase, task, proc.pid, command_sides)
+        log.info("run %d: %s task=%s%s (consumer pid %s; commanding %s)",
+                 self.state.run_seq, phase, task,
+                 f" skill={skill_name}" if skill_name else "",
+                 proc.pid, command_sides)
 
     def _handle_stop(self) -> None:
         if self.run is None:

@@ -22,6 +22,9 @@ from .channel import action_field
 from .channel import action_hold_fields
 from .channel import control_channel_name
 from .channel import control_specs
+from .channel import estimate_chunk_end
+from .channel import horizon_kind
+from .channel import horizon_signals
 from .channel import pack_action
 from .channel import pack_streamed
 from .channel import setpoint_dim
@@ -29,6 +32,7 @@ from .channel import slice_streamed
 from .channel import streamed_layout
 from .convention import convert_factr_to_rizon
 from .convention import normalize_gripper
+from .convention import offsets_from_straight_pose
 from .message import CommandKind
 from .message import ControlCommand
 
@@ -41,6 +45,9 @@ __all__ = [
     "action_hold_fields",
     "control_channel_name",
     "control_specs",
+    "estimate_chunk_end",
+    "horizon_kind",
+    "horizon_signals",
     "setpoint_dim",
     "streamed_layout",
     "pack_action",
@@ -48,6 +55,7 @@ __all__ = [
     "slice_streamed",
     "convert_factr_to_rizon",
     "normalize_gripper",
+    "offsets_from_straight_pose",
     "SETPOINT",
     "COMMAND",
 ]

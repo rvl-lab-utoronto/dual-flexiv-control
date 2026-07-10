@@ -42,6 +42,18 @@ JOINT_POS_STREAM = "{side}/q"
 #: purple horizon-target ghost + the current→target EEF trace during eval runs.
 HORIZON_STREAM = "eval/{side}/q_horizon"
 
+#: Cartesian sibling of :data:`HORIZON_STREAM` (control kinds with no joint target
+#: — ``end_effector``/``eef_vel``): the estimated base-frame TCP position
+#: ``[x y z]`` at the END of the chunk — see ``policy.loop.eef_horizon_stream_name``.
+#: Read by the 3D robot scene to draw the current→predicted EEF trace (no ghost).
+EEF_HORIZON_STREAM = "eval/{side}/eef_horizon"
+
+#: Policy-server comm events published by a running eval (one ``[kind, seq,
+#: elapsed_s]`` sample per packet sent / received / failed — see
+#: ``policy.loop.comm_stream_name``). Read by the mirror to plot send/receive
+#: activity and round-trip latency below the robot metrics.
+POLICY_COMM_STREAM = "eval/policy_comm"
+
 #: Friendly labels for flexivrdk OperationalStatus names (RDK 1.8.0).
 _MODE_LABELS = {
     "READY": "Auto (Remote)",
@@ -76,6 +88,18 @@ class ArmStatus:
     control_active: bool | None = None  # in a control session? None = unknown/old stream
 
 
+@dataclass(frozen=True)
+class LeaderStatus:
+    """Reachability of one FACTR teleop leader (the arm the operator moves)."""
+
+    side: str  # "left" | "right"
+    name: str  # display name (side, capitalized)
+    reachable: bool  # did the leader's server answer?
+    dof: int  # arm joints (trailing gripper dropped), when reachable
+    gripper: float | None  # raw trailing gripper reading, when reachable
+    sim: bool  # runtime.sim -> the reading is synthetic, not real hardware
+
+
 # ---------------------------------------------------------------------------
 # Discovery
 # ---------------------------------------------------------------------------
@@ -88,6 +112,13 @@ _SNAPSHOT: tuple[tuple[ArmInfo, ...], bool, object, dict] | None = None
 #: config default. Owned here so every dashboard compose (arms, cameras, storage)
 #: follows the same selection.
 _ACTIVE_RIG: str | None = None
+
+_LEADER_LOCK = threading.Lock()
+#: Cached FACTR client for the read-only leader-status probe. Its own client (not
+#: the Calibrate tab's) so the always-on status poll and the on-demand calibration
+#: render never share one keep-alive HTTP connection across threads. Dropped by
+#: :func:`reset` so a rig / ``runtime.sim`` change rebuilds it.
+_LEADER_CLIENT = None
 
 
 def set_active_rig(rig: str | None) -> None:
@@ -159,6 +190,14 @@ def reset() -> None:
     global _SNAPSHOT
     with _LOCK:
         _SNAPSHOT = None
+    global _LEADER_CLIENT
+    with _LEADER_LOCK:
+        if _LEADER_CLIENT is not None:
+            try:
+                _LEADER_CLIENT.close()
+            except Exception:  # noqa: BLE001 - already broken; just drop it
+                pass
+        _LEADER_CLIENT = None
 
 
 def _compose() -> tuple[tuple[ArmInfo, ...], bool, object, dict]:
@@ -227,6 +266,54 @@ def read_arm_status(arm: ArmInfo, runtime_dir: str | None = None) -> ArmStatus:
             control_active=None if control is None else bool(control),
         )
     return ArmStatus(arm, mode="disconnected", estop_pressed=None, source="disconnected")
+
+
+def configured_leader_sides() -> list[str]:
+    """The teleop-leader sides the active rig serves (keys of ``cfg.factr.servers``)."""
+    servers = getattr(discover_factr(), "servers", None)
+    return list(servers) if servers else []
+
+
+def _leader_client():
+    """The cached read-only leader client (built lazily), or None if none composes.
+
+    Honours ``runtime.sim``; construction only builds the per-side HTTP clients (no
+    connection), so this returns a client whenever the rig configures any FACTR
+    server. :func:`reset` drops it so a rig / sim change rebuilds it.
+    """
+    from ..interfaces.factr.client import FactrClient
+
+    global _LEADER_CLIENT
+    with _LEADER_LOCK:
+        if _LEADER_CLIENT is None:
+            try:
+                client = FactrClient.from_config(discover_factr(), sim=runtime_is_sim())
+            except Exception:  # noqa: BLE001 - no/invalid FACTR config -> no leaders
+                return None
+            _LEADER_CLIENT = client if client.sides else None
+        return _LEADER_CLIENT
+
+
+def read_leader_status(side: str) -> LeaderStatus:
+    """Single read-only reachability probe for one FACTR teleop leader.
+
+    One HTTP GET (never a robot connection): **reachable** if the leader's server
+    answers with a valid ``DoF+1`` sample, else **disconnected**. In ``runtime.sim``
+    the reading is synthetic (``sim=True``) — the leader always reads reachable, so
+    the row flags it rather than implying live hardware.
+    """
+    name = side.capitalize()
+    sim = runtime_is_sim()
+    client = _leader_client()
+    if client is None or side not in getattr(client, "sides", []):
+        return LeaderStatus(side, name, reachable=False, dof=0, gripper=None, sim=sim)
+    with _LEADER_LOCK:  # serialize the shared keep-alive connection across fragments
+        try:
+            jp = np.asarray(client.get_joint_positions_for(side), dtype=float).ravel()
+        except Exception:  # noqa: BLE001 - leader down / bad response -> disconnected
+            return LeaderStatus(side, name, reachable=False, dof=0, gripper=None, sim=sim)
+    grip = float(jp[-1]) if jp.size else None
+    return LeaderStatus(side, name, reachable=True, dof=max(0, jp.size - 1), gripper=grip, sim=sim)
 
 
 def _runtime_root(runtime_dir: str | None) -> Path:
@@ -313,6 +400,54 @@ def read_live_horizon_q(side: str, runtime_dir: str | None = None) -> np.ndarray
     outside eval runs → the caller hides the horizon-target ghost.
     """
     return _read_live_stream_newest(HORIZON_STREAM.format(side=side), runtime_dir)
+
+
+def read_live_horizon_eef(side: str, runtime_dir: str | None = None) -> np.ndarray | None:
+    """Latest estimated horizon-end TCP position ``eval/<side>/eef_horizon``, or None.
+
+    Base-frame ``[x y z]``, published (once per inference) by an eval run whose
+    arm is under a cartesian control kind; None otherwise → the caller hides the
+    predicted-EEF trace.
+    """
+    return _read_live_stream_newest(EEF_HORIZON_STREAM.format(side=side), runtime_dir)
+
+
+def read_live_policy_comm(runtime_dir: str | None = None):
+    """All buffered policy-server comm events, or None outside eval runs.
+
+    Returns the stream's :class:`~dual_flexiv_control.streams.ring.Samples`
+    (``[kind, seq, elapsed_s]`` rows with per-sample monotonic timestamps and
+    gap-free ring sequence numbers) so the caller can pick out the events it
+    has not surfaced yet. None means no running eval publishes the stream.
+    """
+    root = _runtime_root(runtime_dir)
+    if not root.is_dir():
+        return None
+    try:
+        from dual_flexiv_control.streams import StreamReader
+        from dual_flexiv_control.streams import StreamRegistry
+    except Exception:  # noqa: BLE001 - streams stack unavailable -> no live data
+        return None
+    run_dirs = sorted(
+        (p for p in root.iterdir() if (p / "streams").is_dir()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for run_dir in run_dirs:
+        try:
+            entry = StreamRegistry(str(root), run_dir.name).get(POLICY_COMM_STREAM)
+            if entry is None:
+                continue
+            reader = StreamReader.attach(entry)
+            try:
+                samples = reader.last(reader.capacity)
+                if samples.n > 0:
+                    return samples
+            finally:
+                reader.close()
+        except Exception:  # noqa: BLE001 - dead run / lapped buffer -> try next
+            continue
+    return None
 
 
 def _label_for_code(code: float) -> str:

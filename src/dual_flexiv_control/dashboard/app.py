@@ -24,15 +24,20 @@ import streamlit as st
 # so its submodules resolve normally.
 from dual_flexiv_control.dashboard import arms as _arms
 from dual_flexiv_control.dashboard import blueprints
+from dual_flexiv_control.dashboard import calibration as _calibration
 from dual_flexiv_control.dashboard import cameras as _cameras
 from dual_flexiv_control.dashboard import logs as _logs
 from dual_flexiv_control.dashboard import replay as _replay
 from dual_flexiv_control.dashboard import robot_view as _robot
 from dual_flexiv_control.dashboard import runner as _runner
+from dual_flexiv_control.dashboard import skills as _skills
 from dual_flexiv_control.dashboard import storage as _storage
 from dual_flexiv_control.dashboard.arms import ArmStatus
+from dual_flexiv_control.dashboard.arms import LeaderStatus
+from dual_flexiv_control.dashboard.arms import configured_leader_sides
 from dual_flexiv_control.dashboard.arms import discover_arms
 from dual_flexiv_control.dashboard.arms import read_arm_status
+from dual_flexiv_control.dashboard.arms import read_leader_status
 from dual_flexiv_control.dashboard.cameras import CameraStatus
 from dual_flexiv_control.dashboard.cameras import CameraView
 from dual_flexiv_control.dashboard.cameras import discover_camera_views
@@ -42,6 +47,7 @@ from dual_flexiv_control.dashboard.editor import open_in_vscode
 from dual_flexiv_control.dashboard.ssh_hosts import discover_ssh_hosts
 from dual_flexiv_control.dashboard.tasks import RigInfo
 from dual_flexiv_control.dashboard.tasks import TaskInfo
+from dual_flexiv_control.dashboard.tasks import discover_policies
 from dual_flexiv_control.dashboard.tasks import discover_rigs
 from dual_flexiv_control.dashboard.tasks import discover_tasks
 from dual_flexiv_control.dashboard.viewer import RerunServers
@@ -55,24 +61,35 @@ CAMERA_REFRESH = "0.15s"
 #: Logs-tab tail cadence while "Follow" is on (a running system logs a beat every ~2s).
 LOG_REFRESH = "2s"
 
-#: Trim the default top padding and enlarge the tab buttons.
+#: Trim the default top padding, style the tab bar (its labels use monochrome
+#: Material icons — forced white so the active tab's accent colour never tints
+#: them), and enlarge the per-episode action icons in the Storage tab (scoped
+#: via the ``st-key-stor_rows`` container class).
 _PAGE_CSS = """
 <style>
 [data-testid="stMainBlockContainer"], .block-container {
     padding-top: 1.5rem !important;
 }
-.stTabs [data-baseweb="tab-list"] button { padding: 0.6rem 1.4rem; }
+.stTabs [data-baseweb="tab-list"] button { padding: 1rem 2.2rem; }
 .stTabs [data-baseweb="tab-list"] button [data-testid="stMarkdownContainer"] p {
-    font-size: 1.25rem;
+    font-size: 1.35rem;
     font-weight: 600;
 }
+/* The markdown-rendered Material icons in the tab labels (span[role=img]):
+   keep them white even on the active tab (whose text takes the accent color). */
+.stTabs [data-baseweb="tab-list"] button [data-testid="stMarkdownContainer"] span[role="img"] {
+    font-size: 1.5rem;
+    color: #fafafa !important;
+}
+.st-key-stor_rows .stButton button p { font-size: 1.35rem; }
 </style>
 """
 
 #: Page background per session mode. VIEWING keeps the theme default (#0e1117,
 #: hsv 220° 39% 9%); COLLECTION is the same hue one value step up (~15%); EVAL is
-#: collection's value/saturation with the hue shifted purple (~280°).
-_MODE_BG = {"collection": "#181d27", "eval": "#211627"}
+#: collection's value/saturation with the hue shifted purple (~280°); SKILL
+#: (teach-and-repeat replay) shifts it green (~150°) instead.
+_MODE_BG = {"collection": "#181d27", "eval": "#211627", "skill": "#16271d"}
 
 
 def _apply_mode_background(view) -> None:
@@ -138,6 +155,16 @@ def _replay_viewer() -> _replay.ReplayViewer:
 
 
 @st.cache_resource
+def _calibration_viewer() -> _calibration.CalibViewer:
+    """Start (once) the calibration gRPC recording, embedded in the shared web viewer.
+
+    Its own recording (isolated from metrics/replay) so the Calibrate tab can pose an
+    arm at the leader's commanded config without disturbing the live run scene.
+    """
+    return _calibration.start_calib_viewer(web_port=_servers().web_port)
+
+
+@st.cache_resource
 def _registry() -> _runner.RunRegistry:
     return _runner.RunRegistry()
 
@@ -169,11 +196,14 @@ def _reset_services(registry: _runner.RunRegistry) -> bool:
     _arms.reset()
     _cameras.reset()
     _storage.reset()
-    _teardown_servers()          # rerun_shutdown: releases metrics + replay gRPC ports
+    _skills.reset()
+    _teardown_servers()          # rerun_shutdown: releases metrics + replay + calib gRPC ports
     _robot.reset()               # forget the dead metrics recording
     _replay.reset()              # forget the (now released) replay server
+    _calibration.reset()         # forget the (now released) calibration server + leader client
     _servers.clear()             # st.cache_resource: re-run start_servers on next call
     _replay_viewer.clear()
+    _calibration_viewer.clear()
     _servers()                   # re-serve metrics gRPC + re-attach robot scene + welcome
     _runner.reset_viewer()       # idle welcome blueprint + README + reset event log
     # Fresh daemon on the (possibly re-read) rig/sim; ensure restarts the mirror too.
@@ -246,9 +276,19 @@ def _render_controls(
 
     # One compact row: labels collapsed (the column is narrow), meaning carried
     # by tooltips + the resolution caption underneath.
-    eval_cols = st.columns([1.4, 1.2, 0.8], vertical_alignment="center")
+    eval_cols = st.columns([0.85, 1.1, 1.1, 0.6], vertical_alignment="center")
+    policy_choice = eval_cols[1].selectbox(
+        "Policy type", ["default", *discover_policies()], key="eval_policy_type",
+        label_visibility="collapsed",
+        help=(
+            "Policy client/schema for this eval run (overrides the policy "
+            "group, e.g. acme's multipart HTTP vs openpi's websocket). "
+            "'default' uses the task's policy config."
+        ),
+    )
+    policy = None if policy_choice == "default" else policy_choice
     by_alias = {h.alias: h.address for h in discover_ssh_hosts()}
-    host_choice = eval_cols[1].selectbox(
+    host_choice = eval_cols[2].selectbox(
         "Policy host", ["default", *by_alias], key="eval_policy_host",
         label_visibility="collapsed",
         help=(
@@ -258,7 +298,7 @@ def _render_controls(
         ),
     )
     host = by_alias.get(host_choice)
-    port_raw = eval_cols[2].text_input(
+    port_raw = eval_cols[3].text_input(
         "Policy port", key="eval_policy_port", placeholder="port",
         label_visibility="collapsed",
         help=(
@@ -272,12 +312,13 @@ def _render_controls(
         disabled=not launchable or port_error is not None,
         help="Online policy rollout (needs the policy server reachable).",
     ):
-        _launch(registry, task, "eval", rig.name, host=host, port=port)
+        _launch(registry, task, "eval", rig.name, policy=policy, host=host, port=port)
     if port_error:
         st.caption(f":red[{port_error}]")
-    elif host is not None or port is not None:
+    elif policy is not None or host is not None or port is not None:
         st.caption(
-            f":gray[policy → {host or 'config host'}:{port or 'config port'}]"
+            f":gray[policy → {policy or 'config type'} @ "
+            f"{host or 'config host'}:{port or 'config port'}]"
         )
 
     st.caption("Each launch runs a single episode.")
@@ -320,6 +361,33 @@ def _arm_status_rows() -> None:
         _render_arm_row(read_arm_status(arm))
 
 
+def _render_leader_row(s: LeaderStatus) -> None:
+    dot = "🟢" if s.reachable else "⚫"
+    if s.reachable:
+        detail = ":orange[sim]" if s.sim else ":green[live]"
+        detail += f" · {s.dof} joints"
+        if s.gripper is not None:
+            detail += f" · grip `{s.gripper:+.2f}`"
+    else:
+        detail = ":gray[no signal]"
+    st.markdown(f"{dot} **{s.name}**  \n{detail}")
+
+
+@st.fragment(run_every="2s")
+def _leader_status_rows() -> None:
+    """Read-only per-leader (FACTR teleop arm) reachability rows, refreshed periodically."""
+    try:
+        sides = configured_leader_sides()
+    except Exception as exc:  # noqa: BLE001 - broken factr conf -> compact, visible note
+        st.warning(f"Leader config failed to compose: {exc}", icon="🛠️")
+        return
+    if not sides:
+        st.caption(":gray[No teleop leaders configured.]")
+        return
+    for side in sides:
+        _render_leader_row(read_leader_status(side))
+
+
 def _render_camera_row(s: CameraStatus) -> None:
     dot = "🟢" if s.detected else "⚫"
     if s.detected:
@@ -360,11 +428,11 @@ def _parse_port(raw: str) -> tuple[int | None, str | None]:
 
 def _launch(
     registry: _runner.RunRegistry, task: TaskInfo, phase: str, rig: str,
-    host: str | None = None, port: int | None = None,
+    policy: str | None = None, host: str | None = None, port: int | None = None,
 ) -> None:
     """Launch a run, surfacing a refused launch (e.g. one is still saving) inline."""
     try:
-        registry.launch(task, phase, rig, host=host, port=port)
+        registry.launch(task, phase, rig, policy=policy, host=host, port=port)
     except RuntimeError as exc:
         st.error(str(exc), icon="⚠️")
         return
@@ -472,6 +540,8 @@ def _render_status(registry: _runner.RunRegistry) -> None:
     st.subheader("Status")
     st.caption("Arms")
     _arm_status_rows()
+    st.caption("Teleop leaders")
+    _leader_status_rows()
     st.caption("Cameras")
     _camera_status_rows()
     st.divider()
@@ -503,29 +573,42 @@ def _render_status(registry: _runner.RunRegistry) -> None:
         st.rerun()
 
 
-def _render_logs_tab() -> None:
-    """Browse the flexiv control system's per-run logs (Hydra ``outputs/*/system.log``).
+def _render_logs_tab(registry: _runner.RunRegistry) -> None:
+    """Browse the flexiv control system's logs: the live session daemon and past runs.
 
-    Lists every run's log newest-first, tails the selected one (bounded read), and
-    — while *Follow* is on — auto-refreshes so a live run streams in. The picker and
-    controls are rendered here; only :func:`_log_tail_view` reruns on the follow tick.
+    Dashboard-launched runs all share one log for the daemon's lifetime (it never
+    runs a fresh Hydra job — see :func:`~.logs.live_daemon_log`); that entry is
+    listed first (and selected by default) since it is the one still growing. Past
+    runs launched straight from the CLI each wrote their own ``system.log`` under
+    Hydra's ``outputs/<timestamp>/`` and are listed newest-first after it. Follow
+    tails the selected one live; the picker and controls are rendered here, only
+    :func:`_log_tail_view` reruns on the follow tick.
     """
-    files = _logs.discover_logs()
+    live = _logs.live_daemon_log(registry.session_view().log_path)
+    # The live daemon's session.log now lives under the outputs root, so
+    # discover_logs() also finds it — drop that copy so it appears once (as 🔴).
+    past = [f for f in _logs.discover_logs() if live is None or f.path != live.path]
+    files = ([live] if live is not None else []) + past
     top = st.columns([3, 1])
     if top[1].button("🔄 Refresh", use_container_width=True,
-                     help="Re-scan the outputs directory for run logs."):
+                     help="Re-scan for the live daemon log and past run logs."):
         st.rerun()
     if not files:
         st.info(
-            f"No run logs found under `{_logs.outputs_root()}`. Launch a run "
-            "(or run `dual-flexiv-control` from the CLI) and they'll appear here."
+            f"No logs yet. Launch a run from the dashboard, or run "
+            f"`dual-flexiv-control` from the CLI (writes under `{_logs.outputs_root()}`)."
         )
         return
 
-    by_name = {f"{f.name}  ·  {_logs.human_size(f.size_bytes)}": f for f in files}
+    def _label(f: _logs.LogFile) -> str:
+        prefix = "🔴 " if f is live else ""
+        return f"{prefix}{f.name}  ·  {_logs.human_size(f.size_bytes)}"
+
+    by_name = {_label(f): f for f in files}
     label = top[0].selectbox(
         "Run log", list(by_name), key="log_sel",
-        help="One log per dual-flexiv-control run (Hydra outputs/<timestamp>/system.log).",
+        help="🔴 = the live session daemon log (all dashboard runs); others are "
+             "past dual-flexiv-control CLI runs (Hydra outputs/<timestamp>/system.log).",
     )
     selected = by_name[label]
     st.caption(f"`{selected.path}`")
@@ -594,31 +677,128 @@ def _camera_feed(by_key: dict[str, CameraView]) -> None:
 
 @st.fragment(run_every="0.5s")
 def _depth_overlay_feed(camera: str) -> None:
-    """While the depth checkbox is on, push the latest RGB-D cloud into the robot scene.
+    """Push the latest RGB-D cloud into the robot scene, whenever one is live.
 
     Reads the camera's ``left`` + ``depth`` shm streams, back-projects to a
     coloured point cloud (:func:`~.cameras.depth_point_cloud`), poses it with
     the camera extrinsics from ``conf/camera`` (:func:`~.robot_view.camera_world_pose`),
-    and logs it into the robot recording. On checkbox off, clears the cloud once.
+    and logs it into the robot recording. There is no on/off control here —
+    show/hide the cloud via the entity's visibility in the Rerun sidebar.
     """
-    enabled = bool(st.session_state.get("robot_depth", False))
-    was_on = bool(st.session_state.get("_robot_depth_was_on", False))
-    st.session_state["_robot_depth_was_on"] = enabled
-    if not enabled:
-        if was_on:
-            _robot.clear_depth_points()
-        return
     cloud = _cameras.depth_point_cloud(camera)
     if cloud is None:
-        st.caption(
-            f"⚪ no live RGB-D from `{camera}` — needs the system running with "
-            "`depth` in that camera's views."
-        )
         return
     pts_cam, colors = cloud
     rot, t = _robot.camera_world_pose(_cameras.camera_cfg(camera))
     _robot.log_depth_points(pts_cam @ rot.T + t, colors)
-    st.caption(f"🟢 depth overlay: {len(pts_cam):,} points from `{camera}`")
+
+
+def _render_skill_bar(registry: _runner.RunRegistry) -> None:
+    """Teach-and-repeat bar: pick a taught skill and ▶ Repeat it on the live arms.
+
+    Repeat launches a ``skill`` run through the session daemon — the same
+    lifecycle as Collection/Eval (arms get the skill coefficients, the skill
+    consumer streams the trajectory, Stop lives in the status panel), so all the
+    usual guardrails apply. A skill run needs no cameras, so the only gate is an
+    idle (viewing) session. Skills are taught from the **Storage** tab: each
+    episode row has a 🎓 Teach button beside ▶ replay.
+    """
+    view = registry.session_view()
+    infos = _skills.discover()
+    if not infos:
+        st.caption(
+            "🎓 Teach & repeat: no skills yet — hit **🎓 Teach** on any episode "
+            "row in the **Storage** tab; it becomes repeatable here."
+        )
+        return
+    by_name = {s.name: s for s in infos}
+    # A completed rename re-selects the new name; the widget's state can only be
+    # written BEFORE the selectbox is instantiated, so it is staged on rerun.
+    staged = st.session_state.pop("_skill_sel_next", None)
+    if staged in by_name:
+        st.session_state["skill_sel"] = staged
+    cols = st.columns([4, 1.2, 0.5, 0.5], vertical_alignment="center")
+    selected = cols[0].selectbox(
+        "Skill", list(by_name), key="skill_sel", label_visibility="collapsed",
+        help="Taught skills (files under the skills root, `skill.root`). Teach "
+             "new ones from a replayed episode in the Storage tab.",
+    )
+    info = by_name[selected]
+    launchable = view.state == "viewing"
+    if cols[1].button(
+        "▶ Repeat", type="primary", use_container_width=True, disabled=not launchable,
+        help="Retrace this skill on the live arm(s): move to its start pose, then "
+             "replay the taught joint trajectory. Stop from the status panel.",
+    ):
+        try:
+            registry.launch_skill(info.name, _arms.active_rig() or "")
+        except RuntimeError as exc:
+            st.error(str(exc), icon="⚠️")
+        else:
+            st.rerun()
+    if cols[2].button(
+        "✏️", key="skill_ren", use_container_width=True, help="Rename this skill."
+    ):
+        st.session_state["skill_rename_pending"] = info.name
+        st.session_state.pop("skill_delete_pending", None)
+    if cols[3].button(
+        "🗑️", key="skill_del", use_container_width=True, help="Delete this skill."
+    ):
+        st.session_state["skill_delete_pending"] = info.name
+        st.session_state.pop("skill_rename_pending", None)
+
+    src = info.source or {}
+    origin = ""
+    if src.get("repo_id") and src.get("episode_index") is not None:
+        origin = f" · from `{src['repo_id']}` #{src['episode_index']}"
+    st.caption(
+        f"🎓 `{info.name}` · {info.frames} frames · {info.duration_s:.1f}s @ "
+        f"{info.fps:g} fps · arms: {', '.join(info.sides)}{origin}"
+        + (f" · taught {info.created}" if info.created else "")
+    )
+
+    renaming = st.session_state.get("skill_rename_pending")
+    if renaming and renaming in by_name:
+        # Per-skill widget key: reopening the row for a different skill never
+        # inherits a previous rename's half-typed text.
+        rc = st.columns([1.2, 3, 1, 1], vertical_alignment="center")
+        rc[0].markdown(f"Rename `{renaming}` to:")
+        new_name = rc[1].text_input(
+            "New skill name", value=renaming, key=f"skill_rename_to::{renaming}",
+            label_visibility="collapsed",
+            help="New file stem (letters, digits, '.', '_', '-'). Refuses a name "
+                 "that already exists.",
+        )
+        if rc[2].button("✓ Rename", type="primary", use_container_width=True):
+            try:
+                _skills.rename(renaming, (new_name or "").strip())
+            except Exception as exc:  # noqa: BLE001 - report, don't crash the page
+                st.error(f"Rename failed: {exc}")
+            else:
+                st.session_state.pop("skill_rename_pending", None)
+                st.session_state["_skill_sel_next"] = (new_name or "").strip()
+                st.toast(f"Renamed `{renaming}` → `{(new_name or '').strip()}`.", icon="✏️")
+                st.rerun()
+        if rc[3].button("Cancel", use_container_width=True, key="skill_ren_cancel"):
+            st.session_state.pop("skill_rename_pending", None)
+            st.rerun()
+    elif renaming:  # the pending skill vanished (renamed/deleted elsewhere)
+        st.session_state.pop("skill_rename_pending", None)
+
+    pending = st.session_state.get("skill_delete_pending")
+    if pending and pending in by_name:
+        st.error(f"Delete skill `{pending}`? This cannot be undone.")
+        cc = st.columns([1, 1, 3])
+        if cc[0].button("✓ Confirm delete", type="primary", use_container_width=True):
+            _skills.delete(pending)
+            st.session_state.pop("skill_delete_pending", None)
+            st.toast(f"Deleted skill `{pending}`.", icon="🗑️")
+            st.rerun()
+        if cc[1].button("Cancel", use_container_width=True):
+            st.session_state.pop("skill_delete_pending", None)
+            st.rerun()
+    elif pending:  # the pending skill vanished (deleted elsewhere) — drop the gate
+        st.session_state.pop("skill_delete_pending", None)
 
 
 @st.fragment(run_every="2s")
@@ -692,6 +872,195 @@ def _render_delete_dataset_button(ds) -> None:
     ):
         st.session_state["stor_pending"] = {"repo_id": ds.repo_id, "whole": True}
         st.rerun()
+
+
+def _calib_offsets(side: str) -> list[float]:
+    """The in-progress offsets for ``side``, seeded from config on first use."""
+    key = f"calib_offsets::{side}"
+    if key not in st.session_state:
+        st.session_state[key] = _calibration.initial_offsets(side)
+    return st.session_state[key]
+
+
+def _calib_flips(side: str) -> set[int]:
+    """The in-progress sign-flip joint set for ``side``, seeded from config on first use."""
+    key = f"calib_flips::{side}"
+    if key not in st.session_state:
+        st.session_state[key] = set(_calibration.current_convention(side).sign_flip_joints)
+    return st.session_state[key]
+
+
+def _calib_gripper(side: str):
+    """(open, closed) raw gripper endpoints for ``side``, seeded from config; None until set."""
+    conv = _calibration.current_convention(side)
+    ok, ck = f"calib_grip_open::{side}", f"calib_grip_closed::{side}"
+    if ok not in st.session_state:
+        st.session_state[ok] = conv.gripper_open
+    if ck not in st.session_state:
+        st.session_state[ck] = conv.gripper_closed
+    return st.session_state[ok], st.session_state[ck]
+
+
+@st.fragment(run_every="0.3s")
+def _calibration_view_feed(side: str) -> None:
+    """Pose the live view at the leader's commanded config (in-progress convention).
+
+    Only this fragment reruns on its cadence — it reads the leader and logs one arm
+    frame into the calibration recording (using the working offsets **and** sign
+    flips, so a flip visibly mirrors that link); the embedded viewer picks it up over
+    gRPC. On a read failure it says so rather than fabricating motion.
+    """
+    offsets = st.session_state.get(f"calib_offsets::{side}")
+    if offsets is None:
+        return
+    flips = sorted(st.session_state.get(f"calib_flips::{side}", set()))
+    try:
+        _calibration.render(side, offsets, flips)
+        st.caption(f"🟢 live: `{side}` leader → follower (solid) vs straight/home (ghost)")
+    except Exception as exc:  # noqa: BLE001 - leader down -> report, hold the last pose
+        st.caption(f"⚪ no live `{side}` leader — {exc}")
+
+
+def _render_calibration_tab() -> None:
+    """Measure a leader's joint convention **one joint at a time**, with a live view.
+
+    Per joint: straighten the link and **📸 Capture** to solve its ``offsets_deg``
+    (``offset = wrap(-degrees(leader_joint))``), and **↔ Flip** to toggle its sign in
+    ``sign_flip_joints`` — the 3D view mirrors the link live so you can confirm the
+    direction. The view poses a Flexiv arm at the config the current leader maps to
+    under the working convention (solid) against the straight/home target (ghost), so
+    each link visibly snaps into alignment as it is calibrated. **💾 Sync to file**
+    writes the result into the rig YAML; hit **Reset services** to apply it.
+    """
+    sides = _calibration.configured_leader_sides()
+    if not sides:
+        st.info("No FACTR leader is configured for the active rig — nothing to calibrate.")
+        return
+    if _arms.runtime_is_sim():
+        st.warning(
+            "`runtime.sim` is on — leader positions are a synthetic sinusoid, so "
+            "captured offsets are meaningless (the view still animates so you can "
+            "confirm the plumbing). Calibrate against real hardware.",
+            icon="⚠️",
+        )
+
+    side = sides[0] if len(sides) == 1 else st.selectbox(
+        "Leader to calibrate", sides, format_func=str.capitalize, key="calib_side"
+    )
+    offsets = _calib_offsets(side)
+    flips = _calib_flips(side)
+    grip_open, grip_closed = _calib_gripper(side)
+    done = st.session_state.setdefault(f"calib_done::{side}", {})  # joint -> captured_deg
+
+    left, right = st.columns([2, 3], gap="large")
+    with left:
+        st.caption(
+            f"Straighten one link at a time: **Capture** its offset, **Flip** its sign "
+            f"if the view mirrors the wrong way. **{len(done)}/{len(offsets)}** joints captured."
+        )
+        for j in range(len(offsets)):
+            c0, c1, c2 = st.columns([3, 1, 1])
+            captured = j in done
+            mark = "✅" if captured else "⬜"
+            flipped = j in flips
+            c0.markdown(
+                f"{mark} **J{j}** · offset `{offsets[j]:+.2f}°`"
+                + (" · ↔" if flipped else "")
+                + (f" · straight@`{done[j]:+.2f}°`" if captured else "")
+            )
+            if c1.button("📸", key=f"calib_cap::{side}::{j}", help=f"Capture J{j} offset",
+                         use_container_width=True):
+                try:
+                    cap = _calibration.capture_joint(side, j)
+                    offsets[j] = cap.offset_deg
+                    done[j] = cap.captured_deg
+                    st.rerun()
+                except Exception as exc:  # noqa: BLE001 - surface, don't crash the page
+                    st.error(f"Could not read the {side} leader: {exc}", icon="🛑")
+            if c2.button("↔", key=f"calib_flip::{side}::{j}",
+                         type="primary" if flipped else "secondary",
+                         help=f"Toggle sign flip for J{j}", use_container_width=True):
+                flips.discard(j) if flipped else flips.add(j)
+                st.rerun()
+
+        st.divider()
+        st.markdown("**Gripper** — record the raw trigger reading at each extreme:")
+        g0, g1 = st.columns(2)
+        if g0.button("📗 Record open", key=f"calib_gopen::{side}", use_container_width=True,
+                     help="Capture the raw gripper value at the FULLY OPEN trigger (maps to 0.0)."):
+            try:
+                st.session_state[f"calib_grip_open::{side}"] = _calibration.read_gripper(side)
+                st.rerun()
+            except Exception as exc:  # noqa: BLE001 - surface, don't crash the page
+                st.error(f"Could not read the {side} gripper: {exc}", icon="🛑")
+        if g1.button("📕 Record closed", key=f"calib_gclosed::{side}", use_container_width=True,
+                     help="Capture the raw gripper value at the FULLY CLOSED trigger (maps to 1.0)."):
+            try:
+                st.session_state[f"calib_grip_closed::{side}"] = _calibration.read_gripper(side)
+                st.rerun()
+            except Exception as exc:  # noqa: BLE001 - surface, don't crash the page
+                st.error(f"Could not read the {side} gripper: {exc}", icon="🛑")
+        o_txt = f"`{grip_open:+.4f}`" if grip_open is not None else "—"
+        c_txt = f"`{grip_closed:+.4f}`" if grip_closed is not None else "—"
+        st.caption(f"open {o_txt} · closed {c_txt} rad (raw servo)")
+        preview = _calibration.gripper_preview(grip_open, grip_closed)
+        if preview:
+            st.caption("normalizes: " + " · ".join(f"{lab}→{frac:.2f}" for lab, _raw, frac in preview))
+        elif grip_open is not None and grip_closed is not None:
+            st.caption("⚠️ open and closed are equal — move the trigger between captures.")
+
+        st.divider()
+        if st.button("↺ Reset to config", key=f"calib_reset::{side}"):
+            conv = _calibration.current_convention(side)
+            st.session_state[f"calib_offsets::{side}"] = _calibration.initial_offsets(side)
+            st.session_state[f"calib_flips::{side}"] = set(conv.sign_flip_joints)
+            st.session_state[f"calib_grip_open::{side}"] = conv.gripper_open
+            st.session_state[f"calib_grip_closed::{side}"] = conv.gripper_closed
+            st.session_state[f"calib_done::{side}"] = {}
+            st.rerun()
+
+        flips_sorted = sorted(flips)
+        if st.button("💾 Sync to rig file", key=f"calib_sync::{side}", type="primary",
+                     use_container_width=True,
+                     help="Write arms.<side>.convention into the rig YAML, then Reset services."):
+            try:
+                path = _calibration.apply_to_rig(
+                    side, offsets, flips_sorted,
+                    gripper_open=grip_open, gripper_closed=grip_closed,
+                )
+                st.success(f"Wrote `arms.{side}.convention` to `{path}` — hit **Reset services** to apply.")
+            except Exception as exc:  # noqa: BLE001 - surface the write failure, don't crash
+                st.error(f"Sync failed: {exc}", icon="🛑")
+        with st.expander("Preview / copy the config"):
+            st.code(_calibration.format_yaml(side, offsets, flips_sorted, grip_open, grip_closed),
+                    language="yaml")
+            st.caption("…or as a Hydra CLI override:")
+            st.code(_calibration.format_overrides(side, offsets, flips_sorted, grip_open, grip_closed),
+                    language="bash")
+
+    with right:
+        # OFF by default: st.tabs renders every tab body on each rerun and run_every
+        # fragments fire on their own timer, so an always-on feed would poll the FACTR
+        # leader (~3 Hz) and bind the viewer's gRPC port even when nobody is on this
+        # tab — contending with a live collection/eval run. Gate it behind opt-in so
+        # the leader is touched only while actively calibrating.
+        live = st.checkbox(
+            "🔴 Live 3D view",
+            value=False,
+            key=f"calib_live::{side}",
+            help="Pose a Flexiv arm at the leader's commanded config, refreshing ~3 Hz. "
+            "Off by default so it doesn't poll the leader while you're not calibrating.",
+        )
+        if live:
+            viewer = _calibration_viewer()
+            st.iframe(_browser_url(viewer.web_url), height=VIEWER_HEIGHT_PX)
+            _calibration_view_feed(side)
+        else:
+            st.info(
+                "Enable **Live 3D view** to pose the arm at the leader's commanded "
+                "config and watch each link snap onto the straight/home ghost as you "
+                "calibrate. Capture/Flip/Sync work without it."
+            )
 
 
 def _render_storage_tab(registry: _runner.RunRegistry) -> None:
@@ -779,14 +1148,17 @@ def _render_storage_tab(registry: _runner.RunRegistry) -> None:
     st.divider()
 
     # -- per-episode rows: checkbox · info · replay · delete ------------------
-    header = st.columns([0.6, 5, 0.8, 0.8])
+    header = st.columns([0.6, 5, 0.8, 0.8, 0.8])
     header[0].caption("Sel")
     header[1].caption("Episode")
     header[2].caption("Replay")
-    header[3].caption("Delete")
-    with st.container(height=420):
+    header[3].caption("Teach")
+    header[4].caption("Delete")
+    # key -> a stable `st-key-stor_rows` class, the hook _PAGE_CSS uses to
+    # enlarge these rows' icon buttons without touching buttons elsewhere.
+    with st.container(height=420, key="stor_rows"):
         for e in episodes:
-            row = st.columns([0.6, 5, 0.8, 0.8])
+            row = st.columns([0.6, 5, 0.8, 0.8, 0.8])
             row[0].checkbox(
                 "select",
                 key=_sel_key(ds.repo_id, e.index),
@@ -802,7 +1174,11 @@ def _render_storage_tab(registry: _runner.RunRegistry) -> None:
                              help="Replay this episode (3D arms + cameras + plots)."):
                 st.session_state["replay_target"] = (ds.repo_id, e.index)
                 st.rerun()
-            if row[3].button("🗑️", key=f"stor_del::{ds.repo_id}::{e.index}", disabled=locked):
+            if row[3].button("🎓", key=f"stor_teach::{ds.repo_id}::{e.index}",
+                             help="Teach: save this episode's measured trajectory as "
+                                  "a skill — repeat it from the Viewer tab's ▶ Repeat."):
+                _teach_episode(ds, e.index)
+            if row[4].button("🗑️", key=f"stor_del::{ds.repo_id}::{e.index}", disabled=locked):
                 st.session_state["stor_pending"] = {
                     "repo_id": ds.repo_id, "indices": [e.index]
                 }
@@ -850,6 +1226,30 @@ def _render_replay_panel(ds) -> None:
         "press play (▶) or scrub the timeline in the viewer."
     )
     st.iframe(_browser_url(viewer.web_url), height=VIEWER_HEIGHT_PX)
+
+
+def _teach_episode(ds, index: int) -> None:
+    """🎓 Teach: save one episode's measured trajectory as a skill, one click.
+
+    Named ``<dataset>-ep<index>`` (re-teaching the same episode overwrites its
+    own skill); the skill lands under the skills root (``skill.root``) and shows
+    up in the Viewer tab's teach-and-repeat bar, where ▶ Repeat retraces it on
+    the live arms. Reads only the episode's proprio columns (no video decode),
+    so this is quick even for long episodes.
+    """
+    name = _skills.default_name(ds.repo_id, index)
+    with st.spinner(f"Teaching `{name}` from episode #{index}…"):
+        try:
+            info = _skills.teach_from_episode(ds, index, name)
+        except Exception as exc:  # noqa: BLE001 - report, don't crash the page
+            st.error(f"Teach failed: {exc}")
+            return
+    st.toast(
+        f"Taught skill `{info.name}` — {info.frames} frames · "
+        f"{info.duration_s:.1f}s · {', '.join(info.sides)}. "
+        "Repeat it from the Viewer tab.",
+        icon="🎓",
+    )
 
 
 def _resolve_rig(rigs: list[RigInfo]) -> RigInfo | None:
@@ -922,36 +1322,39 @@ def main() -> None:
     with controls:
         _render_controls(tasks, rig, registry)
     with panel:
-        tab_metrics, tab_camera, tab_storage, tab_logs = st.tabs(
-            ["📊 Metrics", "📷 Camera", "💾 Storage", "📜 Logs"]
+        tab_viewer, tab_camera, tab_calib, tab_storage, tab_logs = st.tabs(
+            [
+                ":material/monitoring: Viewer",
+                ":material/videocam: Camera",
+                ":material/adjust: Calibrate",
+                ":material/database: Storage",
+                ":material/terminal: Logs",
+            ]
         )
-        with tab_metrics:
-            # The robot 3D scene now shares this viewer's left panel (it replaced the
-            # old EEF trace), so its controls + status live alongside the metrics.
-            st.caption(
-                "Rizon 4s on the Vention pedestal beside the live run metrics — "
-                "**solid** arms = measured joint state, **translucent ghost** = "
-                "commanded teleop, **red** = no live joint data."
-            )
-            _robot_data_status()
+        with tab_viewer:
+            st.iframe(_browser_url(servers.web_url), height=VIEWER_HEIGHT_PX)
+            # The robot 3D scene shares this viewer's left panel (it replaced the
+            # old EEF trace); its controls + status sit below so the viewer leads.
+            _render_skill_bar(registry)
             depth_cams = _cameras.depth_cameras()
             for name in depth_cams:
                 # Cheap static re-log each rerun: keeps the frustum in sync with
                 # conf/camera pose edits after a "Reset services".
                 _robot.log_camera_frustum(name, _cameras.camera_cfg(name))
             if depth_cams:
-                st.checkbox(
-                    f"Depth overlay (`{depth_cams[0]}`)",
-                    key="robot_depth",
-                    help=(
-                        "Project the camera's RGB-D as coloured points into the 3D "
-                        "scene, posed via pose_frame/pose_xyz/pose_rpy in conf/camera."
-                    ),
-                )
+                # Streams whenever live RGB-D exists; show/hide the cloud from the
+                # Rerun sidebar (entity visibility) rather than a dashboard control.
                 _depth_overlay_feed(depth_cams[0])
-            st.iframe(_browser_url(servers.web_url), height=VIEWER_HEIGHT_PX)
+            st.caption(
+                "Rizon 4s on the Vention pedestal beside the live run metrics — "
+                "**solid** arms = measured joint state, **translucent ghost** = "
+                "commanded teleop, **red** = no live joint data."
+            )
+            _robot_data_status()
         with tab_camera:
             _render_camera_tab(cameras)
+        with tab_calib:
+            _render_calibration_tab()
         with tab_storage:
             st.caption(
                 "Recorded LeRobot episodes — select with checkboxes, delete "
@@ -960,10 +1363,11 @@ def main() -> None:
             _render_storage_tab(registry)
         with tab_logs:
             st.caption(
-                "Per-run flexiv control logs (Hydra `outputs/<timestamp>/system.log`) "
-                "— pick a run, follow the tail live, or read a past run's output."
+                "The live session daemon log (all dashboard runs) plus any past "
+                "`dual-flexiv-control` CLI runs — pick one, follow the tail live, "
+                "or read a past run's output."
             )
-            _render_logs_tab()
+            _render_logs_tab(registry)
 
 
 main()

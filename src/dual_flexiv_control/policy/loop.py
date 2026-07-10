@@ -21,11 +21,19 @@ A rollout has no operator, so it is bounded by :attr:`EvalCfg.num_timesteps`
 failures *hold* (no setpoint posted, timestep not counted) — the arms' deadman
 then parks them at the last target, exactly as during a teleop dropout.
 
-For visualization, the node also publishes ``eval/<side>/q_horizon`` — each
-controlled arm's joint target at the END of the policy's returned chunk,
-refreshed once per inference. The dashboard's metrics viewer reads it (read-only
-shared memory, like ``<side>/q``) to pose a purple horizon-target ghost and
-trace current-EEF → horizon-EEF in the 3D robot scene.
+For visualization, the node also publishes each arm's *estimated chunk-end
+state* — where the policy's returned chunk is predicted to land the arm —
+refreshed once per inference (see
+:func:`~dual_flexiv_control.control.estimate_chunk_end` for the per-kind
+estimate). Joint kinds (``qpos``/``qvel``) yield a joint config on
+``eval/<side>/q_horizon``; cartesian kinds (``end_effector``/``eef_vel``) yield
+a base-frame TCP position on ``eval/<side>/eef_horizon``; ``force`` predicts no
+motion. The dashboard's metrics viewer reads these (read-only shared memory,
+like ``<side>/q``) to pose a purple horizon-target ghost (joint kinds) and
+trace current-EEF → predicted-EEF in the 3D robot scene. Visualization does not
+require actuation: with no control-enabled arm the rollout is a *dry run* — the
+policy is still queried over the full action space and its predictions are
+published, but no setpoints are posted.
 """
 
 from __future__ import annotations
@@ -44,6 +52,9 @@ from ..configs import RuntimeCfg
 from ..configs import TaskCfg
 from ..control import action_hold_fields
 from ..control import control_specs
+from ..control import estimate_chunk_end
+from ..control import horizon_kind
+from ..control import horizon_signals
 from ..control import pack_action
 from ..process import ProcessNode
 from ..process import RateLimiter
@@ -76,6 +87,25 @@ def horizon_stream_name(side: str) -> str:
     return f"eval/{side}/q_horizon"
 
 
+def eef_horizon_stream_name(side: str) -> str:
+    """Stream carrying ``side``'s estimated base-frame TCP position ``[x y z]`` at
+    the end of the policy horizon (cartesian control kinds, which have no joint
+    target to pose a ghost from)."""
+    return f"eval/{side}/eef_horizon"
+
+
+def comm_stream_name() -> str:
+    """Stream of policy-server comm events: ``[kind, seq, elapsed_s]`` per event.
+
+    ``kind`` is a :mod:`~.client` comm constant (``COMM_SENT`` / ``COMM_RECV`` /
+    ``COMM_ERROR``), ``seq`` the 1-based inference request it belongs to, and
+    ``elapsed_s`` the round-trip (or time-to-failure) — 0 on the SENT event. The
+    ring's own per-sample timestamps carry *when* each packet left / arrived;
+    the dashboard mirror reads them to plot send/receive activity live.
+    """
+    return "eval/policy_comm"
+
+
 class EvalLoop:
     """Drives one attached Brain through a fixed-horizon policy rollout."""
 
@@ -90,6 +120,7 @@ class EvalLoop:
         num_timesteps: int = 1,
         replan_steps: int = 0,
         on_chunk=None,
+        horizon_arms: dict[str, ArmCfg] | None = None,
     ) -> None:
         self.brain = brain
         self.observer = observer
@@ -99,10 +130,13 @@ class EvalLoop:
         self.frequency_hz = frequency_hz
         self.num_timesteps = max(1, int(num_timesteps))
         self.replan_steps = int(replan_steps)
-        #: callable ``{side: q_d at the END of the returned chunk} -> None``, invoked
-        #: once per inference with the policy's horizon-end joint targets (viz hook —
-        #: EvalNode publishes them on ``eval/<side>/q_horizon``). Never fatal.
+        #: callable ``{side: ("q"|"eef", vector)} -> None``, invoked once per
+        #: inference with each arm's estimated chunk-end state (viz hook — EvalNode
+        #: publishes them on ``eval/<side>/{q,eef}_horizon``). Never fatal.
         self._on_chunk = on_chunk
+        #: arms the horizon estimate covers (viz): every layout side, not just the
+        #: driven ones — a dry run still predicts. Defaults to ``control_arms``.
+        self.horizon_arms = horizon_arms if horizon_arms is not None else control_arms
         self.timesteps_done = 0
         self.inferences = 0
         self._pending: deque[np.ndarray] = deque()
@@ -153,7 +187,7 @@ class EvalLoop:
                 return False
             self.inferences += 1
             chunk = self._validate_chunk(chunk)
-            self._announce_horizon(chunk)
+            self._announce_horizon(chunk, snapshot)
             # Receding horizon: execute only the chunk prefix before re-inferring
             # (0 = the whole chunk, open-loop within it).
             self._pending.extend(chunk[: self.replan_steps] if self.replan_steps > 0 else chunk)
@@ -177,19 +211,38 @@ class EvalLoop:
             )
         return arr
 
-    def _announce_horizon(self, chunk: np.ndarray) -> None:
-        """Hand the horizon-END joint targets (the FULL chunk's last action — the
-        policy's intent, even when ``replan_steps`` re-infers earlier) to the viz
-        hook. Only sides whose action space is joint-position (``q_d``) yield a joint
-        horizon target; other kinds (velocity/cartesian) have none, so they're
-        skipped. Purely observational: a failure must never disturb the rollout."""
+    def _announce_horizon(self, chunk: np.ndarray, snapshot: dict) -> None:
+        """Hand each arm's estimated chunk-END state to the viz hook.
+
+        The estimate covers the FULL chunk (the policy's intent, even when
+        ``replan_steps`` re-infers earlier), per that side's control kind (see
+        :func:`~dual_flexiv_control.control.estimate_chunk_end`): joint kinds yield
+        ``("q", joint config)``, cartesian kinds ``("eef", TCP position)``; velocity
+        kinds integrate from the measured baseline in ``snapshot`` (side skipped if
+        that stream is dry), ``force`` predicts nothing. Purely observational: a
+        failure must never disturb the rollout."""
         if self._on_chunk is None:
             return
         try:
-            targets = self.layout.split(chunk[-1])
-            q_targets = {side: t["q_d"] for side, t in targets.items() if "q_d" in t}
-            if q_targets:
-                self._on_chunk(q_targets)
+            dt = 1.0 / self.frequency_hz
+            targets: dict[str, tuple[str, np.ndarray]] = {}
+            for side in self.layout.sides:
+                arm = self.horizon_arms.get(side)
+                if arm is None:
+                    continue
+                measured = {}
+                for sig in horizon_signals(arm.control):
+                    samples = snapshot.get(f"{side}/{sig}")
+                    newest = samples.newest if samples is not None else None
+                    if newest is not None:
+                        measured[sig] = np.asarray(newest, dtype=np.float64)
+                est = estimate_chunk_end(
+                    arm.control, chunk[:, self.layout.primary_slice(side)], dt, measured
+                )
+                if est is not None:
+                    targets[side] = est
+            if targets:
+                self._on_chunk(targets)
         except Exception:  # noqa: BLE001 - viz hook only
             log.exception("horizon viz hook failed (rollout unaffected)")
 
@@ -257,27 +310,40 @@ class EvalNode(ProcessNode):
 
     def run(self, stop_event) -> None:
         control_sides = [s for s, arm in self.arms.items() if arm.control_enabled]
+        # The action layout (what the policy emits) is decoupled from actuation:
+        # with no control-enabled arm the rollout is a dry run over ALL arms —
+        # the policy is queried and its horizon predictions visualized, but no
+        # setpoint is posted.
+        action_sides = control_sides or list(self.arms)
         if not control_sides:
             log.warning(
-                "eval: no arm has control_enabled=true — the policy will be queried "
-                "but its actions will not drive any arm. Enable control, e.g. "
-                "arms.left.control_enabled=true."
+                "eval: no arm has control_enabled=true — dry run: the policy is "
+                "queried over all arms' action space (%s) and its predictions are "
+                "visualized, but no arm is driven. Enable control, e.g. "
+                "arms.left.control_enabled=true.",
+                sorted(self.arms),
             )
         observer = ObservationBuilder(
             self.arms, self.cameras,
             self.task.language_instruction, self.task.state_signals,
         )
-        layout = ActionLayout(self.arms, control_sides)
+        layout = ActionLayout(self.arms, action_sides)
+        horizon_arms = {side: self.arms[side] for side in layout.sides}
 
         # Some control kinds hold an absolute field at the measured value (force ->
         # pose_d from the arm's eef). Subscribe those proprio streams too, so the
         # loop can latch them; the observation vector itself is unchanged (the
-        # observer only reads its own state_signals).
+        # observer only reads its own state_signals). Likewise the measured
+        # baselines the horizon estimate integrates velocity kinds from (viz).
         hold_streams = [
             name for side in control_sides
             for name in hold_stream_names(side, self.arms[side].control)
         ]
-        subscribe = list(dict.fromkeys([*observer.stream_names, *hold_streams]))
+        viz_streams = [
+            f"{side}/{sig}" for side in layout.sides
+            for sig in horizon_signals(self.arms[side].control)
+        ]
+        subscribe = list(dict.fromkeys([*observer.stream_names, *hold_streams, *viz_streams]))
 
         registry = StreamRegistry(self.runtime.runtime_dir, self.run_id)
         brain = Brain(registry, subscribe, self.brain_cfg.attach_timeout_s)
@@ -297,14 +363,21 @@ class EvalNode(ProcessNode):
         brain.open_control(control_registry, specs_by_side)
         control_arms = {side: self.arms[side] for side in control_sides}
 
-        # Horizon-target streams (viz): one per controlled arm, refreshed once per
-        # inference with the chunk-end joint target. Owned by this node (created +
-        # unlinked here), read by the dashboard's 3D robot scene.
-        horizon_writers = {
-            side: StreamWriter.create(
+        # Horizon-target streams (viz): one per layout arm, refreshed once per
+        # inference with the estimated chunk-end state — a joint config
+        # (``q_horizon``, joint kinds) or a base-frame TCP position
+        # (``eef_horizon``, cartesian kinds); ``force`` predicts nothing. Owned by
+        # this node (created + unlinked here), read by the dashboard's 3D scene.
+        horizon_writers: dict[str, tuple[str, StreamWriter, str]] = {}
+        for side in layout.sides:
+            hk = horizon_kind(self.arms[side].control)
+            if hk is None:
+                continue
+            name = horizon_stream_name(side) if hk == "q" else eef_horizon_stream_name(side)
+            writer = StreamWriter.create(
                 StreamSpec(
-                    name=horizon_stream_name(side),
-                    dim=int(self.arms[side].dof),
+                    name=name,
+                    dim=int(self.arms[side].dof) if hk == "q" else 3,
                     capacity=64,
                     dtype="float64",
                     rate_hz=self.task.eval.frequency_hz,
@@ -312,39 +385,64 @@ class EvalNode(ProcessNode):
                 self.run_id,
                 registry,
             )
-            for side in control_sides
-        }
+            horizon_writers[side] = (hk, writer, name)
 
-        def publish_horizon(targets: dict[str, np.ndarray]) -> None:
-            for side, q_d in targets.items():
-                writer = horizon_writers.get(side)
-                if writer is not None:
-                    writer.write(np.ascontiguousarray(q_d, dtype=np.float64))
+        def publish_horizon(targets: dict[str, tuple[str, np.ndarray]]) -> None:
+            for side, (hk, vec) in targets.items():
+                entry = horizon_writers.get(side)
+                if entry is not None and entry[0] == hk:
+                    entry[1].write(np.ascontiguousarray(vec, dtype=np.float64))
+
+        # Policy-server comm events (viz): one sample per packet sent / received /
+        # failed, written by RemotePolicy's on_comm hook. Owned by this node like
+        # the horizon streams; the dashboard mirror plots them below the robot
+        # metrics. Capacity is generous — events come at most a few per second.
+        comm_writer = StreamWriter.create(
+            StreamSpec(
+                name=comm_stream_name(), dim=3, capacity=512, dtype="float64",
+                rate_hz=self.task.eval.frequency_hz,
+            ),
+            self.run_id,
+            registry,
+        )
+
+        def publish_comm(kind: float, seq: int, elapsed_s: float) -> None:
+            comm_writer.write(np.array([kind, float(seq), elapsed_s], dtype=np.float64))
 
         policy = None
         try:
             # May block up to policy.connect_timeout_s waiting for the server;
             # raises PolicyUnavailable (bringing the system down with a clear
             # message) if it never appears.
-            policy = build_policy(self.policy_cfg, layout, observer, stop_event=stop_event)
+            policy = build_policy(
+                self.policy_cfg, layout, observer, stop_event=stop_event,
+                on_comm=publish_comm,
+            )
             loop = EvalLoop(
                 brain, observer, policy, layout, control_arms,
                 frequency_hz=self.task.eval.frequency_hz,
                 num_timesteps=self.task.eval.num_timesteps,
                 replan_steps=self.policy_cfg.replan_steps,
                 on_chunk=publish_horizon if horizon_writers else None,
+                horizon_arms=horizon_arms,
             )
             loop.run(stop_event)
         finally:
             if policy is not None:
                 policy.close()
-            for side, writer in horizon_writers.items():
+            try:
+                comm_writer.close()
+                comm_writer.unlink()
+            except Exception:  # noqa: BLE001 - teardown must not raise
+                log.exception("error releasing the policy comm stream")
+            registry.remove(comm_stream_name())
+            for side, (_hk, writer, name) in horizon_writers.items():
                 try:
                     writer.close()
                     writer.unlink()
                 except Exception:  # noqa: BLE001 - teardown must not raise
                     log.exception("error releasing horizon stream for %s", side)
-                registry.remove(horizon_stream_name(side))
+                registry.remove(name)
             # Hand control back cleanly: STOP the arms (they exit their control
             # session at once instead of riding the deadman), then unlink channels.
             brain.stop_arms()

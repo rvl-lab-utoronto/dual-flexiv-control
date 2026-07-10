@@ -26,6 +26,7 @@ from .client import WebsocketTransport
 from .client import build_policy
 from .loop import EvalLoop
 from .loop import EvalNode
+from .loop import eef_horizon_stream_name
 from .loop import horizon_stream_name
 from .observation import ObservationBuilder
 from .schema import AcmeSchema
@@ -51,6 +52,7 @@ __all__ = [
     "WebsocketTransport",
     "build_policy",
     "build_schema",
+    "eef_horizon_stream_name",
     "horizon_stream_name",
     "register_schema",
 ]

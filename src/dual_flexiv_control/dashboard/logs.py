@@ -1,17 +1,27 @@
 """Discover and read the flexiv control system's log files.
 
-Backs the dashboard's **Logs** tab. Every ``dual-flexiv-control`` run — whether
-launched from the dashboard (Collection/Eval) or straight from the CLI — is a
-Hydra job that writes a ``system.log`` under its run dir (``hydra.run.dir``,
-``outputs/<timestamp>/`` by default; see ``conf/config.yaml``). This module:
+Backs the dashboard's **Logs** tab, which shows two kinds of log:
 
-* finds those log files under the outputs root, newest first, and
-* reads the tail of one (bounded, so a huge log never blows up the page).
+* A run launched straight from the CLI (``dual-flexiv-control``) goes through
+  ``@hydra.main`` and writes a ``system.log`` under its run dir
+  (``hydra.run.dir``, ``outputs/<timestamp>/`` by default; see
+  ``conf/config.yaml``). :func:`discover_logs` finds those, newest first.
+* A run launched from the dashboard goes through the persistent session daemon
+  (:mod:`~.session`), which composes each run via the Hydra *compose* API and
+  spawns only the consumer node — it never runs a fresh ``@hydra.main`` job, so
+  there is no per-run ``system.log``. Instead all of a daemon's dashboard-run
+  output accumulates in one ``session.log`` for the daemon's lifetime, written
+  under a ``session_<timestamp>/`` dir in the outputs root (see
+  :class:`~.session.SessionManager`) so :func:`discover_logs` lists it once the
+  daemon exits; :func:`live_daemon_log` additionally flags the currently-live
+  one so the tab can follow it while it grows.
 
-The outputs root is resolved against the dashboard's cwd (the same cwd the
-spawned system inherits — see :func:`~.runner._launch_collection`), so the logs
-the tab lists are exactly the ones the launched runs write. Override the root
-with ``DFC_OUTPUTS_DIR`` if Hydra's ``run.dir`` is customised.
+Either way, :func:`read_tail` reads the tail of the selected file (bounded, so
+a huge log never blows up the page).
+
+The outputs root is resolved against the dashboard's cwd, so
+:func:`discover_logs` lists exactly what a direct CLI launch writes there.
+Override the root with ``DFC_OUTPUTS_DIR`` if Hydra's ``run.dir`` is customised.
 """
 
 from __future__ import annotations
@@ -102,6 +112,24 @@ def read_tail(path: Path, max_bytes: int = _MAX_TAIL_BYTES) -> str:
         _, _, rest = text.partition("\n")
         text = f"… (showing last {max_bytes // 1024} KB of {size // 1024} KB)\n{rest}"
     return text
+
+
+def live_daemon_log(path: str | None) -> LogFile | None:
+    """Wrap the session daemon's own log file as a :class:`LogFile`, if live.
+
+    ``path`` is :attr:`~.session.SessionView.log_path` — the daemon most
+    recently spawned by this dashboard process, if any (even a dead one, for
+    post-mortem reading). ``None`` if no daemon has been spawned yet, or its
+    log file is gone.
+    """
+    if not path:
+        return None
+    p = Path(path)
+    try:
+        stat = p.stat()
+    except OSError:
+        return None
+    return LogFile(name="live session daemon", path=p, size_bytes=stat.st_size, mtime=stat.st_mtime)
 
 
 def human_size(n: int) -> str:

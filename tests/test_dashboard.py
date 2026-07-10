@@ -11,6 +11,7 @@ import importlib.util
 import pytest
 
 from dual_flexiv_control.dashboard.tasks import TaskInfo
+from dual_flexiv_control.dashboard.tasks import discover_policies
 from dual_flexiv_control.dashboard.tasks import discover_rigs
 from dual_flexiv_control.dashboard.tasks import discover_tasks
 
@@ -36,6 +37,13 @@ def test_discover_tasks_every_entry_has_an_instruction():
     assert all(t.language_instruction for t in discover_tasks())
 
 
+def test_discover_policies_finds_shipped_types():
+    # The eval launcher's policy-type dropdown: real entries only, no schema base.
+    policies = discover_policies()
+    assert {"acme", "openpi"} <= set(policies)
+    assert "base_policy" not in policies
+
+
 def test_discover_rigs_finds_shipped_rigs_with_descriptions():
     rigs = {r.name: r for r in discover_rigs()}
     assert {"bimanual", "bench", "left_only"} <= set(rigs)
@@ -46,7 +54,7 @@ def test_discover_rigs_finds_shipped_rigs_with_descriptions():
 
 
 @_needs_rerun
-@pytest.mark.parametrize("phase", ["eval", "collection"])
+@pytest.mark.parametrize("phase", ["eval", "collection", "skill"])
 def test_for_phase_builds_a_blueprint(phase):
     import rerun.blueprint as rrb
 
@@ -127,6 +135,54 @@ def test_layouts_embed_robot_scene_not_eef_trace(kind):
     origins = _view_origins(bp)
     assert "/robot" in origins
     assert not any(o == "/eef" or o.startswith("/eef/") for o in origins)
+
+
+def test_read_live_policy_comm_returns_buffered_events(tmp_path):
+    # The mirror's comm reader: all buffered [kind, seq, elapsed_s] events (with
+    # ring timestamps), None when no eval run publishes the stream.
+    import numpy as np
+
+    from dual_flexiv_control.dashboard.arms import POLICY_COMM_STREAM
+    from dual_flexiv_control.dashboard.arms import read_live_policy_comm
+    from dual_flexiv_control.streams import StreamRegistry
+    from dual_flexiv_control.streams.spec import StreamSpec
+    from dual_flexiv_control.streams.stream import StreamWriter
+
+    assert read_live_policy_comm(runtime_dir=str(tmp_path)) is None
+
+    registry = StreamRegistry(str(tmp_path), "runX")
+    writer = StreamWriter.create(
+        StreamSpec(name=POLICY_COMM_STREAM, dim=3, capacity=512,
+                   dtype="float64", rate_hz=15.0),
+        "runX",
+        registry,
+    )
+    try:
+        writer.write(np.array([0.0, 1.0, 0.0]))   # sent
+        writer.write(np.array([1.0, 1.0, 0.25]))  # received, 250 ms round trip
+        samples = read_live_policy_comm(runtime_dir=str(tmp_path))
+        assert samples is not None and samples.n == 2
+        np.testing.assert_allclose(samples.data[0], [0.0, 1.0, 0.0])
+        np.testing.assert_allclose(samples.data[1], [1.0, 1.0, 0.25])
+        assert samples.t_ns[1] >= samples.t_ns[0] > 0
+        assert list(samples.seq) == [0, 1]
+    finally:
+        writer.close()
+        writer.unlink()
+
+
+@_needs_rerun
+def test_eval_layout_has_policy_comm_row_collection_does_not():
+    # Eval adds the policy-server comms panels (packet send/receive activity +
+    # round-trip latency) below the robot metrics; collection has no server.
+    from dual_flexiv_control.dashboard import blueprints
+
+    eval_origins = _view_origins(blueprints.for_phase("eval", "handover"))
+    assert f"/{blueprints.POLICY_COMM_ROOT}" in eval_origins
+    assert f"/{blueprints.POLICY_LATENCY_PATH}" in eval_origins
+    for phase in ("collection", "viewing"):
+        origins = _view_origins(blueprints.for_phase(phase, "handover"))
+        assert not any(o.startswith("/policy") for o in origins)
 
 
 def test_eef_position_is_a_time_series_metric():
@@ -218,6 +274,248 @@ def test_runtime_is_sim_returns_bool():
     assert isinstance(runtime_is_sim(), bool)
 
 
+def test_calibration_configured_leader_sides_from_rig():
+    from dual_flexiv_control.dashboard import calibration
+    from dual_flexiv_control.dashboard.arms import set_active_rig
+
+    set_active_rig("left_only")  # ships just the left FACTR leader (:5000)
+    try:
+        assert calibration.configured_leader_sides() == ["left"]
+    finally:
+        set_active_rig(None)
+
+
+def test_calibration_capture_joint_solves_one_index(monkeypatch):
+    # Drive the real per-joint capture path against the synthetic (sim) FACTR source
+    # so it needs no hardware; each capture solves exactly its one joint's offset.
+    from dual_flexiv_control.dashboard import arms as _arms
+    from dual_flexiv_control.dashboard import calibration
+
+    _arms.set_active_rig("left_only")
+    monkeypatch.setattr(_arms, "runtime_is_sim", lambda: True)
+    calibration.reset()  # drop any cached client so the sim override takes effect
+    try:
+        offsets = calibration.initial_offsets("left")
+        assert len(offsets) == 7  # gripper dropped
+        for j in (0, 3, 6):
+            cap = calibration.capture_joint("left", j, samples=1)
+            assert cap.joint == j
+            assert -180.0 <= cap.offset_deg <= 180.0
+            # captured joint reads its straight angle; offset is that negated (+ wrap)
+            assert cap.offset_deg == pytest.approx(_wrap180(-cap.captured_deg), abs=1e-6)
+    finally:
+        calibration.reset()
+        _arms.set_active_rig(None)
+
+
+def test_calibration_capture_joint_rejects_out_of_range(monkeypatch):
+    from dual_flexiv_control.dashboard import arms as _arms
+    from dual_flexiv_control.dashboard import calibration
+
+    _arms.set_active_rig("left_only")
+    monkeypatch.setattr(_arms, "runtime_is_sim", lambda: True)
+    calibration.reset()
+    try:
+        with pytest.raises(RuntimeError):
+            calibration.capture_joint("left", 7, samples=1)  # 7-DoF: valid indices 0..6
+    finally:
+        calibration.reset()
+        _arms.set_active_rig(None)
+
+
+def _wrap180(deg: float) -> float:
+    return (deg + 180.0) % 360.0 - 180.0
+
+
+def test_calibration_format_yaml_and_overrides():
+    from dual_flexiv_control.dashboard.calibration import format_overrides
+    from dual_flexiv_control.dashboard.calibration import format_yaml
+
+    offsets = [180.0, -90.0, -90.0, 90.0, 90.0, 180.0, -90.0]
+    y = format_yaml("right", offsets, [1, 2, 3])
+    assert "right:" in y and "offsets_deg: [180.00, -90.00" in y and "sign_flip_joints: [1, 2, 3]" in y
+    assert format_overrides("right", offsets, [1, 2, 3]) == (
+        "arms.right.convention.offsets_deg='[180.00,-90.00,-90.00,90.00,90.00,180.00,-90.00]' "
+        "arms.right.convention.sign_flip_joints='[1,2,3]'"
+    )
+
+
+def test_splice_convention_inserts_and_preserves_comments():
+    # On a real rig file with no active convention, splicing inserts one inline line,
+    # the result parses, the convention is set, and existing comments survive.
+    # The shipped rig may already carry a live calibration (💾 Sync writes into it),
+    # so strip any active convention line first — the test targets insertion.
+    import yaml
+
+    from dual_flexiv_control.dashboard import calibration
+
+    path = calibration.rig_path("left_only")
+    text = "\n".join(
+        line for line in path.read_text().splitlines()
+        if not line.lstrip().startswith("convention:")
+    ) + "\n"
+    assert "convention:" not in text.replace("# convention:", "")  # none active
+    out = calibration._splice_convention(
+        text, "left", {"offsets_deg": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0], "sign_flip_joints": [1, 2]}
+    )
+    data = yaml.safe_load(out)
+    assert data["arms"]["left"]["convention"]["offsets_deg"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+    assert data["arms"]["left"]["convention"]["sign_flip_joints"] == [1, 2]
+    assert data["arms"]["left"]["serial"] == "Rizon4s-062841"  # untouched
+    assert "# NOTE: a camera exists only" in out                # comments preserved
+
+
+def test_apply_to_rig_merges_existing_gripper(tmp_path, monkeypatch):
+    # An existing convention with gripper endpoints must survive a sync; offsets/flips
+    # are (re)written. Idempotent: applying twice leaves a single valid convention.
+    import yaml
+
+    from dual_flexiv_control.dashboard import calibration
+
+    rig_file = tmp_path / "myrig.yaml"
+    rig_file.write_text(
+        "# @package _global_\n"
+        "arms:\n"
+        "  left:\n"
+        "    name: \"Lauer\"\n"
+        "    serial: Rizon4s-000000\n"
+        "    convention: { gripper_open: 0.1, gripper_closed: 1.2 }\n"
+    )
+    monkeypatch.setattr(calibration, "rig_path", lambda *_a, **_k: rig_file)
+
+    offsets = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0]
+    calibration.apply_to_rig("left", offsets, [3, 1])
+    calibration.apply_to_rig("left", offsets, [3, 1])  # idempotent
+    data = yaml.safe_load(rig_file.read_text())
+    conv = data["arms"]["left"]["convention"]
+    assert conv["offsets_deg"] == [round(o, 2) for o in offsets]
+    assert conv["sign_flip_joints"] == [1, 3]           # sorted+deduped
+    assert conv["gripper_open"] == 0.1 and conv["gripper_closed"] == 1.2  # preserved
+    assert data["arms"]["left"]["serial"] == "Rizon4s-000000"
+
+
+def test_apply_to_rig_rejects_missing_side(tmp_path, monkeypatch):
+    from dual_flexiv_control.dashboard import calibration
+
+    rig_file = tmp_path / "r.yaml"
+    rig_file.write_text("arms:\n  left:\n    serial: X\n")
+    monkeypatch.setattr(calibration, "rig_path", lambda *_a, **_k: rig_file)
+    with pytest.raises(RuntimeError):
+        calibration.apply_to_rig("right", [0.0] * 7, [])
+
+
+def test_gripper_read_and_preview(monkeypatch):
+    import numpy as np
+
+    from dual_flexiv_control.dashboard import arms as _arms
+    from dual_flexiv_control.dashboard import calibration
+
+    _arms.set_active_rig("left_only")
+    monkeypatch.setattr(_arms, "runtime_is_sim", lambda: True)
+    calibration.reset()
+    try:
+        g = calibration.read_gripper("left", samples=1)
+        assert np.isfinite(g)  # trailing element of the DoF+1 sim vector
+        prev = calibration.gripper_preview(0.2, 1.2)
+        labels = {lab: frac for lab, _raw, frac in prev}
+        assert labels["open"] == pytest.approx(0.0)
+        assert labels["mid"] == pytest.approx(0.5)
+        assert labels["closed"] == pytest.approx(1.0)
+        assert calibration.gripper_preview(0.5, 0.5) is None   # equal endpoints -> no map
+        assert calibration.gripper_preview(None, 1.0) is None   # unset -> no map
+    finally:
+        calibration.reset()
+        _arms.set_active_rig(None)
+
+
+def test_format_and_apply_include_gripper(tmp_path, monkeypatch):
+    import yaml
+
+    from dual_flexiv_control.dashboard import calibration
+
+    offs = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0]
+    y = calibration.format_yaml("left", offs, [1, 2], gripper_open=0.1, gripper_closed=1.25)
+    assert "gripper_open: 0.1000" in y and "gripper_closed: 1.2500" in y
+    ov = calibration.format_overrides("left", offs, [1, 2], gripper_open=0.1, gripper_closed=1.25)
+    assert "convention.gripper_open=0.1000" in ov and "convention.gripper_closed=1.2500" in ov
+    # omitted -> no gripper keys emitted
+    assert "gripper" not in calibration.format_yaml("left", offs, [1, 2])
+
+    rig_file = tmp_path / "r.yaml"
+    rig_file.write_text("arms:\n  left:\n    serial: X\n")
+    monkeypatch.setattr(calibration, "rig_path", lambda *_a, **_k: rig_file)
+    calibration.apply_to_rig("left", offs, [1], gripper_open=0.3, gripper_closed=1.4)
+    conv = yaml.safe_load(rig_file.read_text())["arms"]["left"]["convention"]
+    assert conv["gripper_open"] == 0.3 and conv["gripper_closed"] == 1.4
+
+
+def test_follower_dof_and_initial_offsets_length(monkeypatch):
+    from dual_flexiv_control.dashboard import arms as _arms
+    from dual_flexiv_control.dashboard import calibration
+
+    _arms.set_active_rig("left_only")
+    try:
+        assert calibration.follower_dof("left") == 7  # server dof 8 - drop_trailing 1
+        assert len(calibration.initial_offsets("left")) == 7
+        # A mis-sized config offsets list is normalized to the follower DoF, not echoed.
+        monkeypatch.setattr(calibration, "current_convention",
+                            lambda side: _FakeConv([1.0, 2.0, 3.0]))  # too short
+        assert len(calibration.initial_offsets("left")) == 7
+        assert calibration.initial_offsets("left")[:3] == [1.0, 2.0, 3.0]
+        assert calibration.initial_offsets("left")[3:] == [0.0, 0.0, 0.0, 0.0]  # zero-padded
+    finally:
+        _arms.set_active_rig(None)
+
+
+class _FakeConv:
+    def __init__(self, offsets):
+        self.offsets_deg = offsets
+        self.sign_flip_joints = [1, 2, 3]
+        self.drop_trailing = 1
+
+
+def test_calibration_render_smoke(monkeypatch):
+    # The live-view path (render -> commanded_follower_q -> robot_view.update_poses)
+    # must run end-to-end without throwing; drive it against a buffered recording (no
+    # gRPC server) and the synthetic FACTR source.
+    import rerun as rr
+
+    from dual_flexiv_control.dashboard import arms as _arms
+    from dual_flexiv_control.dashboard import calibration
+
+    _arms.set_active_rig("left_only")
+    monkeypatch.setattr(_arms, "runtime_is_sim", lambda: True)
+    calibration.reset()
+    rec = rr.RecordingStream("dfc-test-calib", recording_id="t")
+    from dual_flexiv_control.dashboard import robot_view
+    robot_view.log_scene(rec)
+    monkeypatch.setattr(calibration, "_REC", rec)
+    try:
+        q = calibration.render("left", calibration.initial_offsets("left"), [1, 2, 3])
+        assert q.shape == (7,)
+    finally:
+        monkeypatch.setattr(calibration, "_REC", None)
+        calibration.reset()
+        _arms.set_active_rig(None)
+
+
+def test_calibration_reset_closes_client(monkeypatch):
+    from dual_flexiv_control.dashboard import arms as _arms
+    from dual_flexiv_control.dashboard import calibration
+
+    _arms.set_active_rig("left_only")
+    monkeypatch.setattr(_arms, "runtime_is_sim", lambda: True)
+    calibration.reset()
+    try:
+        client = calibration._get_client()
+        assert client is not None
+        calibration.reset()
+        assert calibration._CLIENT is None  # reset drops (and closes) the cached client
+    finally:
+        calibration.reset()
+        _arms.set_active_rig(None)
+
+
 def test_read_arm_status_placeholder_when_no_run(tmp_path):
     from dual_flexiv_control.dashboard.arms import ArmStatus
     from dual_flexiv_control.dashboard.arms import discover_arms
@@ -230,6 +528,39 @@ def test_read_arm_status_placeholder_when_no_run(tmp_path):
     assert status.mode == "disconnected"
     assert status.estop_pressed is None
     assert status.info is arm
+
+
+def test_read_leader_status_sim_reachable(monkeypatch):
+    # In sim the FACTR client fabricates positions, so a configured leader reads
+    # reachable with the sim flag set and the trailing gripper split off.
+    from dual_flexiv_control.dashboard import arms as _arms
+    from dual_flexiv_control.dashboard.arms import LeaderStatus
+    from dual_flexiv_control.dashboard.arms import read_leader_status
+
+    monkeypatch.setattr(_arms, "runtime_is_sim", lambda: True)
+    _arms.reset()  # drop any real cached leader client so the sim one is built
+    sides = _arms.configured_leader_sides()
+    assert sides, "the default rig should configure at least one FACTR leader"
+    status = read_leader_status(sides[0])
+    assert isinstance(status, LeaderStatus)
+    assert status.reachable is True
+    assert status.sim is True
+    assert status.dof >= 1
+    assert status.gripper is not None
+    _arms.reset()
+
+
+def test_read_leader_status_disconnected_when_unconfigured(monkeypatch):
+    # A side the rig does not serve reads as disconnected (no signal), never crashes.
+    from dual_flexiv_control.dashboard import arms as _arms
+    from dual_flexiv_control.dashboard.arms import read_leader_status
+
+    monkeypatch.setattr(_arms, "runtime_is_sim", lambda: True)
+    _arms.reset()
+    status = read_leader_status("nonexistent-side")
+    assert status.reachable is False
+    assert status.gripper is None
+    _arms.reset()
 
 
 def test_robot_urdf_chain_parses():
@@ -339,9 +670,55 @@ def test_horizon_target_update_and_clear_smoke():
     q = np.zeros(7)
     robot_view.update_horizon_targets(rec, {"left": q + 0.3}, {"left": q}, t=1.0)
     assert "left" in robot_view._shown_targets
+    assert "left" in robot_view._shown_traces
     robot_view.update_horizon_targets(rec, {"left": q + 0.2}, {}, t=2.0)  # no measured q: no trace
     robot_view.clear_horizon_targets(rec)
     assert not robot_view._shown_targets
+    assert not robot_view._shown_traces
+
+
+@_needs_rerun
+def test_horizon_eef_target_traces_without_ghost():
+    # Cartesian-kind predictions carry only a TCP position: a trace + tip are drawn
+    # (from the measured eef when present, else FK of measured q) but no ghost.
+    import numpy as np
+    import rerun as rr
+
+    from dual_flexiv_control.dashboard import robot_view
+
+    rec = rr.RecordingStream("dfc-test-horizon-eef")
+    p = np.array([0.4, 0.0, 0.3])
+    robot_view.update_horizon_targets(
+        rec, {}, {}, t=1.0,
+        target_eef={"right": p}, real_eef={"right": np.array([0.4, 0.1, 0.3])},
+    )
+    assert "right" in robot_view._shown_traces
+    assert "right" not in robot_view._shown_targets  # no joint target -> no ghost
+    # no measured eef: falls back to FK of measured q; with neither, tip only
+    robot_view.update_horizon_targets(rec, {}, {"right": np.zeros(7)}, t=2.0, target_eef={"right": p})
+    robot_view.update_horizon_targets(rec, {}, {}, t=3.0, target_eef={"right": p})
+    robot_view.clear_horizon_targets(rec)
+    assert not robot_view._shown_traces
+
+
+@_needs_rerun
+def test_mount_world_point_matches_fk_base():
+    # The mount transform applied to the base-frame origin lands on the arm's mount
+    # (= the FK world position of the chain root), so measured/predicted eef points
+    # render in the same frame as the FK trace endpoints.
+    import numpy as np
+
+    from dual_flexiv_control.dashboard import robot_view
+
+    for side in ("left", "right"):
+        origin = robot_view.mount_world_point(side, np.zeros(3))
+        np.testing.assert_allclose(
+            origin, np.asarray(robot_view._MOUNTS[side]["translation"]), atol=1e-12
+        )
+    # a point along base +Z leans outward with the 45° plate tilt (x moves, z rises)
+    up = robot_view.mount_world_point("right", np.array([0.0, 0.0, 1.0]))
+    anchor = np.asarray(robot_view._MOUNTS["right"]["translation"])
+    assert up[0] > anchor[0] + 0.5 and up[2] > 0.5
 
 
 @_needs_rerun
@@ -378,6 +755,17 @@ def test_read_live_horizon_q_none_without_eval_run(tmp_path):
 
     assert HORIZON_STREAM.format(side="left") == horizon_stream_name("left")
     assert read_live_horizon_q("left", runtime_dir=str(tmp_path)) is None
+
+
+def test_read_live_horizon_eef_none_without_eval_run(tmp_path):
+    from dual_flexiv_control.dashboard.arms import EEF_HORIZON_STREAM
+    from dual_flexiv_control.dashboard.arms import read_live_horizon_eef
+
+    # Name must match what the eval node publishes (policy.loop.eef_horizon_stream_name).
+    from dual_flexiv_control.policy import eef_horizon_stream_name
+
+    assert EEF_HORIZON_STREAM.format(side="left") == eef_horizon_stream_name("left")
+    assert read_live_horizon_eef("left", runtime_dir=str(tmp_path)) is None
 
 
 def test_get_frame_missing_when_no_live_producer(tmp_path):
@@ -436,6 +824,33 @@ def test_read_tail_returns_whole_small_log(tmp_path):
     p = tmp_path / "system.log"
     p.write_text("only line\n")
     assert logs.read_tail(p) == "only line\n"
+
+
+def test_live_daemon_log_wraps_existing_path(tmp_path):
+    # Dashboard-launched runs never write an outputs/ system.log (the persistent
+    # session daemon composes each run in-process, skipping the Hydra job
+    # machinery that creates it) — their output all lands in the daemon's own
+    # log file instead, which the Logs tab must surface via this wrapper.
+    from dual_flexiv_control.dashboard import logs
+
+    p = tmp_path / "dfc-session-abc123.log"
+    p.write_text("hello\n")
+    found = logs.live_daemon_log(str(p))
+    assert found is not None
+    assert found.path == p
+    assert found.size_bytes > 0
+
+
+def test_live_daemon_log_none_when_no_path():
+    from dual_flexiv_control.dashboard import logs
+
+    assert logs.live_daemon_log(None) is None
+
+
+def test_live_daemon_log_none_when_path_missing(tmp_path):
+    from dual_flexiv_control.dashboard import logs
+
+    assert logs.live_daemon_log(str(tmp_path / "gone.log")) is None
 
 
 # ---------------------------------------------------------------------------

@@ -40,6 +40,31 @@ def convert_factr_to_rizon(q_leader_rad, conv: "JointConventionCfg") -> np.ndarr
     return np.radians(deg)
 
 
+def offsets_from_straight_pose(q_leader_rad, conv: "JointConventionCfg") -> list[float]:
+    """Solve for ``offsets_deg`` that map a captured *straight* leader pose to zero.
+
+    Calibration inverse of :func:`convert_factr_to_rizon`: pose the leader so the
+    follower would stand at its URDF home (every joint at 0 — all links straight),
+    read one leader sample ``q_leader_rad`` (rad, ``DoF+1``), and this returns the
+    per-joint ``offsets_deg`` that make ``convert_factr_to_rizon(q_leader_rad, …)``
+    come out all-zero. Since the convention adds the offset *before* the sign flip
+    and the target is zero, the flip is irrelevant here, so::
+
+        offsets_deg[j] = wrap(-degrees(q_leader_arm[j]))   # wrap to [-180, 180]
+
+    The returned list has one entry per follower joint (gripper dropped via
+    ``conv.drop_trailing``); ``sign_flip_joints`` / ``drop_trailing`` / ``wrap_deg``
+    are unchanged — copy those from the existing convention when writing the config.
+    """
+    q = np.asarray(q_leader_rad, dtype=np.float64).ravel()
+    if conv.drop_trailing:
+        q = q[: len(q) - conv.drop_trailing]          # drop trailing gripper value(s)
+    offsets = -np.degrees(q)
+    if conv.wrap_deg:
+        offsets = (offsets + 180.0) % 360.0 - 180.0   # keep offsets in the canonical range
+    return [float(o) for o in offsets]
+
+
 def normalize_gripper(raw_value, conv: "JointConventionCfg") -> float:
     """Map FACTR's trailing gripper value (raw servo radians) to a 0..1 fraction.
 

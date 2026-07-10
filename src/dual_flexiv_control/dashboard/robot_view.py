@@ -723,20 +723,65 @@ def _trace_entities(side: str) -> tuple[str, str]:
 
 
 #: Sides whose horizon-target ghost geometry has been logged (lazy: the purple ghost
-#: only exists in the scene while an eval run publishes targets).
+#: only exists in the scene while an eval run publishes joint targets).
 _shown_targets: set[str] = set()
+#: Sides whose trace/tip entities have been logged (superset of ghost sides: an
+#: eef-only prediction draws a trace with no ghost), for clean removal.
+_shown_traces: set[str] = set()
 
 
-def update_horizon_targets(rec, target_q: dict, real_q: dict, t: float) -> None:
-    """Pose the purple horizon-target ghost(s) and the current→target EEF trace.
+def mount_world_point(side: str, p_base) -> np.ndarray:
+    """One arm's base-frame point -> the world frame, via its mount transform.
+
+    The measured ``<side>/eef`` pose and the eval node's ``eef_horizon`` estimate
+    are in the arm's own base frame; this places them in the rendered scene.
+    """
+    mount = _MOUNTS[side]
+    return np.asarray(mount["rot"], dtype=float) @ np.asarray(p_base, dtype=float)[:3] + np.asarray(
+        mount["translation"], dtype=float
+    )
+
+
+def _log_trace(rec, side: str, p_now: np.ndarray | None, p_end: np.ndarray) -> None:
+    """The purple current→predicted EEF trace (world-frame): tip always, line when
+    the current endpoint is known."""
+    _shown_traces.add(side)
+    trace_path, tip_path = _trace_entities(side)
+    rec.log(
+        tip_path,
+        rr.Points3D([p_end.tolist()], radii=_TRACE_TIP_RADIUS, colors=[_TRACE_COLOR]),
+    )
+    if p_now is not None:
+        rec.log(
+            trace_path,
+            rr.LineStrips3D([[p_now.tolist(), p_end.tolist()]],
+                            radii=_TRACE_RADIUS, colors=[_TRACE_COLOR]),
+        )
+
+
+def update_horizon_targets(
+    rec,
+    target_q: dict,
+    real_q: dict,
+    t: float,
+    target_eef: dict | None = None,
+    real_eef: dict | None = None,
+) -> None:
+    """Pose the purple horizon prediction(s): ghost + trace, or trace alone.
 
     ``target_q`` maps side -> the policy's horizon-END joint target (from the
-    ``eval/<side>/q_horizon`` stream); ``real_q`` maps side -> live measured ``q``.
-    Sides absent from ``target_q`` are left untouched. The trace needs both
-    configs (its endpoints are FK of each); with no measured ``q`` the ghost is
-    still posed but the trace is skipped. Geometry is logged lazily on a side's
-    first target (on the timeline, not static, so :func:`clear_horizon_targets`
-    removes it cleanly when the run ends).
+    ``eval/<side>/q_horizon`` stream) — posed as the purple ghost, with the
+    current→target EEF trace between the FK of the measured ``real_q`` and of the
+    target (with no measured ``q`` the ghost is still posed, the trace skipped).
+    ``target_eef`` maps side -> the estimated horizon-END base-frame TCP position
+    (``eval/<side>/eef_horizon``, cartesian control kinds): no joint target exists
+    to pose a ghost, so only the trace + tip are drawn — from the measured
+    ``real_eef`` TCP position (preferred: TCP→TCP, no flange/tool offset) or,
+    lacking that, the FK of ``real_q`` (the flange — a tool shows as a small
+    gap); with neither, the predicted tip alone. Sides absent from both target
+    dicts are left untouched. Geometry is logged lazily on a side's first target
+    (on the timeline, not static, so :func:`clear_horizon_targets` removes it
+    cleanly when the run ends).
     """
     rec.set_time(_POSE_TIMELINE, duration=t)
     chain = _chain()
@@ -759,30 +804,34 @@ def update_horizon_targets(rec, target_q: dict, real_q: dict, t: float) -> None:
         _log_arm_pose(rec, side, chain, q, ghost=False, static=False, root=root)
 
         rq = real_q.get(side)
-        trace_path, tip_path = _trace_entities(side)
         if rq is not None:
-            p_now = fk_world_eef(side, rq)
-            p_end = fk_world_eef(side, q)
-            rec.log(
-                trace_path,
-                rr.LineStrips3D([[p_now.tolist(), p_end.tolist()]],
-                                radii=_TRACE_RADIUS, colors=[_TRACE_COLOR]),
-            )
-            rec.log(
-                tip_path,
-                rr.Points3D([p_end.tolist()], radii=_TRACE_TIP_RADIUS, colors=[_TRACE_COLOR]),
-            )
+            _log_trace(rec, side, fk_world_eef(side, rq), fk_world_eef(side, q))
+
+    for side, p in (target_eef or {}).items():
+        if p is None or side not in _MOUNTS or side in target_q:
+            continue
+        p_end = mount_world_point(side, p)
+        p_meas = (real_eef or {}).get(side)
+        rq = real_q.get(side)
+        p_now = (
+            mount_world_point(side, p_meas) if p_meas is not None
+            else fk_world_eef(side, rq) if rq is not None
+            else None
+        )
+        _log_trace(rec, side, p_now, p_end)
 
 
 def clear_horizon_targets(rec) -> None:
     """Remove the horizon-target ghosts + traces (eval run ended / stream gone)."""
-    if rec is None or not _shown_targets:
+    if rec is None or (not _shown_targets and not _shown_traces):
         return
     for side in list(_shown_targets):
         rec.log(_target_root(side), rr.Clear(recursive=True))
+    for side in list(_shown_traces):
         for entity in _trace_entities(side):
             rec.log(entity, rr.Clear(recursive=False))
     _shown_targets.clear()
+    _shown_traces.clear()
 
 
 # ---------------------------------------------------------------------------

@@ -23,6 +23,9 @@ defaults:
 # The server returns ABSOLUTE joint targets (it integrates the network's joint
 # velocities at dt=1/15 s), so the eval loop posts them directly — run eval at
 # task.eval.frequency_hz=15 to match that integration step.
+acme_image_keys:
+  wrist_image_left: static_left
+
 kind: remote
 schema: acme
 transport: http

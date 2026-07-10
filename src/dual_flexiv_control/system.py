@@ -45,6 +45,8 @@ from .interfaces.zed import ZedInterface
 from .policy import EvalNode
 from .process import ProcessNode
 from .process import run_node
+from .skills import SkillNode
+from .skills import load_skill
 from .streams.registry import cleanup_run
 
 log = logging.getLogger(__name__)
@@ -61,10 +63,17 @@ def make_run_id() -> str:
 
 
 def active_coeffs(config: Config):
-    """The selected phase's per-task controller coefficients (validates the phase)."""
+    """The selected phase's controller coefficients (validates the phase).
+
+    Collection/eval coefficients are per-task templates; a skill replay is
+    task-independent, so its coefficients live on the top-level ``skill`` config.
+    """
+    if config.runtime.phase == "skill":
+        return config.skill.coeffs
     if config.runtime.phase not in ("collection", "eval"):
         raise ValueError(
-            f"runtime.phase must be 'collection' or 'eval', got {config.runtime.phase!r}"
+            f"runtime.phase must be 'collection', 'eval' or 'skill', "
+            f"got {config.runtime.phase!r}"
         )
     return getattr(config.task, config.runtime.phase).coeffs
 
@@ -103,8 +112,20 @@ def build_consumer(config: Config, run_id: str) -> ProcessNode:
     """The phase-selected consumer node: collection runs the recording teleop loop
     (reads FACTR + proprio, commands the arms at the collection frequency, samples
     all cameras software-synchronised, and exports LeRobot demos); eval runs the
-    policy rollout (same observation schema, actions from the policy server)."""
+    policy rollout (same observation schema, actions from the policy server);
+    skill replays a taught joint trajectory (loaded here, so a missing/corrupt
+    skill file fails the launch instead of crashing the spawned run)."""
     active_coeffs(config)  # validate the phase before constructing anything
+    if config.runtime.phase == "skill":
+        skill = load_skill(config.skill.root, config.skill.name)
+        return SkillNode(
+            config.skill,
+            config.runtime,
+            config.brain,
+            run_id,
+            config.arms,
+            skill,
+        )
     if config.runtime.phase == "collection":
         return CollectionNode(
             config.task,
