@@ -2,7 +2,7 @@ defaults:
   - base_factr
   - _self_
 
-# The FACTR-Server's factr_api runs as ONE FastAPI process on :5001 serving a
+# The FACTR-Server's factr_api runs as ONE FastAPI process (left :5000, right :5001) serving a
 # per-side endpoint for each leader arm:
 #   /get_joint_positions_left   <- ROS /joint_pos_left
 #   /get_joint_positions_right  <- ROS /joint_pos_right
@@ -15,7 +15,7 @@ defaults:
 # An endpoint whose ROS publisher isn't running serves a zeros placeholder /
 # goes unreachable; its stream then reads stale and the side shows disconnected.
 servers:
-  left:  { host: localhost, port: 5001, endpoint: get_joint_positions_left,  request_timeout_s: 0.5, dof: 8 }
+  left:  { host: localhost, port: 5000, endpoint: get_joint_positions_left,  request_timeout_s: 0.5, dof: 8 }
   right: { host: localhost, port: 5001, endpoint: get_joint_positions_right, request_timeout_s: 0.5, dof: 8 }
 
 # The session daemon launches/supervises the FACTR-Server processes themselves
