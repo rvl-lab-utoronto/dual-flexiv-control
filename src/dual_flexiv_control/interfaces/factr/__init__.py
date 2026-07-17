@@ -9,6 +9,10 @@ viewer and the control path see identical samples by construction.
 
 :class:`FactrServerClient` / :class:`FactrClient` are the underlying HTTP
 clients the producer holds (also used by the interactive calibration tools).
+
+:class:`FactrServerSupervisor` launches and supervises the external
+FACTR-Server *processes* themselves (the grav-comp teleops + the API relay) on
+the session daemon's behalf — see :mod:`.launch`.
 """
 
 from .client import FactrClient
@@ -19,12 +23,14 @@ from .interface import factr_stream_name
 from .interface import fresh_leader_positions
 from .interface import leader_stream_names
 from .interface import wait_leaders_fresh
+from .launch import FactrServerSupervisor
 
 __all__ = [
     "FactrClient",
     "FactrServerClient",
     "FactrError",
     "FactrInterface",
+    "FactrServerSupervisor",
     "factr_stream_name",
     "fresh_leader_positions",
     "leader_stream_names",

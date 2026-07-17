@@ -70,6 +70,10 @@ class SessionView:
     #: A queued switch/start waiting for the session to go idle
     #: (``{phase, task, skill}``), or None.
     pending: dict | None = None
+    #: Daemon-managed FACTR-Server processes: the supervisor's status dict
+    #: (state / countdown_ends_ts / units / down), or None when the daemon does
+    #: not manage them (factr.launch disabled, sim, or no daemon state yet).
+    factr_servers: dict | None = None
     log_path: str | None = None
 
     @property
@@ -322,6 +326,14 @@ class SessionManager:
         """Replace one camera node now (skips the watchdog's respawn pacing)."""
         return self.send({"cmd": "respawn_camera", "name": name})
 
+    def start_factr(self) -> bool:
+        """Launch the FACTR-Server processes (pose-then-calibrate countdown)."""
+        return self.send({"cmd": "start_factr"})
+
+    def stop_factr(self) -> bool:
+        """Stop the FACTR-Server processes (SIGINT — the leaders de-energize)."""
+        return self.send({"cmd": "stop_factr"})
+
     # -- state -------------------------------------------------------------------
 
     def view(self) -> SessionView:
@@ -345,6 +357,7 @@ class SessionManager:
                 cameras_down=tuple(raw.get("cameras_down") or ()),
                 arms_down=tuple(raw.get("arms_down") or ()),
                 pending=raw.get("pending"),
+                factr_servers=raw.get("factr_servers"),
                 log_path=self._log_path,
             )
         if alive:

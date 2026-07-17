@@ -587,6 +587,64 @@ class FactrServerCfg:
 
 
 @dataclass
+class FactrLaunchCfg:
+    """Launching the external FACTR-Server processes from the session daemon.
+
+    Replaces the FACTR-Server repo's VS Code "Launch EVERYTHING" task: when
+    ``enabled`` (and not ``runtime.sim``), the daemon owns one grav-comp teleop
+    process per leader arm plus the FastAPI relay, supervised like the hardware
+    nodes (see :class:`~dual_flexiv_control.interfaces.factr.FactrServerSupervisor`)
+    and driven from the dashboard's Teleop leaders panel. Launching is always
+    user-initiated — the teleops energize the leader servos and read a
+    calibration pose at boot.
+
+    The processes run outside our environment on purpose: ``python_exe`` is the
+    system interpreter (conda's python cannot load rclpy) and ``setup_scripts``
+    are sourced first (ROS 2 + the FACTR workspace), from ``workdir`` (the
+    ``FACTR_Teleop`` directory — module paths and relative setup scripts resolve
+    against it).
+    """
+
+    enabled: bool = False
+    """Master switch (rig-provided). Off: the daemon never touches FACTR-Server
+    and the dashboard shows no launch controls (external launch still works)."""
+
+    workdir: str = "~/FACTR-Server/FACTR_Teleop"
+    """The FACTR_Teleop directory: cwd for every process; ``~`` expands."""
+
+    python_exe: str = "/usr/bin/python3"
+    """System python (3.10) — conda's 3.13 cannot load rclpy."""
+
+    setup_scripts: List[str] = field(
+        default_factory=lambda: ["/opt/ros/humble/setup.bash", "install/setup.bash"]
+    )
+    """Sourced (in order) before exec; relative paths resolve against ``workdir``."""
+
+    teleop_modules: Dict[str, str] = field(default_factory=dict)
+    """side -> python module of that leader's grav-comp teleop (torque ON), e.g.
+    left: the single-board ``factr_rizon_teleop``, right: ``factr_rizon_dual_board``.
+    Only sides present both here and in ``factr.servers`` get a process."""
+
+    api_module: str = "src.factr_fastapi.factr_fastapi.factr_api"
+    """The ROS->HTTP relay serving every leader (left :5000, right :5001)."""
+
+    api_ports: List[int] = field(default_factory=lambda: [5000, 5001])
+    """Ports freed (``fuser -k``) before the relay spawns — a stale/orphaned
+    relay holding them would kill the fresh one at bind."""
+
+    calib_delay_s: float = 30.0
+    """Seconds between the operator's Launch and the spawn: the teleops read the
+    leaders' pose for calibration at boot, so the arms must be posed FIRST."""
+
+    calib_pose: str = "[0, 0, 0, 1.57, 0, 0, 0] (J4 ≈ 90°)"
+    """Human-readable calibration pose, shown with the countdown."""
+
+    stop_grace_s: float = 10.0
+    """Cooperative window after SIGINT (the only stop that de-energizes the
+    servos) before SIGTERM/SIGKILL escalation."""
+
+
+@dataclass
 class FactrCfg:
     """FACTR teleop: one HTTP endpoint per leader arm, streamed by ONE producer.
 
@@ -608,6 +666,9 @@ class FactrCfg:
     """Freshness gate for readers: a ``factr/<side>`` sample older than this is
     treated as a leader dropout (consumers hold their last real target; the
     dashboard shows the leader as disconnected)."""
+
+    launch: FactrLaunchCfg = field(default_factory=FactrLaunchCfg)
+    """Daemon-managed launch of the FACTR-Server processes (off by default)."""
 
 
 @dataclass

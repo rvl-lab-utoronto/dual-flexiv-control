@@ -25,7 +25,10 @@ session drops back to VIEWING with the hardware untouched.
   ``state.pending``), ``{"cmd": "stop"}`` (also cancels a pending switch),
   ``{"cmd": "reconnect_arm", "side": "<side>"}`` / ``{"cmd": "respawn_camera",
   "name": "zed:<name>"}`` (replace that hardware node now, when no run needs
-  it), ``{"cmd": "shutdown"}``. stdin EOF == shutdown, so a dead dashboard can
+  it), ``{"cmd": "start_factr"}`` / ``{"cmd": "stop_factr"}`` (launch/stop the
+  external FACTR-Server processes — grav-comp leaders + API relay — when
+  ``factr.launch.enabled``; start arms a pose-then-calibrate countdown),
+  ``{"cmd": "shutdown"}``. stdin EOF == shutdown, so a dead dashboard can
   never leave an orphaned daemon holding robots.
 * state — ``<runtime_dir>/session.json``, atomically replaced (same pattern as the
   stream-manifest registry): current mode, active run, a heartbeat timestamp, and
@@ -49,6 +52,11 @@ stalled-but-alive node is killed first, because a ZED handle never recovers
 once its device dropped — so a recovered camera (e.g. after a USB replug) is
 picked back up automatically. Arm telemetry and VIEWING are never held hostage
 by a flaky camera.
+The **FACTR-Server processes** (when ``factr.launch.enabled``) are supervised
+by :class:`~dual_flexiv_control.interfaces.factr.FactrServerSupervisor` in the
+same spirit: a dead API relay is respawned (paced), a dead grav-comp teleop is
+only reported (respawning would re-energize + re-calibrate an unposed leader),
+and daemon shutdown SIGINTs the group so the leader servos always de-energize.
 """
 
 from __future__ import annotations
@@ -70,6 +78,7 @@ import numpy as np
 
 from .configs import Config
 from .configs import register_configs
+from .interfaces.factr.launch import FactrServerSupervisor
 from .orphans import sweep as orphan_sweep
 from .orphans import tag_supervisor
 from .process import run_node
@@ -227,6 +236,10 @@ class SessionState:
     #: command's tail): ``{phase, task, skill}``, or None. The UI keys its
     #: "switching…" affordance on this — there is no separate state value.
     pending: dict | None = None
+    #: Daemon-managed FACTR-Server processes (grav-comp leaders + API relay):
+    #: the supervisor's status dict (state/countdown/units/down), or None when
+    #: launch is not managed here (``factr.launch.enabled`` false, or sim).
+    factr_servers: dict | None = None
 
 
 class StateFile:
@@ -468,6 +481,7 @@ class SessionDaemon:
         self.arms: list[_ArmUnit] = []
         self.cameras: list[_CameraUnit] = []
         self.factr: _FactrUnit | None = None
+        self.factr_servers = self._make_factr_server_supervisor(config)
         self.run: _ActiveRun | None = None
         self.pending: _PendingStart | None = None
         self.cmd_q: queue_mod.Queue = queue_mod.Queue()
@@ -477,9 +491,33 @@ class SessionDaemon:
             rig=_override_value(overrides, "rig") or "default",
             sim=bool(config.runtime.sim),
         )
+        if self.factr_servers is not None:
+            self.state.factr_servers = self.factr_servers.status()
         self.state_file = StateFile(state_path(config.runtime.runtime_dir))
         self._registry = StreamRegistry(config.runtime.runtime_dir, self.run_id)
         self._fatal: str | None = None
+
+    @staticmethod
+    def _make_factr_server_supervisor(config: Config) -> FactrServerSupervisor | None:
+        """The FACTR-Server process supervisor, or None when launch is not ours.
+
+        Not ours when: the rig doesn't enable it, the runtime is sim (the
+        producer fabricates leader data — no real servers to run), or no
+        configured leader side has a teleop module to launch.
+        """
+        launch = config.factr.launch
+        if not launch.enabled or config.runtime.sim:
+            return None
+        sides = [s for s in config.factr.servers if s in launch.teleop_modules]
+        missing = [s for s in config.factr.servers if s not in launch.teleop_modules]
+        if missing:
+            log.warning(
+                "factr.launch enabled but side(s) %s have no teleop_modules entry — "
+                "their leaders must be launched externally", missing,
+            )
+        if not sides:
+            return None
+        return FactrServerSupervisor(launch, sides)
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -579,6 +617,7 @@ class SessionDaemon:
                     changed |= self._tend_cameras()
                     changed |= self._tend_arms()
                     self._tend_factr()
+                    changed |= self._tend_factr_servers()
                 if now - last_orphan_sweep >= _ORPHAN_SWEEP_S:
                     last_orphan_sweep = now
                     # Tag-based detector only while running (the boot sweep in
@@ -609,11 +648,17 @@ class SessionDaemon:
             self.run.stop_event.set()
             _escalate([self.run.proc], cooperative_s=self.config.runtime.save_grace_s)
             self.run = None
+        if self.factr_servers is not None:
+            # SIGINT now so the leaders de-energize while the hardware nodes
+            # unwind in parallel; the blocking wait comes after.
+            self.factr_servers.request_stop()
         factr_units = [self.factr] if self.factr is not None else []
         for unit in (*self.arms, *self.cameras, *factr_units):  # each via its own event
             unit.stop_event.set()
         hw_procs = [unit.proc for unit in (*self.arms, *self.cameras, *factr_units)]
         _shutdown(hw_procs, self.hw_stop, save_grace_s=0.0)
+        if self.factr_servers is not None:
+            self.factr_servers.shutdown()  # wait out the de-energize; escalate if wedged
         n = cleanup_run(self.config.runtime.runtime_dir, self.run_id)
         self.state_file.remove()
         log.info("session shutdown complete; unlinked %d shm segment(s)", n)
@@ -662,6 +707,10 @@ class SessionDaemon:
                 self._handle_reconnect_arm(cmd)
             elif kind == "respawn_camera":
                 self._handle_respawn_camera(cmd)
+            elif kind == "start_factr":
+                self._handle_start_factr()
+            elif kind == "stop_factr":
+                self._handle_stop_factr()
             else:
                 self.state.message = f"unknown command {kind!r}"
                 log.warning("unknown command: %r", cmd)
@@ -813,6 +862,11 @@ class SessionDaemon:
                     f"{', '.join(stale)}. Start/check the FACTR server(s) "
                     "(and their leader publishers), then retry."
                 )
+                if self.factr_servers is not None and self.factr_servers.state == "off":
+                    refusal += (
+                        " The servers are not launched — use ▶ Launch leaders "
+                        "in the dashboard's Teleop leaders panel."
+                    )
         if refusal is not None:
             log.error("start %s task=%s refused by preflight: %s", phase, task, refusal)
             self.state.message = refusal
@@ -1022,6 +1076,80 @@ class SessionDaemon:
         unit.stalled_since = None
         self.state.message = f"camera {name}: respawning now…"
         log.info("respawn_camera %s: node respawned", name)
+
+    def _handle_start_factr(self) -> None:
+        """Arm the FACTR-Server launch (pose-then-calibrate countdown).
+
+        Refused while a run is active or queued: the teleops energize the leader
+        servos and calibrate against whatever pose the arms hold when they boot —
+        mid-run the operator's hands (or a rollout) are on them. The countdown is
+        the operator's window to pose the arms; the processes spawn from
+        :meth:`_tend_factr_servers` when it expires.
+        """
+        if self.factr_servers is None:
+            self.state.message = (
+                "FACTR launch is not managed by this session (factr.launch is "
+                "disabled for this rig, or runtime is sim) — start the servers "
+                "externally if needed"
+            )
+            return
+        if self.run is not None or self.pending is not None:
+            self.state.message = (
+                "cannot launch the FACTR servers during a run — the teleops "
+                "calibrate the leader arms at boot; stop the run first"
+            )
+            return
+        ok, detail = self.factr_servers.request_start()
+        self.state.message = detail
+        self.state.factr_servers = self.factr_servers.status()
+
+    def _handle_stop_factr(self) -> None:
+        """Stop the FACTR-Server processes (SIGINT: the leaders de-energize).
+
+        Refused mid-collection — teleop is being fed by these very leaders, so
+        stopping them would freeze the followers on their last target while the
+        recording keeps rolling. Eval/skill runs don't read the leaders.
+        """
+        if self.factr_servers is None:
+            self.state.message = "FACTR launch is not managed by this session"
+            return
+        if self.run is not None and self.run.phase == COLLECTION:
+            self.state.message = (
+                "cannot stop the FACTR servers during a collection run — teleop "
+                "is fed by the leaders; stop the run first"
+            )
+            return
+        ok, detail = self.factr_servers.request_stop()
+        self.state.message = detail
+        self.state.factr_servers = self.factr_servers.status()
+
+    def _tend_factr_servers(self) -> bool:
+        """One supervisor beat + state sync; alerts on a teleop dying mid-teleop.
+
+        Returns True when ``state.factr_servers`` changed (the caller then
+        rewrites the state file — same contract as the other tenders).
+        """
+        sup = self.factr_servers
+        if sup is None:
+            return False
+        sup.tend()
+        status = sup.status()
+        prev = self.state.factr_servers
+        if status == prev:
+            return False
+        if self.run is not None and self.run.phase == COLLECTION and not self.run.stopping:
+            newly_down = set(status.get("down", ())) - set((prev or {}).get("down", ()))
+            teleops = sorted(n for n in newly_down if n.startswith("teleop:"))
+            if teleops:
+                # The followers hold their last real target on stale streams; the
+                # operator decides whether the episode is still worth keeping.
+                self.state.message = (
+                    f"FACTR {', '.join(teleops)} died mid-collection — the "
+                    "follower(s) hold their last target; stop the run, then "
+                    "relaunch the leaders"
+                )
+        self.state.factr_servers = status
+        return True
 
     def _reap_consumer(self) -> bool:
         """Harvest a finished consumer: outcome -> state, sweep channels, VIEWING."""
