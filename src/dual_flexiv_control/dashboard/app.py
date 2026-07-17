@@ -64,12 +64,18 @@ LOG_REFRESH = "2s"
 
 #: Trim the default top padding, style the tab bar (its labels use monochrome
 #: Material icons — forced white so the active tab's accent colour never tints
-#: them), and enlarge the per-episode action icons in the Storage tab (scoped
-#: via the ``st-key-stor_rows`` container class).
+#: them), enlarge the controls-column section headers (scoped via the explicit
+#: ``anchor=`` ids their ``st.subheader`` calls pin), and enlarge the
+#: per-episode action icons in the Storage tab (scoped via the
+#: ``st-key-stor_rows`` container class).
 _PAGE_CSS = """
 <style>
 [data-testid="stMainBlockContainer"], .block-container {
     padding-top: 1.5rem !important;
+}
+h3#sec-experiment, h3#sec-status {
+    font-size: 1.9rem;
+    text-align: center;
 }
 .stTabs [data-baseweb="tab-list"] button { padding: 1rem 2.2rem; }
 .stTabs [data-baseweb="tab-list"] button [data-testid="stMarkdownContainer"] p {
@@ -222,7 +228,7 @@ def _render_controls(
     tasks: list[TaskInfo], rig: RigInfo | None, registry: _runner.RunRegistry
 ) -> None:
 
-    st.subheader("Experiment")
+    st.subheader("Experiment", anchor="sec-experiment")
     if not tasks:
         st.error(
             "No tasks found in `conf/task/`. Add one (copy `task/default.yaml`) "
@@ -780,12 +786,12 @@ def _run_status_panel(registry: _runner.RunRegistry) -> None:
 
 
 def _render_status(registry: _runner.RunRegistry) -> None:
-    st.subheader("Status")
-    st.caption("Arms")
+    st.subheader("Status", anchor="sec-status")
+    st.markdown("#### Arms")
     _arm_status_rows(registry)
-    st.caption("Teleop leaders")
+    st.markdown("#### Teleop leaders")
     _leader_status_rows()
-    st.caption("Cameras")
+    st.markdown("#### Cameras")
     _camera_status_rows()
     st.divider()
     _run_status_panel(registry)
