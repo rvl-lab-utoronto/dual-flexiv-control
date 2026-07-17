@@ -98,15 +98,21 @@ def _apply_mode_background(view) -> None:
     ``saving`` keeps its run's tint (``view.phase`` stays set) so the color does
     not snap back to viewing while the episode finalizes. The header is made
     transparent so the tint runs edge to edge.
+
+    ALWAYS emits exactly one markdown element (empty ``<style>`` when there is
+    no tint): Streamlit identifies elements by their position in the tree, so a
+    conditionally-present element here would shift everything below it on every
+    viewing ↔ run transition — remounting the tabs and the embedded Rerun
+    viewer iframe, i.e. a full viewer reload on every mode change.
     """
     color = _MODE_BG.get(view.phase if view.state == "saving" else view.state)
-    if color is None:
-        return
-    st.markdown(
-        f"<style>.stApp {{ background-color: {color}; }} "
-        f'[data-testid="stHeader"] {{ background: transparent; }}</style>',
-        unsafe_allow_html=True,
+    css = (
+        f".stApp {{ background-color: {color}; }} "
+        '[data-testid="stHeader"] { background: transparent; }'
+        if color
+        else ""
     )
+    st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
 
 
 def _browser_url(url: str) -> str:
@@ -264,15 +270,26 @@ def _render_controls(
         result = open_in_vscode(rig.path)
         st.toast(result.message, icon="📝") if result.ok else st.warning(result.message)
 
-    # Launchable only from VIEWING with every rig camera streaming (the daemon
-    # refuses otherwise; disabling here just makes that visible up front).
-    launchable = view.state == "viewing" and not view.cameras_down
+    # Launchable only from VIEWING with every rig camera streaming and every
+    # arm publishing (the daemon refuses otherwise; disabling here just makes
+    # that visible up front).
+    launchable = (
+        view.state == "viewing" and not view.cameras_down and not view.arms_down
+    )
+    # During a run the same buttons become atomic ⇄ switches: one click stops
+    # the current run (its episode saves) and starts the new mode once idle.
+    switching = view.run_active
 
     if st.button(
-        "▶ Collection", use_container_width=True, disabled=not launchable,
-        help="Teleoperated demonstration gathering (real recording run).",
+        "⇄ Collection" if switching else "▶ Collection",
+        use_container_width=True, disabled=not (launchable or switching),
+        help=(
+            "Teleoperated demonstration gathering (real recording run). While "
+            "a run is active this switches to it: the current run stops (its "
+            "episode saves), then collection starts — no manual retries."
+        ),
     ):
-        _launch(registry, task, "collection", rig.name)
+        _launch(registry, task, "collection", rig.name, switch=switching)
 
     # One compact row: labels collapsed (the column is narrow), meaning carried
     # by tooltips + the resolution caption underneath.
@@ -308,11 +325,19 @@ def _render_controls(
     )
     port, port_error = _parse_port(port_raw)
     if eval_cols[0].button(
-        "▶ Eval", type="primary", use_container_width=True,
-        disabled=not launchable or port_error is not None,
-        help="Online policy rollout (needs the policy server reachable).",
+        "⇄ Eval" if switching else "▶ Eval",
+        type="primary", use_container_width=True,
+        disabled=not (launchable or switching) or port_error is not None,
+        help=(
+            "Online policy rollout (needs the policy server reachable). While "
+            "a run is active this switches to it: the current run stops (its "
+            "episode saves), then eval starts — no manual retries."
+        ),
     ):
-        _launch(registry, task, "eval", rig.name, policy=policy, host=host, port=port)
+        _launch(
+            registry, task, "eval", rig.name,
+            policy=policy, host=host, port=port, switch=switching,
+        )
     if port_error:
         st.caption(f":red[{port_error}]")
     elif policy is not None or host is not None or port is not None:
@@ -324,7 +349,10 @@ def _render_controls(
     st.caption("Each launch runs a single episode.")
 
     if view.run_active:
-        st.caption("A run is active — stop it before launching another.")
+        st.caption(
+            "A run is active — ⇄ switches straight to a new run (the current "
+            "episode saves first), or ■ Stop just ends it."
+        )
     elif view.state == "starting":
         st.caption("Session starting — arms and cameras coming up…")
     elif view.state == "down":
@@ -350,15 +378,28 @@ def _render_arm_row(s: ArmStatus) -> None:
 
 
 @st.fragment(run_every="2s")
-def _arm_status_rows() -> None:
-    """Read-only per-arm rows (operation mode + E-stop), refreshed periodically."""
+def _arm_status_rows(registry: _runner.RunRegistry) -> None:
+    """Per-arm rows (operation mode + E-stop) with a ↻ reconnect button each."""
     try:
         arms = discover_arms()
     except Exception as exc:  # noqa: BLE001 - broken rig conf -> compact, visible note
         st.warning(f"Arm config failed to compose: {exc}", icon="🛠️")
         return
+    run_active = registry.session_view().run_active
     for arm in arms:
-        _render_arm_row(read_arm_status(arm))
+        cols = st.columns([5, 1], vertical_alignment="center")
+        with cols[0]:
+            _render_arm_row(read_arm_status(arm))
+        if cols[1].button(
+            "↻", key=f"arm_reconnect::{arm.side}", disabled=run_active,
+            help=f"Reconnect the {arm.side} arm now: replace its node for a "
+                 "fresh RDK connection — back to IDLE telemetry, never "
+                 "auto-controlled. Disabled while a run is active.",
+        ):
+            if registry.reconnect_arm(arm.side):
+                st.toast(f"Reconnecting arm {arm.side}…", icon="🔁")
+            else:
+                st.warning("Session daemon not reachable.", icon="⚠️")
 
 
 def _render_leader_row(s: LeaderStatus) -> None:
@@ -429,10 +470,13 @@ def _parse_port(raw: str) -> tuple[int | None, str | None]:
 def _launch(
     registry: _runner.RunRegistry, task: TaskInfo, phase: str, rig: str,
     policy: str | None = None, host: str | None = None, port: int | None = None,
+    switch: bool = False,
 ) -> None:
-    """Launch a run, surfacing a refused launch (e.g. one is still saving) inline."""
+    """Launch (or ⇄ switch to) a run, surfacing a refusal inline."""
     try:
-        registry.launch(task, phase, rig, policy=policy, host=host, port=port)
+        registry.launch(
+            task, phase, rig, policy=policy, host=host, port=port, switch=switch
+        )
     except RuntimeError as exc:
         st.error(str(exc), icon="⚠️")
         return
@@ -490,6 +534,13 @@ def _run_status_panel(registry: _runner.RunRegistry) -> None:
             st.rerun(scope="app")
     if view.message:
         st.warning(view.message, icon="⚠️")
+    if view.pending:
+        st.info(
+            f"⇄ Switching to **{view.pending.get('phase') or '?'}** — the "
+            "current run is stopping / the arms are winding down; the new run "
+            "starts automatically.",
+            icon="⏳",
+        )
     active = registry.active()
     if active is None:
         if view.state == "viewing":
@@ -500,6 +551,25 @@ def _run_status_panel(registry: _runner.RunRegistry) -> None:
                     "retried automatically; launches are disabled until every rig "
                     "camera streams (replug/fix, or pick a rig without it).",
                     icon="📷",
+                )
+                for name in view.cameras_down:
+                    if st.button(
+                        f"↻ Retry {name} now", key=f"cam_retry::{name}",
+                        help="Kill + respawn this camera node immediately (e.g. "
+                             "right after a replug), instead of waiting out the "
+                             "automatic retry pacing.",
+                    ):
+                        if registry.respawn_camera(name):
+                            st.toast(f"Respawning {name}…", icon="🔁")
+                        else:
+                            st.warning("Session daemon not reachable.", icon="⚠️")
+            if view.arms_down:
+                st.warning(
+                    "Waiting on arm(s): **" + ", ".join(view.arms_down) + "** — "
+                    "reconnected automatically (back to read-only telemetry; "
+                    "never auto-controlled); launches are disabled until the "
+                    "arm publishes again.",
+                    icon="🦾",
                 )
         elif view.state == "starting":
             st.info("⏳ Session starting — arms and cameras coming up…")
@@ -539,7 +609,7 @@ def _run_status_panel(registry: _runner.RunRegistry) -> None:
 def _render_status(registry: _runner.RunRegistry) -> None:
     st.subheader("Status")
     st.caption("Arms")
-    _arm_status_rows()
+    _arm_status_rows(registry)
     st.caption("Teleop leaders")
     _leader_status_rows()
     st.caption("Cameras")

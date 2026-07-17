@@ -530,24 +530,57 @@ def test_read_arm_status_placeholder_when_no_run(tmp_path):
     assert status.info is arm
 
 
-def test_read_leader_status_sim_reachable(monkeypatch):
-    # In sim the FACTR client fabricates positions, so a configured leader reads
-    # reachable with the sim flag set and the trailing gripper split off.
+def test_read_leader_status_reachable_iff_stream_fresh(tmp_path, monkeypatch):
+    # The leader status probe reads the factr/<side> stream (the same samples
+    # control consumes): fresh sample -> reachable (trailing gripper split off);
+    # no stream (no producer running) -> disconnected; stale sample -> disconnected.
+    import time as _time
+
+    import numpy as np
+
     from dual_flexiv_control.dashboard import arms as _arms
     from dual_flexiv_control.dashboard.arms import LeaderStatus
     from dual_flexiv_control.dashboard.arms import read_leader_status
+    from dual_flexiv_control.interfaces.factr import factr_stream_name
+    from dual_flexiv_control.streams import StreamRegistry
+    from dual_flexiv_control.streams.spec import StreamSpec
+    from dual_flexiv_control.streams.stream import StreamWriter
 
+    monkeypatch.setenv("DFC_RUNTIME_DIR", str(tmp_path))
     monkeypatch.setattr(_arms, "runtime_is_sim", lambda: True)
-    _arms.reset()  # drop any real cached leader client so the sim one is built
+    _arms.reset()
     sides = _arms.configured_leader_sides()
     assert sides, "the default rig should configure at least one FACTR leader"
-    status = read_leader_status(sides[0])
-    assert isinstance(status, LeaderStatus)
-    assert status.reachable is True
-    assert status.sim is True
-    assert status.dof >= 1
-    assert status.gripper is not None
-    _arms.reset()
+    side = sides[0]
+
+    # No producer -> no stream -> disconnected (even in sim: the probe is a reader).
+    status = read_leader_status(side)
+    assert status.reachable is False
+
+    registry = StreamRegistry(str(tmp_path), "runX")
+    writer = StreamWriter.create(
+        StreamSpec(name=factr_stream_name(side), dim=8, capacity=64,
+                   dtype="float64", rate_hz=100.0),
+        "runX",
+        registry,
+    )
+    try:
+        # Stale sample (older than factr.max_age_s) -> still disconnected.
+        writer.write(np.linspace(0.1, 0.8, 8), _time.monotonic_ns() - int(60e9))
+        assert read_leader_status(side).reachable is False
+
+        # Fresh sample -> reachable, DoF+gripper split, sim flag carried through.
+        writer.write(np.linspace(0.1, 0.8, 8), _time.monotonic_ns())
+        status = read_leader_status(side)
+        assert isinstance(status, LeaderStatus)
+        assert status.reachable is True
+        assert status.sim is True
+        assert status.dof == 7
+        assert status.gripper == pytest.approx(0.8)
+    finally:
+        writer.close()
+        writer.unlink()
+        _arms.reset()
 
 
 def test_read_leader_status_disconnected_when_unconfigured(monkeypatch):

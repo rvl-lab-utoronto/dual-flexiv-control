@@ -64,6 +64,12 @@ class SessionView:
     last_outcome: dict | None = None
     #: Camera nodes the daemon reports down/booting (runs are gated on empty).
     cameras_down: tuple = ()
+    #: Arm nodes the daemon reports down (auto-respawned to IDLE telemetry;
+    #: runs needing them are refused until they are back).
+    arms_down: tuple = ()
+    #: A queued switch/start waiting for the session to go idle
+    #: (``{phase, task, skill}``), or None.
+    pending: dict | None = None
     log_path: str | None = None
 
     @property
@@ -279,7 +285,22 @@ class SessionManager:
         host: str | None = None, port: int | None = None,
         skill: str | None = None,
     ) -> bool:
-        cmd = {"cmd": "start", "phase": phase, "task": task}
+        return self._send_run_cmd("start", phase, task, policy, host, port, skill)
+
+    def switch_run(
+        self, phase: str, task: str, policy: str | None = None,
+        host: str | None = None, port: int | None = None,
+        skill: str | None = None,
+    ) -> bool:
+        """Atomic mode switch: the daemon stops any active run (episode saves),
+        then starts this one the moment the session is idle — no polling."""
+        return self._send_run_cmd("switch", phase, task, policy, host, port, skill)
+
+    def _send_run_cmd(
+        self, kind: str, phase: str, task: str, policy: str | None,
+        host: str | None, port: int | None, skill: str | None,
+    ) -> bool:
+        cmd = {"cmd": kind, "phase": phase, "task": task}
         if policy is not None:
             cmd["policy"] = policy
         if host is not None:
@@ -292,6 +313,14 @@ class SessionManager:
 
     def stop_run(self) -> bool:
         return self.send({"cmd": "stop"})
+
+    def reconnect_arm(self, side: str) -> bool:
+        """Replace one arm node now (fresh RDK connection, back to IDLE)."""
+        return self.send({"cmd": "reconnect_arm", "side": side})
+
+    def respawn_camera(self, name: str) -> bool:
+        """Replace one camera node now (skips the watchdog's respawn pacing)."""
+        return self.send({"cmd": "respawn_camera", "name": name})
 
     # -- state -------------------------------------------------------------------
 
@@ -314,6 +343,8 @@ class SessionManager:
                 message=raw.get("message"),
                 last_outcome=raw.get("last_outcome"),
                 cameras_down=tuple(raw.get("cameras_down") or ()),
+                arms_down=tuple(raw.get("arms_down") or ()),
+                pending=raw.get("pending"),
                 log_path=self._log_path,
             )
         if alive:

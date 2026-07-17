@@ -8,7 +8,8 @@ real Brain, the real :class:`LeRobotRecorder`, and the tty episode control.
 
 Each tick at :attr:`CollectionCfg.frequency_hz` (default 15 Hz):
 
-1. read the FACTR leaders (on request) + convert to Rizon joint targets,
+1. read the FACTR leaders' fresh samples (from their ``factr/<side>`` streams —
+   the same ones the dashboard renders) + convert to Rizon joint targets,
 2. post them on the setpoint channel — commanding every control-enabled arm,
 3. snapshot every subscribed stream (proprio + all cameras) at one instant
    (software synchronisation — newest frame of each camera at this tick),
@@ -32,10 +33,14 @@ from ..configs import FactrCfg
 from ..configs import RecordingCfg
 from ..configs import RuntimeCfg
 from ..configs import TaskCfg
+from ..control import GRIPPER
 from ..control import control_specs
+from ..control import gripper_spec
 from ..control import pack_streamed
-from ..interfaces.factr import FactrClient
-from ..interfaces.factr.client import FactrError
+from ..interfaces.factr import FactrError
+from ..interfaces.factr import fresh_leader_positions
+from ..interfaces.factr import leader_stream_names
+from ..interfaces.factr import wait_leaders_fresh
 from ..process import ProcessNode
 from ..process import RateLimiter
 from ..streams.registry import AttachAborted
@@ -58,6 +63,7 @@ class CollectionLoop:
         recorder: Recorder,
         command_arms: dict[str, ArmCfg],
         conventions: dict,
+        leaders,
         frequency_hz: float = 15.0,
         num_episodes: int = 1,
         events=None,
@@ -70,14 +76,20 @@ class CollectionLoop:
         #: which is independent (we log the teleop command even for arms we don't drive).
         self.command_arms = command_arms
         self.conventions = conventions
+        #: zero-arg callable -> ``{side: leader joint positions}`` for every leader
+        #: with FRESH data right now (a dropped-out side is absent). The live node
+        #: wires :func:`~dual_flexiv_control.interfaces.factr.fresh_leader_positions`
+        #: over the factr/<side> streams; tests pass any callable.
+        self._leaders = leaders
         self.frequency_hz = frequency_hz
         self.num_episodes = max(1, int(num_episodes))
         #: callable -> list[event]; defaults to no operator events (single episode).
         self._poll = events if events is not None else (lambda: [])
         #: operator-paced (keyboard) vs single-episode fallback bounded by stop.
         self._operator_paced = events is not None
-        #: last-known target per side, so a dropped leader read holds rather than
-        #: stalling the whole recording (a fixed-width action must always be filled).
+        #: last-known REAL target per side, so a dropped leader read holds rather
+        #: than stalling the whole recording (a fixed-width action must always be
+        #: filled). Only ever populated from real leader samples.
         self._last_qd: dict = {}
         self._last_grip: dict = {}
         #: streams that blocked the most recent skipped tick (diagnostics).
@@ -146,11 +158,8 @@ class CollectionLoop:
 
     def tick(self) -> bool:
         """Read + command + record one frame. Returns True if a frame was recorded."""
-        try:
-            leaders = self.brain.factr_joint_positions()
-        except FactrError as exc:
-            log.warning("FACTR read failed; holding last targets this tick: %s", exc)
-            leaders = {}
+        # Fresh leader samples only — a dropped-out side is simply absent this tick.
+        leaders = self._leaders()
         acts = self.frames.actions_from_leaders(leaders, self.conventions)
         q_d, gripper = acts["q_d"], acts["gripper"]
 
@@ -165,13 +174,22 @@ class CollectionLoop:
                 q_d[side] = self._last_qd.get(side, np.zeros(self.frames.action_dof(side)))
                 gripper[side] = self._last_grip.get(side, 0.0)
 
-        # Command every control-enabled arm we have a target for (joint-position only).
+        # Command every control-enabled arm with a REAL target — a fresh reading or
+        # the held last-real one — plus its normalized gripper target (a no-op for an
+        # arm without a gripper channel). A side that has never produced a leader
+        # sample is recorded (zeros, above) but NEVER commanded: fabricating a target
+        # would send the arm somewhere no operator asked for (an all-zeros q_d is the
+        # straight-up home pose). With no setpoint posted, the arm just stays parked
+        # in its first-setpoint wait until real teleop data arrives.
         for side, arm in self.command_arms.items():
-            if side in q_d and arm.control.kind == "qpos":
+            if side not in self._last_qd:
+                continue
+            if arm.control.kind == "qpos":
                 setpoint = pack_streamed(
                     arm.control, {"q_d": q_d[side], "dq_d": np.zeros_like(q_d[side])}
                 )
                 self.brain.command(side, setpoint)
+            self.brain.command_gripper(side, gripper[side])
 
         observation = self.brain.observe()
         frame = self.frames.build(observation, q_d, gripper)
@@ -247,34 +265,47 @@ class CollectionNode(ProcessNode):
             self.task.state_signals, video=self.recording.video,
         )
         registry = StreamRegistry(self.runtime.runtime_dir, self.run_id)
-        factr = FactrClient.from_config(self.factr_cfg, sim=self.runtime.sim)
-        # Launch-time teleop preflight: every configured FACTR leader must respond
-        # before we start recording. A missing leader would otherwise be silently
-        # tolerated (the loop holds stale/zero actions), so fail fast with a clear
-        # error — it propagates as a non-zero exit and the dashboard surfaces it as an
-        # error popup. Cameras + arm proprio get the same fail-fast treatment for free
-        # via brain.attach() below (a stream that never publishes → TimeoutError).
-        try:
-            factr.preflight()
-        except FactrError:
-            factr.close()
-            raise
-        brain = Brain(
-            registry, builder.stream_names, self.brain_cfg.attach_timeout_s, factr=factr
-        )
+        # Subscribe the factr/<side> leader streams alongside proprio + cameras:
+        # the loop reads the SAME samples the dashboard renders (one source of
+        # truth). The brain stays a generic stream consumer — FACTR semantics
+        # (names, freshness) come from the factr helpers.
+        subscribe = builder.stream_names + [
+            n for n in leader_stream_names(self.factr_cfg)
+            if n not in builder.stream_names
+        ]
+        brain = Brain(registry, subscribe, self.brain_cfg.attach_timeout_s)
         try:
             brain.attach(stop_event=stop_event)
         except AttachAborted:
             log.info("collection attach aborted by shutdown")
             brain.close()
             return
+        # Launch-time teleop preflight: every configured leader must be streaming
+        # fresh data before we start recording (the producer publishes its streams
+        # immediately, so the attach above proves existence, not data). A missing
+        # leader would otherwise be silently tolerated (the loop records zero
+        # actions and commands nothing), so fail fast with a clear error — it
+        # propagates as a non-zero exit and the dashboard surfaces it as an error
+        # popup. Cameras + arm proprio get the same treatment via brain.attach().
+        try:
+            wait_leaders_fresh(
+                brain, self.factr_cfg, self.brain_cfg.attach_timeout_s,
+                stop_event=stop_event,
+            )
+        except FactrError:
+            brain.close()
+            raise
 
         control_registry = StreamRegistry(
             self.runtime.runtime_dir, self.run_id, sub="control"
         )
-        specs_by_side = {
-            side: control_specs(side, self.arms[side].control) for side in command_sides
-        }
+        specs_by_side = {}
+        for side in command_sides:
+            arm = self.arms[side]
+            specs = control_specs(side, arm.control)
+            if arm.gripper.enabled:
+                specs[GRIPPER] = gripper_spec(side, arm.control.channel)
+            specs_by_side[side] = specs
         brain.open_control(control_registry, specs_by_side)
         command_arms = {side: self.arms[side] for side in command_sides}
         conventions = {side: self.arms[side].convention for side in record_sides}
@@ -288,6 +319,7 @@ class CollectionNode(ProcessNode):
                 events = keys.poll if (keys.active and self.recording.keyboard) else None
                 loop = CollectionLoop(
                     brain, builder, recorder, command_arms, conventions,
+                    leaders=lambda: fresh_leader_positions(brain, self.factr_cfg),
                     frequency_hz=self.cfg.frequency_hz,
                     num_episodes=self.cfg.num_episodes,
                     events=events,

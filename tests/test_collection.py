@@ -171,6 +171,7 @@ class _FakeBrain:
         self._cfg = cfg
         self._builder = builder
         self.commands = []
+        self.gripper_commands = []
 
     def factr_joint_positions(self):
         return {"left": np.linspace(0.1, 0.8, 8)}
@@ -180,6 +181,9 @@ class _FakeBrain:
 
     def command(self, side, setpoint):
         self.commands.append((side, np.asarray(setpoint)))
+
+    def command_gripper(self, side, value):
+        self.gripper_commands.append((side, float(value)))
 
 
 class _FakeRecorder:
@@ -223,11 +227,12 @@ class _StopAfter:
         self._forced = True
 
 
-def _loop(cfg, brain, recorder, events=None, num_episodes=1):
+def _loop(cfg, brain, recorder, events=None, num_episodes=1, leaders=None):
     return CollectionLoop(
         brain, brain._builder, recorder,
         command_arms={"left": cfg.arms["left"]},
         conventions={"left": cfg.arms["left"].convention},
+        leaders=leaders if leaders is not None else brain.factr_joint_positions,
         frequency_hz=1000.0, num_episodes=num_episodes, events=events,
     )
 
@@ -248,6 +253,21 @@ def test_loop_commands_arm_and_records_and_saves_on_stop():
     assert rec.finalized
 
 
+def test_loop_posts_gripper_command_from_leader():
+    """Each tick posts the leader's normalized gripper on the gripper mailbox, so the
+    follower's gripper tracks the leader alongside the joint setpoints."""
+    cfg = _config()
+    b = _builder(cfg)
+    brain = _FakeBrain(cfg, b)
+    rec = _FakeRecorder()
+    loop = _loop(cfg, brain, rec)
+    loop.run(_StopAfter(3))
+    # leader sample is linspace(0.1, 0.8, 8): trailing gripper raw = 0.8, passed
+    # through unchanged by an uncalibrated convention.
+    assert brain.gripper_commands and brain.gripper_commands[0][0] == "left"
+    assert brain.gripper_commands[0][1] == pytest.approx(0.8)
+
+
 def test_loop_saves_and_discards_on_keyboard_events():
     cfg = _config()
     b = _builder(cfg)
@@ -263,6 +283,45 @@ def test_loop_saves_and_discards_on_keyboard_events():
     # also dropped (operator-paced runs never half-save on stop) -> 2 discards.
     assert rec.discarded == 2
     assert rec.finalized
+
+
+def test_loop_never_commands_before_first_real_leader_sample():
+    """A side with no leader data yet is recorded (zeros fill) but NEVER commanded:
+    a fabricated all-zeros q_d is the straight-up home pose — the arm must stay
+    parked in its first-setpoint wait until real teleop data arrives."""
+    cfg = _config()
+    b = _builder(cfg)
+    brain = _FakeBrain(cfg, b)
+    rec = _FakeRecorder()
+    loop = _loop(cfg, brain, rec, leaders=lambda: {})  # leaders never fresh
+    loop.run(_StopAfter(5))
+    assert brain.commands == []          # no setpoint ever posted
+    assert brain.gripper_commands == []  # no gripper target either
+    assert rec.frames >= 5               # frames still record (zero-filled action)
+
+
+def test_loop_holds_last_real_target_through_a_dropout():
+    """After real leader data has flowed, a dropout holds the last REAL target
+    (commands keep riding it) instead of stalling or fabricating."""
+    cfg = _config()
+    b = _builder(cfg)
+    brain = _FakeBrain(cfg, b)
+    rec = _FakeRecorder()
+    reads = {"n": 0}
+
+    def flaky_leaders():
+        reads["n"] += 1
+        # One real sample, then a dropout for the rest of the run.
+        if reads["n"] == 1:
+            return {"left": np.linspace(0.1, 0.8, 8)}
+        return {}
+
+    loop = _loop(cfg, brain, rec, leaders=flaky_leaders)
+    loop.run(_StopAfter(4))
+    assert len(brain.commands) >= 2  # kept commanding through the dropout
+    held = brain.commands[0][1]
+    for _, setpoint in brain.commands[1:]:
+        np.testing.assert_allclose(setpoint, held)  # the held target, unchanged
 
 
 def test_loop_stops_after_target_episode_count():

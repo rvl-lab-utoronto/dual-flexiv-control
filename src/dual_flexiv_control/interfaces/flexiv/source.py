@@ -88,6 +88,17 @@ class FlexivSource:
         self._robot = None
         #: Integrated target for velocity kinds (q_d for qvel, pose_d for eef_vel).
         self._control_target = None
+        #: Gripper handle + cached mapping, set up lazily by :meth:`setup_gripper`
+        #: when a control session actually carries a gripper channel (teleop).
+        self._gripper = None
+        self._gripper_open_w: float = 0.0     # width [m] at normalized 0 (fully open)
+        self._gripper_closed_w: float = 0.0   # width [m] at normalized 1 (fully closed)
+        self._gripper_vel: float = 0.0        # Move velocity [m/s] (clamped to params)
+        self._gripper_force: float = 0.0      # Move force [N] (clamped to params)
+        self._gripper_min_period_ns: int = 0  # throttle: 1 / move_rate_hz
+        self._gripper_deadband: float = 0.0   # min normalized change to re-send
+        self._gripper_last_val: float | None = None   # last commanded normalized value
+        self._gripper_last_send_ns: int = 0
 
     def open(self) -> None:
         import flexivrdk  # imported in the child process only
@@ -332,9 +343,118 @@ class FlexivSource:
                 float(coeffs.max_linear_acc), float(coeffs.max_angular_acc),
             )
 
+    # -- gripper (optional; teleoperated from the leader trigger) --------------
+    #
+    # flexivrdk 1.8 Gripper (verified against the installed wheel): Gripper(robot),
+    # Enable(name), Init() (homing), Move(width_m, velocity_m_s, force_N), Stop(),
+    # params() -> GripperParams(min/max width|vel|force, name), states() ->
+    # GripperStates(width, force, is_moving). One gripper per robot connection.
+
+    @property
+    def gripper_ready(self) -> bool:
+        return self._gripper is not None
+
+    def setup_gripper(self, cfg) -> bool:
+        """Enable + (optionally) home the gripper once, and cache the width mapping.
+
+        Idempotent: a second call while already set up is a no-op (returns True). A
+        disabled gripper or an empty ``cfg.name`` leaves the gripper untouched and
+        returns False (logged once) — actuation then stays off for the session.
+        ``cfg`` is the arm's :class:`~dual_flexiv_control.configs.GripperCfg`.
+        Blocking (``Init`` homes the gripper), so the caller runs it during the
+        control bootstrap, not inside the hot loop.
+        """
+        import flexivrdk
+
+        if self._gripper is not None:
+            return True
+        if not cfg.enabled or not cfg.name:
+            log.warning(
+                "%s: gripper channel present but %s — not actuating the gripper",
+                self.serial,
+                "gripper.enabled=false" if not cfg.enabled else "gripper.name is empty",
+            )
+            return False
+        # Enable/Init/params talk to the gripper device: a wrong `name` (or an
+        # unconfigured / faulted gripper) raises here. Degrade to "gripper off" and
+        # keep the arm running rather than crashing the control session over it.
+        try:
+            gripper = flexivrdk.Gripper(self._robot)
+            log.info("%s: enabling gripper %r", self.serial, cfg.name)
+            gripper.Enable(cfg.name)
+            if cfg.init_on_start:
+                log.info("%s: initializing (homing) gripper %r", self.serial, cfg.name)
+                gripper.Init()
+            params = gripper.params()
+        except Exception as exc:  # noqa: BLE001 - a bad gripper must not stop the arm
+            log.error(
+                "%s: gripper %r setup failed (%s); not actuating the gripper. Check "
+                "gripper.name matches the device configured in Flexiv Elements Studio.",
+                self.serial, cfg.name, exc,
+            )
+            return False
+        # Physical widths mapped from normalized 0 (open) / 1 (closed): the gripper's
+        # own reported travel by default, overridable per rig.
+        self._gripper_open_w = (
+            float(cfg.open_width) if cfg.open_width is not None else float(params.max_width)
+        )
+        self._gripper_closed_w = (
+            float(cfg.closed_width) if cfg.closed_width is not None else float(params.min_width)
+        )
+        # Clamp the requested Move velocity/force into the gripper's valid range.
+        self._gripper_vel = float(np.clip(cfg.velocity, params.min_vel, params.max_vel))
+        self._gripper_force = float(np.clip(cfg.force, params.min_force, params.max_force))
+        self._gripper_min_period_ns = int(1e9 / max(1e-3, cfg.move_rate_hz))
+        self._gripper_deadband = float(cfg.deadband)
+        self._gripper_last_val = None
+        self._gripper_last_send_ns = 0
+        self._gripper = gripper
+        log.info(
+            "%s: gripper ready (open=%.4f m, closed=%.4f m, vel=%.3f m/s, force=%.1f N)",
+            self.serial, self._gripper_open_w, self._gripper_closed_w,
+            self._gripper_vel, self._gripper_force,
+        )
+        return True
+
+    def send_gripper(self, value: float, now_ns: int | None = None) -> None:
+        """Drive the gripper toward normalized ``value`` (0=open, 1=closed).
+
+        No-op until :meth:`setup_gripper` has run. Throttled to ``move_rate_hz`` and
+        gated by ``deadband`` (against the last *sent* value) so the loop's high tick
+        rate doesn't flood the gripper with ``Move`` commands or dither it.
+        """
+        if self._gripper is None:
+            return
+        value = float(np.clip(value, 0.0, 1.0))
+        now_ns = time.monotonic_ns() if now_ns is None else now_ns
+        if self._gripper_last_val is not None:
+            # After the first command: throttle to move_rate_hz and ignore sub-deadband
+            # jitter. The very first command always sends, so the gripper snaps to the
+            # leader's current position at session start regardless of timing.
+            if now_ns - self._gripper_last_send_ns < self._gripper_min_period_ns:
+                return  # never exceed move_rate_hz
+            if abs(value - self._gripper_last_val) < self._gripper_deadband:
+                return  # no meaningful change since the last command
+        width = self._gripper_open_w + value * (self._gripper_closed_w - self._gripper_open_w)
+        self._gripper.Move(float(width), self._gripper_vel, self._gripper_force)
+        self._gripper_last_val = value
+        self._gripper_last_send_ns = now_ns
+
+    def stop_gripper(self) -> None:
+        """Best-effort ``Stop`` of the gripper (teardown); never raises."""
+        if self._gripper is None:
+            return
+        try:
+            self._gripper.Stop()
+        except Exception:  # noqa: BLE001 - teardown must not raise
+            log.exception("%s: error stopping gripper", self.serial)
+        self._gripper = None
+        self._gripper_last_val = None
+
     def close(self) -> None:
         # We never took control, so there is nothing to stop. Drop the handle;
         # the RDK client shuts down its services when garbage collected.
+        self.stop_gripper()
         self._robot = None
         self._control_target = None
 
@@ -355,6 +475,9 @@ class FakeFlexivSource:
         self._tracked_pose = None
         self._control_target = None
         self.last_command = None   # introspection hook for tests
+        #: Gripper sim state (no hardware): whether setup ran + last normalized value.
+        self._gripper_ready = False
+        self.last_gripper: float | None = None   # introspection hook for tests
 
     def open(self) -> None:
         self._t0 = time.monotonic()
@@ -449,6 +572,27 @@ class FakeFlexivSource:
         # force: pose tracks the motion target if present
         elif "pose_d" in fields:
             self._tracked_pose = np.asarray(fields["pose_d"], dtype=np.float64).copy()
+
+    # -- gripper (no hardware; mirrors FlexivSource's contract) ---------------
+
+    @property
+    def gripper_ready(self) -> bool:
+        return self._gripper_ready
+
+    def setup_gripper(self, cfg) -> bool:
+        """Mark the sim gripper ready when enabled + named (no hardware/homing)."""
+        if not cfg.enabled or not cfg.name:
+            return False
+        self._gripper_ready = True
+        return True
+
+    def send_gripper(self, value: float, now_ns: int | None = None) -> None:
+        """Record the latest normalized gripper target (clamped) for introspection."""
+        if self._gripper_ready:
+            self.last_gripper = float(np.clip(value, 0.0, 1.0))
+
+    def stop_gripper(self) -> None:
+        self._gripper_ready = False
 
     def close(self) -> None:
         pass

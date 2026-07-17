@@ -13,8 +13,10 @@ A control-enabled arm is an **idle ↔ control state machine**:
 * **IDLE** — connected read-only, publishing telemetry + status at ``arm.rate_hz``;
   no control action of any kind (the session's VIEWING mode).
 * **CONTROL** — entered on an :class:`EnterControl` message (which carries the
-  active phase's coefficients): attach the brain's channels, enable servos,
-  bootstrap to the first setpoint, then run the merged telemetry+control loop at
+  active phase's coefficients): enable servos (eagerly, overlapping the
+  consumer's own startup — ``arm.control_eager_enable`` reverts to enabling
+  after the channels attach), attach the brain's channels, bootstrap to the
+  first setpoint, then run the merged telemetry+control loop at
   ``arm.control_rate_hz``. *Every* exit (STOP command, deadman, fault, safety
   halt, aborted bootstrap) routes through ``robot.Stop()`` back to IDLE — the
   connection and the published streams survive across control sessions.
@@ -45,6 +47,7 @@ from ...control import CommandCursor
 from ...control import CommandKind
 from ...control import ControlCommand
 from ...control import control_channel_name
+from ...control import gripper_channel_name
 from ...control import slice_streamed
 from ...process import RateLimiter
 from ...process import StreamProducerNode
@@ -301,8 +304,19 @@ class FlexivInterface(StreamProducerNode):
         ch = ctrl.channel
         sp_reader: StreamReader | None = None
         cmd_cursor: CommandCursor | None = None
+        grip_reader: StreamReader | None = None
         self._control_active = True
         try:
+            # 0. Eager servo-on (config-gated): Enable/brake release takes seconds
+            #    and needs nothing from the brain, so start it BEFORE waiting on
+            #    the channels — it overlaps the consumer's spawn + imports + attach
+            #    instead of serializing after them. Every failure past this point
+            #    still routes through the finally's robot.Stop() → IDLE. Tradeoff:
+            #    a consumer that dies before publishing its channels leaves the
+            #    arm enabled-but-idle for the attach timeout (motion-safe).
+            if self.arm.control_eager_enable:
+                self._source.enter_control()
+
             # 1. Wait for the brain's control channels and attach (consumer). The
             #    brain publishes these only after it has attached our telemetry, so
             #    telemetry being published first is what prevents a deadlock.
@@ -313,13 +327,33 @@ class FlexivInterface(StreamProducerNode):
             cmd_name = control_channel_name(self.side, COMMAND)
             sp_reader = StreamReader.attach(entries[sp_name])
             cmd_cursor = CommandCursor(StreamReader.attach(entries[cmd_name]))
+            # Optional gripper mailbox: attach it if this arm has a gripper AND the
+            # brain published the channel for this session (teleop does; a policy
+            # eval run does not). The brain creates it *before* setpoint/command, so
+            # by now it is registered if it exists at all — a single lookup suffices.
+            if self.arm.gripper.enabled:
+                grip_entry = control_reg.get(gripper_channel_name(self.side))
+                if grip_entry is not None:
+                    grip_reader = StreamReader.attach(grip_entry)
+                else:
+                    log.info(
+                        "[%s] gripper enabled but no gripper channel this session "
+                        "(non-teleop run?); gripper not actuated", self.name,
+                    )
 
-            # 2. Enable servos, wait for the first setpoint, then bootstrap + switch.
-            #    A STOP on the command channel (distinct from stop_event) must abort
-            #    even during the blocking bootstrap, so both the first-setpoint wait
-            #    and the MoveJ poll drain commands via this predicate.
-            self._source.enter_control()
-            abort = lambda: stop_event.is_set() or self._drain_commands(cmd_cursor)  # noqa: E731
+            # 2. Enable servos (unless already eagerly enabled above), wait for the
+            #    first setpoint, then bootstrap + switch. A STOP on the command
+            #    channel (distinct from stop_event) must abort even during the
+            #    blocking bootstrap, so both the first-setpoint wait and the MoveJ
+            #    poll drain commands via this predicate — which also ticks
+            #    telemetry, keeping status/proprio fresh (dashboard + the session
+            #    supervisor's freshness watchdog) through the multi-second MoveJ.
+            if not self.arm.control_eager_enable:
+                self._source.enter_control()
+
+            def abort() -> bool:
+                self._write_telemetry(time.monotonic_ns())
+                return stop_event.is_set() or self._drain_commands(cmd_cursor)
             first = self._await_first_setpoint(sp_reader, stop_event, cmd_cursor)
             if first is None:
                 return
@@ -329,9 +363,16 @@ class FlexivInterface(StreamProducerNode):
             ):
                 log.info("[%s] control bootstrap aborted before start", self.name)
                 return
+            # Enable + home the gripper once, now (blocking is fine during bootstrap,
+            # not inside the loop). If setup fails/declines, drop the reader so the
+            # loop skips gripper work entirely.
+            if grip_reader is not None and not self._source.setup_gripper(self.arm.gripper):
+                grip_reader.close()
+                grip_reader = None
             log.info(
-                "[%s] control loop started (kind=%s @ %.0f Hz)",
+                "[%s] control loop started (kind=%s @ %.0f Hz, gripper=%s)",
                 self.name, ctrl.kind, self.arm.control_rate_hz,
+                "on" if grip_reader is not None else "off",
             )
 
             # 3. The merged loop: publish telemetry, watch faults/commands, track the
@@ -387,15 +428,32 @@ class FlexivInterface(StreamProducerNode):
                 except SafetyHalt as exc:
                     log.error("[%s] %s; halting", self.name, exc)
                     break
+
+                # (f) gripper: track the leader's latest normalized target (its own
+                #     latest-wins mailbox). Self-throttled/deadbanded in send_gripper,
+                #     so calling it every tick is cheap. Only alongside live actuation
+                #     — a stale/held joint setpoint already `continue`d above. A gripper
+                #     fault disables the gripper for the session but never stops the arm.
+                if grip_reader is not None:
+                    g = grip_reader.latest()
+                    if g.n:
+                        try:
+                            self._source.send_gripper(float(g.newest[0]), t_ns)
+                        except Exception:  # noqa: BLE001 - gripper is non-critical to arm motion
+                            log.exception("[%s] gripper command failed; disabling for session", self.name)
+                            self._source.stop_gripper()
+                            grip_reader.close()
+                            grip_reader = None
                 rate.sleep()
         finally:
             self._control_active = False
             try:
                 if self._source is not None:
+                    self._source.stop_gripper()  # best-effort; never raises
                     self._source.stop()  # blocking stop -> IDLE; connection retained
             except Exception:  # noqa: BLE001 - teardown must not raise
                 log.exception("[%s] error stopping robot", self.name)
-            for reader in (sp_reader, cmd_cursor):
+            for reader in (sp_reader, cmd_cursor, grip_reader):
                 if reader is not None:
                     try:
                         reader.close()  # readers never unlink (the brain owns the segments)

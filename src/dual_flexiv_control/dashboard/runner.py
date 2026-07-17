@@ -8,11 +8,11 @@ VIEWING ↔ COLLECTION ↔ EVAL state machine. This module is the glue:
 * :class:`RunRegistry` — the UI-facing facade: launch/stop are JSON commands to
   the daemon; run state, outcomes, and alerts come from its ``session.json``.
 * :class:`SessionMirror` — ONE persistent background thread that mirrors the live
-  shared-memory streams (arm proprio, FACTR leaders, the 3D robot scene, eval
-  horizon ghosts) into the metrics Rerun recording, in every mode. In VIEWING the
-  streams are published by the idle (read-only) arms, so the viewer is live
-  *before* any run starts. It never opens a robot connection — shared memory and
-  the FACTR HTTP endpoint only.
+  shared-memory streams (arm proprio, ``factr/<side>`` leaders, the 3D robot
+  scene, eval horizon ghosts) into the metrics Rerun recording, in every mode. In
+  VIEWING the streams are published by the idle (read-only) arms and the FACTR
+  producer, so the viewer is live *before* any run starts. It never opens a robot
+  or HTTP connection — shared memory only.
 
 A run is **one episode** (collection = one teleop demo, eval = one policy
 rollout); launch one at a time, matching the single bimanual rig. Stopping is
@@ -42,7 +42,7 @@ log = logging.getLogger(__name__)
 
 PHASES = ("collection", "eval", "skill")
 
-#: Mirror loop rate (matches the recording rate; FACTR is polled per tick).
+#: Mirror loop rate (matches the recording rate; leader streams read per tick).
 _MIRROR_HZ = 15.0
 #: Trailing daemon-log lines surfaced in the UI when a run errors out.
 _ERROR_TAIL_LINES = 25
@@ -183,13 +183,17 @@ class RunRegistry:
 
     # -- launch / stop ---------------------------------------------------------------
 
-    def _check_launchable(self, rig: str) -> None:
-        """Raise a ``RuntimeError`` describing why nothing can launch right now."""
+    def _check_launchable(self, rig: str, switching: bool = False) -> None:
+        """Raise a ``RuntimeError`` describing why nothing can launch right now.
+
+        ``switching`` skips only the run-active refusal: an atomic switch stops
+        the current run itself (daemon-side), so an active run is expected.
+        """
         view = self.manager.view()
-        if view.run_active:
+        if view.run_active and not switching:
             raise RuntimeError(
                 "a run is still active (recording or saving its episode) — stop it "
-                "and wait for it to finish first"
+                "and wait for it to finish first (or switch, which does both)"
             )
         if view.state == "down":
             raise RuntimeError(
@@ -207,6 +211,7 @@ class RunRegistry:
     def launch(
         self, task: TaskInfo, phase: str, rig: str = "bimanual",
         policy: str | None = None, host: str | None = None, port: int | None = None,
+        switch: bool = False,
     ) -> None:
         """Ask the daemon to start ``phase`` for ``task``; raises on a refusal.
 
@@ -216,12 +221,15 @@ class RunRegistry:
         session needs a restart (surfaced, not silently absorbed). ``policy`` /
         ``host`` / ``port`` (eval only) override the ``policy`` group selection
         and ``policy.host`` / ``policy.port`` for this run; None keeps the
-        task's policy config.
+        task's policy config. ``switch`` sends an atomic switch instead: the
+        daemon stops any active run (its episode saves) and starts this one the
+        moment the session is idle.
         """
         if phase not in PHASES:
             raise ValueError(f"unknown phase {phase!r} (expected one of {PHASES})")
-        self._check_launchable(rig)
-        if not self.manager.start_run(phase, task.name, policy=policy, host=host, port=port):
+        self._check_launchable(rig, switching=switch)
+        send = self.manager.switch_run if switch else self.manager.start_run
+        if not send(phase, task.name, policy=policy, host=host, port=port):
             raise RuntimeError("could not reach the session daemon — see the Logs tab")
         detail = ""
         if policy is not None or host is not None or port is not None:
@@ -229,7 +237,8 @@ class RunRegistry:
                 f" · policy {policy or 'config-type'}"
                 f" @ {host or 'config-host'}:{port or 'config-port'}"
             )
-        _log_event(f"launch {phase} · task={task.name} · rig={rig}{detail}")
+        verb = "switch to" if switch else "launch"
+        _log_event(f"{verb} {phase} · task={task.name} · rig={rig}{detail}")
 
     def launch_skill(self, skill: str, rig: str) -> None:
         """Ask the daemon to repeat a taught skill; raises on a refusal.
@@ -247,6 +256,20 @@ class RunRegistry:
         """Ask the daemon to stop the active run (non-blocking; episode saves)."""
         if self.manager.stop_run():
             _log_event("stop requested — saving episode…")
+
+    def reconnect_arm(self, side: str) -> bool:
+        """Ask the daemon to replace one arm node now (fresh RDK connection)."""
+        ok = self.manager.reconnect_arm(side)
+        if ok:
+            _log_event(f"reconnect requested for arm {side}")
+        return ok
+
+    def respawn_camera(self, name: str) -> bool:
+        """Ask the daemon to replace one camera node now (skip the retry pacing)."""
+        ok = self.manager.respawn_camera(name)
+        if ok:
+            _log_event(f"respawn requested for camera {name}")
+        return ok
 
     def reset(self) -> None:
         """Stop any active run and clear the history — a clean slate."""
@@ -428,51 +451,43 @@ def _last_heartbeat(path: str | None) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def _open_factr_client():
-    """Build the FACTR leader client from config, or ``None`` if unavailable.
-
-    Honours ``runtime.sim`` (the client fabricates leader positions offline). Any
-    failure here (missing config, import error, no servers) disables leader
-    logging without disturbing the follower proprio stream.
-    """
-    from ..interfaces.factr.client import FactrClient
-    from .arms import discover_factr
-    from .arms import runtime_is_sim
+def _factr_leader_sides() -> list[str]:
+    """The configured leader sides, or empty if no FACTR config composes."""
+    from .arms import configured_leader_sides
 
     try:
-        client = FactrClient.from_config(discover_factr(), sim=runtime_is_sim())
+        return configured_leader_sides()
     except Exception as exc:  # noqa: BLE001 - no/invalid FACTR config -> skip leaders
         _log_event(f"FACTR leaders unavailable: {exc}")
-        return None
-    return client if client.sides else None
+        return []
 
 
-def _log_factr_leaders(client, errored: set[str]) -> dict:
-    """Query each configured leader, log arm joints (``q``) + gripper (``grip``), return raw samples.
+def _log_factr_leaders(sides: list[str], errored: set[str]) -> dict:
+    """Read each leader's ``factr/<side>`` stream; log joints (``q``) + gripper (``grip``).
 
-    Per-side error tolerant: an unreachable leader (e.g. the right arm before it
-    is plugged in / served) is logged once and skipped, leaving its row empty; it
-    is picked back up automatically once it starts responding. The server returns
-    a flat ``DoF+1`` ``joint_pos`` — arm joints then a trailing gripper scalar.
+    The SAME shared-memory samples the control loop converts into setpoints (one
+    source of truth — the viewer can never show leader motion control isn't
+    seeing). Per-side tolerant: a stale/absent stream (leader server down, or no
+    running producer) is logged once and skipped, leaving its row empty; it is
+    picked back up automatically once fresh samples flow again. Each sample is a
+    flat ``DoF+1`` vector — arm joints then a trailing gripper scalar.
 
-    Returns ``{side: joint_pos}`` for every leader that responded this tick, so the
-    caller can reuse the samples (e.g. to render the commanded-teleop ghost) without
-    a second HTTP round-trip.
+    Returns ``{side: joint_pos}`` for every fresh leader this tick, so the caller
+    can reuse the samples (e.g. to render the commanded-teleop ghost).
     """
-    from ..interfaces.factr.client import FactrError
+    from .arms import read_live_leader
 
     fetched: dict = {}
-    for side in client.sides:
-        try:
-            jp = client.get_joint_positions_for(side)
-        except FactrError as exc:
+    for side in sides:
+        jp = read_live_leader(side)
+        if jp is None or jp.size == 0:
             if side not in errored:
                 errored.add(side)
-                _log_event(f"FACTR {side} leader not reachable: {exc}")
+                _log_event(f"FACTR {side} leader not streaming (server down or stale)")
             continue
         if side in errored:
             errored.discard(side)
-            _log_event(f"FACTR {side} leader reconnected")
+            _log_event(f"FACTR {side} leader streaming again")
         fetched[side] = jp
         arm = jp[:-1] if jp.shape[0] > 1 else jp
         rr.log(blueprints.factr_path("q", side), rr.Scalars(arm.tolist()))
@@ -519,9 +534,20 @@ _VIEW_STREAMS = (
 def _layout_key(view: SessionView) -> tuple:
     """What determines the viewer layout: the mode family + the active task.
 
-    ``saving`` keeps its run's layout (``view.phase`` stays set); ``down`` and
-    ``starting`` share the welcome screen.
+    A queued switch (``view.pending``) jumps straight to the TARGET phase's
+    layout, so the whole transition (stopping → saving → idle gap → new run)
+    flips the viewer exactly once — the session passes through ``viewing`` for
+    a second or two between the runs, and keying on the raw state would flash
+    the viewing layout in the middle. ``saving`` keeps its run's layout
+    (``view.phase`` stays set); ``down`` and ``starting`` share the welcome
+    screen.
     """
+    if view.pending:
+        phase = view.pending.get("phase") or "collection"
+        label = (
+            view.pending.get("skill") if phase == "skill" else view.pending.get("task")
+        )
+        return (phase, label)
     if view.state in RUN_STATES:
         return (view.phase or "collection", view.task)
     if view.state == "viewing":
@@ -536,21 +562,27 @@ def _send_layout(view: SessionView) -> None:
         log_welcome()
         return
     rr.send_blueprint(blueprints.for_phase(kind, task))
-    _log_mode_readme(view.state, task)
+    # While a switch is pending the README follows the target layout too — the
+    # transient saving/viewing states mid-switch would otherwise caption the
+    # new mode's layout with the old mode's text.
+    _log_mode_readme(kind if view.pending else view.state, task)
 
 
 class SessionMirror:
     """One background thread mirroring the live system into the metrics viewer.
 
-    All real data, read-only: arm proprio + status from shared memory (published
-    by the session's idle or controlling arms), FACTR leaders over HTTP, the 3D
-    robot scene (solid = measured ``<side>/q``, translucent = commanded-teleop
-    ghost, purple = eval horizon prediction from ``eval/<side>/q_horizon`` — a
-    posed ghost — or ``eval/<side>/eef_horizon`` — a predicted-EEF trace). A stream
-    nobody publishes leaves its row empty and its arm still — the viewer never
-    shows motion the system isn't making. It also switches the viewer layout +
-    README whenever the session's mode changes, so VIEWING/COLLECTION/EVAL each
-    get their blueprint without any per-run emitter threads.
+    All real data, read-only, all from shared memory: arm proprio + status
+    (published by the session's idle or controlling arms), FACTR leaders from
+    their ``factr/<side>`` streams (the SAME samples the control loop converts
+    into setpoints — the ghost always shows exactly what teleop would command),
+    the 3D robot scene (solid = measured ``<side>/q``, translucent =
+    commanded-teleop ghost, purple = eval horizon prediction from
+    ``eval/<side>/q_horizon`` — a posed ghost — or ``eval/<side>/eef_horizon`` —
+    a predicted-EEF trace). A stream nobody publishes leaves its row empty and
+    its arm still — the viewer never shows motion the system isn't making. It
+    also switches the viewer layout + README whenever the session's mode
+    changes, so VIEWING/COLLECTION/EVAL each get their blueprint without any
+    per-run emitter threads.
     """
 
     def __init__(self, manager: SessionManager) -> None:
@@ -599,7 +631,7 @@ class SessionMirror:
         dt = 1.0 / _MIRROR_HZ
         _style_eef_pos_series(blueprints.SIDES)
         _style_policy_comm_series()
-        factr_client = _open_factr_client()
+        factr_sides = _factr_leader_sides()
         factr_errored: set[str] = set()
         conventions = discover_conventions()
         robot_rec = robot_view.robot_recording()
@@ -661,7 +693,7 @@ class SessionMirror:
                 _log_policy_comm(comm_state, t0_ns, t)
 
             leader_samples = (
-                _log_factr_leaders(factr_client, factr_errored) if factr_client is not None else {}
+                _log_factr_leaders(factr_sides, factr_errored) if factr_sides else {}
             )
             if robot_rec is not None:
                 real_q = dict(live_q)
@@ -687,5 +719,3 @@ class SessionMirror:
                     tick_s, dt, _MIRROR_HZ,
                 )
             stop.wait(max(0.0, dt - tick_s))
-        if factr_client is not None:
-            factr_client.close()

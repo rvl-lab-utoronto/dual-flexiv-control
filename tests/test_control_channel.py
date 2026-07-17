@@ -18,6 +18,8 @@ from dual_flexiv_control.control import CommandKind
 from dual_flexiv_control.control import ControlCommand
 from dual_flexiv_control.control import control_channel_name
 from dual_flexiv_control.control import control_specs
+from dual_flexiv_control.control import gripper_channel_name
+from dual_flexiv_control.control import gripper_spec
 from dual_flexiv_control.control import pack_streamed
 from dual_flexiv_control.control import setpoint_dim
 from dual_flexiv_control.control import slice_streamed
@@ -186,6 +188,139 @@ def test_normalize_gripper_handles_reversed_endpoints():
     assert normalize_gripper(1.0, conv) == pytest.approx(0.0)
     assert normalize_gripper(0.0, conv) == pytest.approx(1.0)
     assert normalize_gripper(0.5, conv) == pytest.approx(0.5)
+
+
+def test_gripper_spec_dim_and_name():
+    """The gripper mailbox is a latest-wins scalar, named cmd/<side>/gripper, and is
+    orthogonal to the joint control kind (adding it never widens the setpoint vector)."""
+    ctrl = _ctrl("qpos")
+    spec = gripper_spec("left", ctrl.channel)
+    assert spec.name == gripper_channel_name("left") == "cmd/left/gripper"
+    assert spec.dim == 1
+    assert spec.capacity == ctrl.channel.setpoint_capacity
+    assert setpoint_dim(ctrl) == 14  # gripper does NOT ride the joint setpoint vector
+
+
+def test_gripper_mailbox_round_trip_drives_fake_gripper(tmp_path):
+    """A normalized gripper target posted on the mailbox actuates the fake source."""
+    from dual_flexiv_control.configs import GripperCfg
+    from dual_flexiv_control.interfaces.flexiv import FakeFlexivSource
+
+    ctrl = _ctrl("qpos")
+    reg = StreamRegistry(tmp_path, "rid", sub="control")
+    spec = gripper_spec("left", ctrl.channel)
+    writer = StreamWriter.create(spec, "rid", reg)
+    try:
+        reader = StreamReader.attach(reg.get(spec.name))
+        src = FakeFlexivSource("sim", dof=7)
+        src.open()
+        assert src.setup_gripper(GripperCfg(enabled=True, name="G")) is True
+
+        writer.write(np.array([0.25], dtype=np.float64))
+        writer.write(np.array([0.80], dtype=np.float64))  # latest-wins
+        g = reader.latest()
+        src.send_gripper(float(g.newest[0]))
+        assert src.last_gripper == pytest.approx(0.80)
+        reader.close()
+    finally:
+        writer.close()
+        writer.unlink()
+
+
+def test_fake_source_gripper_setup_declines_when_disabled_or_unnamed():
+    from dual_flexiv_control.configs import GripperCfg
+    from dual_flexiv_control.interfaces.flexiv import FakeFlexivSource
+
+    src = FakeFlexivSource("sim", dof=7)
+    assert src.setup_gripper(GripperCfg(enabled=False, name="G")) is False
+    assert src.setup_gripper(GripperCfg(enabled=True, name="")) is False
+    assert src.gripper_ready is False
+    src.send_gripper(0.5)  # not ready -> ignored
+    assert src.last_gripper is None
+
+
+def test_flexiv_source_setup_gripper_reads_params_and_clamps():
+    """setup_gripper enables/homes once, maps widths from params(), clamps vel/force."""
+    pytest.importorskip("flexivrdk")
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    import flexivrdk
+
+    from dual_flexiv_control.configs import GripperCfg
+    from dual_flexiv_control.interfaces.flexiv.source import FlexivSource
+
+    params = SimpleNamespace(
+        min_width=0.01, max_width=0.11, min_vel=0.02, max_vel=0.15,
+        min_force=5.0, max_force=40.0, name="G",
+    )
+    handle = MagicMock()
+    handle.params.return_value = params
+    src = FlexivSource("sim", dof=7)
+    src._robot = MagicMock()
+    with patch.object(flexivrdk, "Gripper", return_value=handle) as GripperCls:
+        ok = src.setup_gripper(GripperCfg(enabled=True, name="G", velocity=999.0, force=1.0))
+        assert ok is True
+        assert src.setup_gripper(GripperCfg(enabled=True, name="G")) is True  # idempotent
+    GripperCls.assert_called_once_with(src._robot)
+    handle.Enable.assert_called_once_with("G")
+    handle.Init.assert_called_once()  # homed (init_on_start default True)
+    assert (src._gripper_open_w, src._gripper_closed_w) == (0.11, 0.01)  # open=max, closed=min
+    assert src._gripper_vel == pytest.approx(0.15)  # clamped down to max_vel
+    assert src._gripper_force == pytest.approx(5.0)  # clamped up to min_force
+
+
+def test_flexiv_source_setup_gripper_degrades_on_bad_name():
+    """A wrong/unconfigured gripper name must NOT crash the arm: Enable raising leaves
+    the gripper off (returns False, no handle, send_gripper a no-op)."""
+    pytest.importorskip("flexivrdk")
+    from unittest.mock import MagicMock, patch
+
+    import flexivrdk
+
+    from dual_flexiv_control.configs import GripperCfg
+    from dual_flexiv_control.interfaces.flexiv.source import FlexivSource
+
+    handle = MagicMock()
+    handle.Enable.side_effect = RuntimeError("no gripper named 'Bogus'")
+    src = FlexivSource("sim", dof=7)
+    src._robot = MagicMock()
+    with patch.object(flexivrdk, "Gripper", return_value=handle):
+        assert src.setup_gripper(GripperCfg(enabled=True, name="Bogus")) is False
+    assert src.gripper_ready is False
+    src.send_gripper(0.8)  # not set up -> no Move, no raise
+    handle.Move.assert_not_called()
+
+
+def test_flexiv_source_send_gripper_throttles_deadbands_and_maps():
+    """send_gripper: first send always goes; then throttled to move_rate_hz + deadbanded,
+    and the normalized value maps linearly open_w..closed_w (clipped to [0,1])."""
+    pytest.importorskip("flexivrdk")
+    from unittest.mock import MagicMock
+
+    from dual_flexiv_control.interfaces.flexiv.source import FlexivSource
+
+    src = FlexivSource("sim", dof=7)
+    handle = MagicMock()
+    src._gripper = handle
+    src._gripper_open_w, src._gripper_closed_w = 0.10, 0.00
+    src._gripper_vel, src._gripper_force = 0.05, 20.0
+    period = int(1e9 / 15)
+    src._gripper_min_period_ns = period
+    src._gripper_deadband = 0.02
+
+    src.send_gripper(0.0, now_ns=0)  # first send unconditional -> width = open
+    assert handle.Move.call_count == 1
+    assert handle.Move.call_args[0] == pytest.approx((0.10, 0.05, 20.0))
+    src.send_gripper(1.0, now_ns=1000)  # within min_period -> throttled
+    assert handle.Move.call_count == 1
+    src.send_gripper(0.005, now_ns=period + 1)  # change < deadband -> skipped
+    assert handle.Move.call_count == 1
+    src.send_gripper(1.0, now_ns=2 * period + 2)  # ok -> width = closed
+    assert handle.Move.call_count == 2
+    assert handle.Move.call_args[0][0] == pytest.approx(0.00)
+    src.send_gripper(9.0, now_ns=3 * period + 3)  # clips to 1.0 (still closed width)
+    assert handle.Move.call_args[0][0] == pytest.approx(0.00)
 
 
 def test_control_specs_names_and_dims():
