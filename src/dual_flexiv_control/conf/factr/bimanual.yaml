@@ -17,3 +17,15 @@ defaults:
 servers:
   left:  { host: localhost, port: 5001, endpoint: get_joint_positions_left,  request_timeout_s: 0.5, dof: 8 }
   right: { host: localhost, port: 5001, endpoint: get_joint_positions_right, request_timeout_s: 0.5, dof: 8 }
+
+# The session daemon launches/supervises the FACTR-Server processes themselves
+# (the grav-comp teleops + the API relay) from the dashboard's Teleop leaders
+# panel — replacing the FACTR-Server repo's "Launch EVERYTHING" VS Code task.
+# Launching stays user-initiated: the teleops energize the leader servos and
+# read a calibration pose at boot. Ignored under runtime.sim.
+launch:
+  enabled: true
+  workdir: ~/FACTR-Server/FACTR_Teleop
+  teleop_modules:
+    left: src.factr_teleop.factr_teleop.factr_rizon_teleop        # single-board
+    right: src.factr_teleop.factr_teleop.factr_rizon_dual_board   # both power boards

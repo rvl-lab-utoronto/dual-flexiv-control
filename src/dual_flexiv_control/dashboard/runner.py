@@ -271,6 +271,20 @@ class RunRegistry:
             _log_event(f"respawn requested for camera {name}")
         return ok
 
+    def start_factr_servers(self) -> bool:
+        """Ask the daemon to launch the FACTR-Server processes (countdown first)."""
+        ok = self.manager.start_factr()
+        if ok:
+            _log_event("FACTR server launch requested (pose the leaders now)")
+        return ok
+
+    def stop_factr_servers(self) -> bool:
+        """Ask the daemon to stop the FACTR-Server processes (leaders de-energize)."""
+        ok = self.manager.stop_factr()
+        if ok:
+            _log_event("FACTR server stop requested")
+        return ok
+
     def reset(self) -> None:
         """Stop any active run and clear the history — a clean slate."""
         view = self.manager.view()
