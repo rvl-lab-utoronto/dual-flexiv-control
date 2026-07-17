@@ -263,12 +263,16 @@ class FactrServerSupervisor:
             "countdown_ends_ts": (
                 self._countdown_ends_ts if self.state == COUNTDOWN else None
             ),
+            "countdown_total_s": float(max(0.0, self.cfg.calib_delay_s)),
             "units": {unit.name: self._unit_state(unit) for unit in self.units},
             "down": sorted(
                 unit.name for unit in self.units
                 if self.state == RUNNING and not unit.alive()
             ),
             "calib_pose": self.cfg.calib_pose,
+            # The daemon and dashboard share the filesystem: the panel tails
+            # these for the teleops' boot phase + servo health readouts.
+            "logs": {unit.name: unit.log_path for unit in self.units},
         }
 
     def _unit_state(self, unit: _ServerUnit) -> str:
