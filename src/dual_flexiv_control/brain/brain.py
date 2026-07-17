@@ -22,11 +22,14 @@ from ..control import CommandKind
 from ..control import ControlCommand
 from ..control import SETPOINT
 from ..control import COMMAND
+from ..control import GRIPPER
 from ..control import control_specs
 from ..control import convert_factr_to_rizon
+from ..control import gripper_spec
+from ..control import normalize_gripper
 from ..control import pack_streamed
-from ..interfaces.factr import FactrClient
-from ..interfaces.factr.client import FactrError
+from ..interfaces.factr import fresh_leader_positions
+from ..interfaces.factr import leader_stream_names
 from ..process import ProcessNode
 from ..process import RateLimiter
 from ..streams.registry import AttachAborted
@@ -42,7 +45,10 @@ def default_stream_names(arms) -> list[str]:
     """Every stream the brain observes by default: each arm's proprio signals.
 
     ``arms`` maps side -> ``ArmCfg`` (with ``.streams``); names follow the
-    ``"<side>/<signal>"`` paths. FACTR is queried on request, not streamed.
+    ``"<side>/<signal>"`` paths. Consumers that read the FACTR leaders append
+    the ``factr/<side>`` names themselves (see
+    :func:`~dual_flexiv_control.interfaces.factr.leader_stream_names`) — the
+    brain itself is a generic stream consumer with no FACTR knowledge.
     """
     names: list[str] = []
     for side, arm in arms.items():
@@ -58,18 +64,17 @@ class Brain:
         registry: StreamRegistry,
         stream_names: list[str],
         attach_timeout_s: float = 10.0,
-        factr: FactrClient | None = None,
     ) -> None:
         self._registry = registry
         self._stream_names = list(stream_names)
         self._attach_timeout_s = attach_timeout_s
         self._readers: dict[str, StreamReader] = {}
-        #: On-request FACTR client; query with :meth:`factr_joint_positions`.
-        self.factr = factr
         #: brain→arm control-channel writers (created in :meth:`open_control`). The
         #: brain OWNS these segments (inverse of telemetry) and unlinks them on close.
         self._setpoint_writers: dict[str, StreamWriter] = {}
         self._command_writers: dict[str, StreamWriter] = {}
+        #: optional per-side gripper mailbox writers (only for arms with a gripper).
+        self._gripper_writers: dict[str, StreamWriter] = {}
 
     def attach(self, stop_event=None) -> None:
         """Block until all subscribed streams exist, then attach read-only views.
@@ -104,27 +109,26 @@ class Brain:
         """Snapshot the last ``k`` samples of every subscribed stream."""
         return {name: reader.last(k) for name, reader in self._readers.items()}
 
-    def factr_joint_positions(self):
-        """Fetch the FACTR leaders' joint positions on request: ``{side: array}``.
-
-        Raises if no FACTR client was configured, or :class:`FactrError` if the
-        server is unreachable / returns a bad response.
-        """
-        if self.factr is None:
-            raise RuntimeError("brain has no FACTR client configured")
-        return self.factr.get_joint_positions()
-
     # -- control channel (brain -> arm) ---------------------------------------
 
     def open_control(self, control_registry: StreamRegistry, specs_by_side: dict) -> None:
-        """Create the setpoint + command writers for each controlled arm.
+        """Create the setpoint + command (+ optional gripper) writers per controlled arm.
 
-        ``specs_by_side`` maps ``side -> {SETPOINT: StreamSpec, COMMAND: StreamSpec}``
-        (from :func:`dual_flexiv_control.control.control_specs`). The arms publish
-        telemetry first and only then wait for these channels, so opening them here —
-        after the brain has attached telemetry — cannot deadlock.
+        ``specs_by_side`` maps ``side -> {SETPOINT: StreamSpec, COMMAND: StreamSpec,
+        [GRIPPER: StreamSpec]}`` (from :func:`dual_flexiv_control.control.control_specs`
+        plus, for gripper-enabled arms, :func:`~dual_flexiv_control.control.gripper_spec`).
+        The arms publish telemetry first and only then wait for these channels, so
+        opening them here — after the brain has attached telemetry — cannot deadlock.
+
+        The gripper mailbox (when present) is created *before* the setpoint/command
+        channels so that once the arm sees those two appear (its attach condition),
+        the gripper channel it optionally discovers is already registered — no race.
         """
         for side, specs in specs_by_side.items():
+            if GRIPPER in specs:
+                self._gripper_writers[side] = StreamWriter.create(
+                    specs[GRIPPER], control_registry.run_id, control_registry
+                )
             self._setpoint_writers[side] = StreamWriter.create(
                 specs[SETPOINT], control_registry.run_id, control_registry
             )
@@ -132,7 +136,10 @@ class Brain:
                 specs[COMMAND], control_registry.run_id, control_registry
             )
         if specs_by_side:
-            log.info("brain opened control channels for %s", list(specs_by_side))
+            log.info(
+                "brain opened control channels for %s (gripper: %s)",
+                list(specs_by_side), list(self._gripper_writers) or "none",
+            )
 
     def command(self, side: str, setpoint: np.ndarray) -> None:
         """Post a high-rate follower setpoint (latest-wins). No flexivrdk involved."""
@@ -142,6 +149,22 @@ class Brain:
         """Post a discrete, reliable control event (home/stop/switch-mode)."""
         writer = self._command_writers[side]
         writer.write(command.encode(writer.spec.dim))
+
+    def command_gripper(self, side: str, value: float) -> None:
+        """Post a normalized (0..1) gripper target for one arm (latest-wins).
+
+        No-op for an arm without a gripper channel (gripper disabled) — the caller
+        may post unconditionally. The arm maps the fraction to a physical width and
+        drives the gripper; see :class:`~dual_flexiv_control.configs.GripperCfg`.
+        """
+        writer = self._gripper_writers.get(side)
+        if writer is not None:
+            writer.write(np.array([float(value)], dtype=np.float64))
+
+    @property
+    def gripper_sides(self) -> list[str]:
+        """Controlled arms with an open gripper channel (posted by the teleop loop)."""
+        return list(self._gripper_writers)
 
     @property
     def controlled_sides(self) -> list[str]:
@@ -166,7 +189,7 @@ class Brain:
         for reader in self._readers.values():
             reader.close()
         self._readers.clear()
-        for writers in (self._setpoint_writers, self._command_writers):
+        for writers in (self._setpoint_writers, self._command_writers, self._gripper_writers):
             for writer in writers.values():
                 try:
                     writer.close()
@@ -174,8 +197,6 @@ class Brain:
                 except Exception:  # noqa: BLE001 - teardown must not raise
                     log.exception("error releasing control writer %s", writer.name)
             writers.clear()
-        if self.factr is not None:
-            self.factr.close()
 
 
 class BrainNode(ProcessNode):
@@ -204,8 +225,13 @@ class BrainNode(ProcessNode):
 
     def run(self, stop_event) -> None:
         registry = StreamRegistry(self.runtime.runtime_dir, self.run_id)
-        factr = FactrClient.from_config(self.factr_cfg, sim=self.runtime.sim)
-        brain = Brain(registry, self.stream_names, self.cfg.attach_timeout_s, factr=factr)
+        # Subscribe the leader streams alongside the given ones: the brain itself
+        # is a generic stream consumer; FACTR semantics stay in this node.
+        subscribe = list(self.stream_names) + [
+            n for n in leader_stream_names(self.factr_cfg)
+            if n not in self.stream_names
+        ]
+        brain = Brain(registry, subscribe, self.cfg.attach_timeout_s)
         try:
             brain.attach(stop_event=stop_event)
         except AttachAborted:
@@ -218,11 +244,14 @@ class BrainNode(ProcessNode):
         # publish telemetry first and only then wait for these, so this is safe to
         # do after our telemetry attach above (no deadlock).
         control_registry = StreamRegistry(self.runtime.runtime_dir, self.run_id, sub="control")
-        specs_by_side = {
-            side: control_specs(side, arm.control)
-            for side, arm in self.arms.items()
-            if arm.control_enabled
-        }
+        specs_by_side = {}
+        for side, arm in self.arms.items():
+            if not arm.control_enabled:
+                continue
+            specs = control_specs(side, arm.control)
+            if arm.gripper.enabled:
+                specs[GRIPPER] = gripper_spec(side, arm.control.channel)
+            specs_by_side[side] = specs
         brain.open_control(control_registry, specs_by_side)
         self._teleop = {side: self.arms[side] for side in specs_by_side}
 
@@ -254,13 +283,12 @@ class BrainNode(ProcessNode):
         Override this for a policy: build the setpoint vector with
         :func:`~dual_flexiv_control.control.pack_streamed` and call ``self._brain.command``.
         """
-        if not self._teleop or self._brain is None or self._brain.factr is None:
+        if not self._teleop or self._brain is None or not self.factr_cfg.servers:
             return
-        try:
-            leaders = self._brain.factr_joint_positions()
-        except FactrError as exc:
-            log.warning("FACTR read failed; holding (no setpoint posted this tick): %s", exc)
-            return
+        # Fresh sides only — a dropped-out leader is simply absent, and its arm
+        # keeps riding the last posted setpoint (the arm-side deadman covers a
+        # long dropout). Never fabricate a target for a missing leader.
+        leaders = fresh_leader_positions(self._brain, self.factr_cfg)
         for side, arm in self._teleop.items():
             q_leader = leaders.get(side)
             if q_leader is None:
@@ -278,6 +306,13 @@ class BrainNode(ProcessNode):
             q_d = convert_factr_to_rizon(q_leader, arm.convention)
             setpoint = pack_streamed(ctrl, {"q_d": q_d, "dq_d": np.zeros_like(q_d)})
             self._brain.command(side, setpoint)
+            # Gripper rides its own latest-wins mailbox (no-op if disabled): the
+            # leader's trailing trigger value, normalized to 0..1 via the convention.
+            q_leader = np.asarray(q_leader, dtype=np.float64).ravel()
+            if q_leader.size:
+                self._brain.command_gripper(
+                    side, normalize_gripper(q_leader[-1], arm.convention)
+                )
 
     def _heartbeat(self, observation: dict[str, Samples]) -> None:
         fresh = sum(1 for s in observation.values() if s.n > 0)

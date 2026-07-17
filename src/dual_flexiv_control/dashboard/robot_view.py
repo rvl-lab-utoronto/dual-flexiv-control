@@ -841,6 +841,8 @@ def clear_horizon_targets(rec) -> None:
 #: Entity holding the projected RGB-D cloud, sibling of the arms under ``robot/``.
 _DEPTH_ENTITY = "robot/depth_cloud"
 _DEPTH_POINT_RADIUS = 0.004
+#: Keep every Nth point of the RGB-D cloud before logging (viewer perf).
+_DEPTH_DOWNSAMPLE = 50
 
 
 def camera_world_pose(cam) -> tuple[np.ndarray, np.ndarray]:
@@ -910,8 +912,13 @@ def log_depth_points(points: np.ndarray, colors: np.ndarray) -> None:
 
     Logged **static** so each refresh replaces the previous cloud (latest-write-
     wins) independent of the pose timeline. No-op until the viewer is started.
+
+    The cloud is downsampled ``_DEPTH_DOWNSAMPLE``x before logging to keep the
+    viewer responsive — the full RGB-D cloud is far denser than the overlay needs.
     """
     if _REC is not None:
+        points = points[::_DEPTH_DOWNSAMPLE]
+        colors = colors[::_DEPTH_DOWNSAMPLE]
         _REC.log(
             _DEPTH_ENTITY,
             rr.Points3D(points, colors=colors, radii=_DEPTH_POINT_RADIUS),

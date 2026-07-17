@@ -113,12 +113,6 @@ _SNAPSHOT: tuple[tuple[ArmInfo, ...], bool, object, dict] | None = None
 #: follows the same selection.
 _ACTIVE_RIG: str | None = None
 
-_LEADER_LOCK = threading.Lock()
-#: Cached FACTR client for the read-only leader-status probe. Its own client (not
-#: the Calibrate tab's) so the always-on status poll and the on-demand calibration
-#: render never share one keep-alive HTTP connection across threads. Dropped by
-#: :func:`reset` so a rig / ``runtime.sim`` change rebuilds it.
-_LEADER_CLIENT = None
 
 
 def set_active_rig(rig: str | None) -> None:
@@ -190,14 +184,6 @@ def reset() -> None:
     global _SNAPSHOT
     with _LOCK:
         _SNAPSHOT = None
-    global _LEADER_CLIENT
-    with _LEADER_LOCK:
-        if _LEADER_CLIENT is not None:
-            try:
-                _LEADER_CLIENT.close()
-            except Exception:  # noqa: BLE001 - already broken; just drop it
-                pass
-        _LEADER_CLIENT = None
 
 
 def _compose() -> tuple[tuple[ArmInfo, ...], bool, object, dict]:
@@ -274,44 +260,52 @@ def configured_leader_sides() -> list[str]:
     return list(servers) if servers else []
 
 
-def _leader_client():
-    """The cached read-only leader client (built lazily), or None if none composes.
+def factr_max_age_s() -> float:
+    """The composed freshness gate for leader streams (``factr.max_age_s``)."""
+    return float(getattr(discover_factr(), "max_age_s", 0.5))
 
-    Honours ``runtime.sim``; construction only builds the per-side HTTP clients (no
-    connection), so this returns a client whenever the rig configures any FACTR
-    server. :func:`reset` drops it so a rig / sim change rebuilds it.
+
+def read_live_leader(side: str, runtime_dir: str | None = None) -> np.ndarray | None:
+    """Newest FRESH sample of one leader's ``factr/<side>`` stream, or None.
+
+    The single source of truth for leader data: the same stream the control loop
+    converts into setpoints (published by the ``FactrInterface`` producer). None
+    when no system publishes the stream, or its newest sample is older than
+    ``factr.max_age_s`` — a stale leader must read as disconnected, not as its
+    frozen last pose.
     """
-    from ..interfaces.factr.client import FactrClient
+    from ..interfaces.factr import factr_stream_name
 
-    global _LEADER_CLIENT
-    with _LEADER_LOCK:
-        if _LEADER_CLIENT is None:
-            try:
-                client = FactrClient.from_config(discover_factr(), sim=runtime_is_sim())
-            except Exception:  # noqa: BLE001 - no/invalid FACTR config -> no leaders
-                return None
-            _LEADER_CLIENT = client if client.sides else None
-        return _LEADER_CLIENT
+    sample = _read_live_stream_sample(factr_stream_name(side), runtime_dir)
+    if sample is None:
+        return None
+    vec, t_ns = sample
+    import time as _time
+
+    if (_time.monotonic_ns() - t_ns) > factr_max_age_s() * 1e9:
+        return None
+    return vec
 
 
 def read_leader_status(side: str) -> LeaderStatus:
-    """Single read-only reachability probe for one FACTR teleop leader.
+    """Read-only status of one FACTR teleop leader, from its ``factr/<side>`` stream.
 
-    One HTTP GET (never a robot connection): **reachable** if the leader's server
-    answers with a valid ``DoF+1`` sample, else **disconnected**. In ``runtime.sim``
-    the reading is synthetic (``sim=True``) — the leader always reads reachable, so
-    the row flags it rather than implying live hardware.
+    **Reachable** iff the stream carries a fresh ``DoF+1`` sample — exactly the
+    condition under which teleop is being fed, judged on the same samples control
+    reads (no separate HTTP probe that could disagree). Disconnected covers: no
+    running session, the producer down, or the leader server stale/unreachable.
+    In ``runtime.sim`` the producer fabricates the readings (``sim=True``) — the
+    leader always reads reachable, so the row flags it rather than implying live
+    hardware.
     """
     name = side.capitalize()
     sim = runtime_is_sim()
-    client = _leader_client()
-    if client is None or side not in getattr(client, "sides", []):
+    if side not in configured_leader_sides():
         return LeaderStatus(side, name, reachable=False, dof=0, gripper=None, sim=sim)
-    with _LEADER_LOCK:  # serialize the shared keep-alive connection across fragments
-        try:
-            jp = np.asarray(client.get_joint_positions_for(side), dtype=float).ravel()
-        except Exception:  # noqa: BLE001 - leader down / bad response -> disconnected
-            return LeaderStatus(side, name, reachable=False, dof=0, gripper=None, sim=sim)
+    jp = read_live_leader(side)
+    if jp is None or jp.size == 0:
+        return LeaderStatus(side, name, reachable=False, dof=0, gripper=None, sim=sim)
+    jp = np.asarray(jp, dtype=float).ravel()
     grip = float(jp[-1]) if jp.size else None
     return LeaderStatus(side, name, reachable=True, dof=max(0, jp.size - 1), gripper=grip, sim=sim)
 
@@ -321,14 +315,18 @@ def _runtime_root(runtime_dir: str | None) -> Path:
     return Path(rd if os.path.isabs(rd) else os.path.join(os.getcwd(), rd))
 
 
-def _read_live_stream_newest(stream: str, runtime_dir: str | None) -> np.ndarray | None:
-    """Newest sample vector of a shared-memory ``stream`` across the latest runs, or None.
+def _read_live_stream_sample(
+    stream: str, runtime_dir: str | None
+) -> tuple[np.ndarray, int] | None:
+    """Newest ``(vector, t_ns)`` of a shared-memory ``stream`` across the latest runs.
 
     Scans the runtime run dirs newest-first, attaches the stream if present, and
-    returns its most recent vector. None means the streams stack is unavailable, no
-    run publishes the stream, or its buffer is empty — i.e. nothing is currently
-    producing it. Read-only shared-memory access: never opens a robot connection, so
-    it cannot conflict with the system that owns the arm.
+    returns its most recent vector with its producer timestamp (monotonic ns —
+    comparable across processes, for freshness gating). None means the streams
+    stack is unavailable, no run publishes the stream, or its buffer is empty —
+    i.e. nothing is currently producing it. Read-only shared-memory access: never
+    opens a robot connection, so it cannot conflict with the system that owns the
+    arm.
     """
     root = _runtime_root(runtime_dir)
     if not root.is_dir():
@@ -353,12 +351,18 @@ def _read_live_stream_newest(stream: str, runtime_dir: str | None) -> np.ndarray
             try:
                 samples = reader.latest()
                 if samples.n > 0:
-                    return np.asarray(samples.newest)
+                    return np.asarray(samples.newest), int(samples.newest_t_ns)
             finally:
                 reader.close()
         except Exception:  # noqa: BLE001 - dead run / lapped buffer -> try next
             continue
     return None
+
+
+def _read_live_stream_newest(stream: str, runtime_dir: str | None) -> np.ndarray | None:
+    """Newest sample vector of a live ``stream``, or None (see `_read_live_stream_sample`)."""
+    sample = _read_live_stream_sample(stream, runtime_dir)
+    return None if sample is None else sample[0]
 
 
 def _read_live_status(

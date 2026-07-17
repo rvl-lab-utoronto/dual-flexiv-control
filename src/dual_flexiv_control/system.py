@@ -7,12 +7,12 @@ Topology for the bimanual setup::
     ZedInterface(wrist_left) --->                         \-- or EvalNode (policy rollout)
     ZedInterface(wrist_right) -/
     ZedInterface(static)    --/
+    FactrInterface          --/   (factr/<side> leader streams)
 
-One process per arm (proprio) and one per ZED camera (frames), plus one
-consumer selected by ``runtime.phase``: collection (FACTR teleop -> LeRobot
-recording) or eval (policy-server client -> setpoints). FACTR is not a spawned
-node: the collection brain holds a ``FactrClient`` and queries the FACTR
-server's joint-position endpoint on demand.
+One process per arm (proprio), one per ZED camera (frames), and one FACTR
+producer (the single HTTP reader of the leader servers, publishing
+``factr/<side>``), plus one consumer selected by ``runtime.phase``: collection
+(FACTR teleop -> LeRobot recording) or eval (policy-server client -> setpoints).
 
 All nodes run as **spawned** processes sharing a single stop ``Event``. The
 parent supervises: if any node dies, it signals the rest to unwind, joins them,
@@ -40,6 +40,7 @@ from omegaconf import OmegaConf
 from .collection import CollectionNode
 from .configs import Config
 from .configs import register_configs
+from .interfaces.factr import FactrInterface
 from .interfaces.flexiv import FlexivInterface
 from .interfaces.zed import ZedInterface
 from .policy import EvalNode
@@ -105,6 +106,10 @@ def build_hardware_nodes(
         ZedInterface(name, cam, config.runtime, run_id)
         for name, cam in config.cameras.items()
     ]
+    if config.factr.servers:
+        # The single FACTR reader: publishes factr/<side> leader streams that the
+        # consumers AND the dashboard read (never the HTTP servers directly).
+        nodes.append(FactrInterface(config.factr, config.runtime, run_id))
     return nodes
 
 
@@ -151,8 +156,7 @@ def build_consumer(config: Config, run_id: str) -> ProcessNode:
 def build_nodes(config: Config, run_id: str) -> list[ProcessNode]:
     """The set of spawned nodes for a one-shot run: hardware + the phase's consumer.
 
-    FACTR is not a node — it is an on-request HTTP client the brain holds. Camera
-    streams are produced unconditionally but are not in the brain's default
+    Camera streams are produced unconditionally but are not in the brain's default
     subscription (proprio only); subscribe to them via ``brain.subscribe`` (see
     :func:`dual_flexiv_control.cameras.camera_stream_names`).
     """
@@ -161,6 +165,9 @@ def build_nodes(config: Config, run_id: str) -> list[ProcessNode]:
 
 def run_system(config: Config, run_id: str | None = None) -> None:
     """Launch every node, supervise, and tear everything down cleanly."""
+    from .orphans import tag_supervisor
+
+    tag_supervisor()  # children carry our pid: future orphans become provable
     ctx = mp.get_context("spawn")  # never fork: flexivrdk has live threads/services
     run_id = run_id or make_run_id()
     duration_s = config.runtime.duration_s

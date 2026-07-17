@@ -2,17 +2,18 @@ defaults:
   - base_factr
   - _self_
 
-# One FACTR FastAPI server per leader arm, each on its own port (single-arm per
-# instance). The FACTR-Server's factr_api is launched once per leader, arm_index 0/1:
-#   arm_index:=0 -> left,  :5000, /get_joint_positions_left   <- ROS /joint_pos_left
-#   arm_index:=1 -> right, :5001, /get_joint_positions_right  <- ROS /joint_pos_right
-# The brain holds a FactrClient that queries every server on request;
-# get_joint_positions() returns {side: joint_positions}. Each server returns DoF+1
-# values (7 arm joints + a trailing gripper) under the `joint_pos` key, so dof is 8;
-# the brain's JointConventionCfg drops the trailing gripper before posting setpoints.
+# The FACTR-Server's factr_api runs as ONE FastAPI process on :5001 serving a
+# per-side endpoint for each leader arm:
+#   /get_joint_positions_left   <- ROS /joint_pos_left
+#   /get_joint_positions_right  <- ROS /joint_pos_right
+# The FactrInterface producer node polls each configured endpoint and publishes
+# it as the factr/<side> shared-memory stream — the single source of leader data
+# for control and the dashboard alike. Each endpoint returns DoF+1 values
+# (7 arm joints + a trailing gripper) under the `joint_pos` key, so dof is 8;
+# the per-arm JointConventionCfg drops the trailing gripper before setpoints.
 #
-# The single leader currently plugged in (U2D2 on /dev/ttyUSB0) is the LEFT arm;
-# the right server has no producer yet, so `right` reads as disconnected until then.
+# An endpoint whose ROS publisher isn't running serves a zeros placeholder /
+# goes unreachable; its stream then reads stale and the side shows disconnected.
 servers:
-  left:  { host: localhost, port: 5000, endpoint: get_joint_positions_left,  request_timeout_s: 0.5, dof: 8 }
+  left:  { host: localhost, port: 5001, endpoint: get_joint_positions_left,  request_timeout_s: 0.5, dof: 8 }
   right: { host: localhost, port: 5001, endpoint: get_joint_positions_right, request_timeout_s: 0.5, dof: 8 }

@@ -9,7 +9,7 @@ The hierarchy mirrors the stream paths discussed for the system:
 
     arms.left.streams.{q,dq,tau,wrench,eef,eef_vel}   -> streams "left/<sig>"
     arms.right.streams.{...}                           -> streams "right/<sig>"
-    factr.{host,port,endpoint,...}                     -> on-request FactrClient
+    factr.servers.{left,right}                         -> streams "factr/<side>"
     arms.{left,right}.control                          -> per-arm ControlCfg
                                                           (qpos|qvel|end_effector|force)
     task.{language_instruction, collection, eval}      -> active task + per-phase templates
@@ -441,6 +441,62 @@ class JointConventionCfg:
 
 
 @dataclass
+class GripperCfg:
+    """Follower end-effector gripper actuation (opt-in; teleoperated from FACTR).
+
+    Off by default (``enabled=False``): a rig with no gripper, or an arm whose
+    gripper should not move, is completely unaffected — no gripper channel is
+    opened and the arm never touches ``flexivrdk.Gripper``. When enabled, the
+    brain posts the leader's normalized trigger (0=open, 1=closed — see
+    :func:`~dual_flexiv_control.control.normalize_gripper`, calibrated via the
+    convention's ``gripper_open``/``gripper_closed``) on a dedicated latest-wins
+    channel (``cmd/<side>/gripper``), and the arm maps it to a physical width and
+    drives the gripper with ``Gripper.Move``.
+
+    ``name`` is the gripper's device name as registered in Flexiv Elements Studio
+    — the argument to ``Gripper.Enable(name)``; it is deployment-specific, so it
+    MUST be set to enable actuation (an empty name disables it with a warning).
+    ``velocity``/``force`` are the ``Move`` limits (clamped to the gripper's own
+    reported ``params()`` range). The physical open/closed widths are taken live
+    from ``params()`` (``max_width``→open, ``min_width``→closed) unless overridden.
+    """
+
+    enabled: bool = False
+    """Master switch: actuate the follower gripper from the leader trigger."""
+
+    name: str = ""
+    """``Gripper.Enable(name)`` device name (from Flexiv Elements Studio). Required
+    to actuate — an empty name leaves the gripper untouched (logged once)."""
+
+    velocity: float = 0.1
+    """``Move`` velocity [m/s], clamped to the gripper's reported ``[min,max]_vel``."""
+
+    force: float = 20.0
+    """``Move`` force [N], clamped to the gripper's reported ``[min,max]_force``."""
+
+    move_rate_hz: float = 15.0
+    """Max ``Move`` command rate. The control loop is far faster (``control_rate_hz``);
+    grippers can't accept every-tick commands, so sends are throttled to this."""
+
+    deadband: float = 0.02
+    """Minimum change in the normalized target (0..1) that triggers a new ``Move``;
+    smaller jitter is ignored so the gripper isn't dithered."""
+
+    init_on_start: bool = True
+    """Run ``Gripper.Init()`` (homing) once when a control session first actuates
+    the gripper. Homing is a physical motion — disable if the gripper is already
+    initialized and re-homing at session start is undesirable."""
+
+    open_width: Optional[float] = None
+    """Override the physical width [m] mapped from normalized 0 (fully open). None
+    => the gripper's reported ``params().max_width``."""
+
+    closed_width: Optional[float] = None
+    """Override the physical width [m] mapped from normalized 1 (fully closed). None
+    => the gripper's reported ``params().min_width``."""
+
+
+@dataclass
 class ArmCfg:
     """One Flexiv arm: connection, read settings, stream schemas, default controller."""
 
@@ -460,7 +516,14 @@ class ArmCfg:
     control_safety_check: bool = True    # L-inf joint-error gate vs measured q (joint kinds)
     control_tolerance: float = 0.5       # [rad] L-inf gate threshold (~28 deg)
     control_attach_timeout_s: float = 10.0   # wait for the brain's channels to appear
+    control_eager_enable: bool = True    # servo-on (Enable/brake release) BEFORE waiting
+                                         # for the brain's channels, overlapping it with
+                                         # the consumer's spawn — cuts seconds off every
+                                         # run start. Off: enable only after the channels
+                                         # attach (the arm is never enabled for a consumer
+                                         # that dies before publishing them).
     convention: JointConventionCfg = field(default_factory=JointConventionCfg)
+    gripper: GripperCfg = field(default_factory=GripperCfg)   # follower gripper (opt-in)
 
 
 @dataclass
@@ -510,11 +573,10 @@ class CameraCfg:
 
 @dataclass
 class FactrServerCfg:
-    """One FACTR leader-arm teleop server (FastAPI), queried on request.
+    """One FACTR leader-arm teleop server endpoint (FastAPI).
 
-    Each leader runs its own server on its own ``port``. A single
-    ``GET http://{host}:{port}/{endpoint}`` returns *that* leader's joint
-    positions (``dof`` joints).
+    A single ``GET http://{host}:{port}/{endpoint}`` returns *that* leader's
+    joint positions (``dof`` values: arm joints + the trailing gripper).
     """
 
     host: str = "localhost"
@@ -526,14 +588,26 @@ class FactrServerCfg:
 
 @dataclass
 class FactrCfg:
-    """FACTR teleop: one HTTP server per leader arm, each on its own port.
+    """FACTR teleop: one HTTP endpoint per leader arm, streamed by ONE producer.
 
-    Not polled and not streamed — the brain holds a ``FactrClient`` that queries
-    every configured server on demand; ``get_joint_positions()`` returns
-    ``{side: joint_positions}``.
+    The :class:`~dual_flexiv_control.interfaces.factr.FactrInterface` node is
+    the single HTTP reader: it polls every configured server at ``rate_hz`` and
+    publishes each leader's raw payload as a ``factr/<side>`` shared-memory
+    stream. Consumers (the collection loop, the brain, the dashboard) attach
+    read-only to those streams — never to the servers — so control and the
+    viewer see identical samples by construction.
     """
 
     servers: Dict[str, FactrServerCfg] = field(default_factory=dict)
+
+    rate_hz: float = 100.0
+    """The producer's poll/publish rate. Far above the collection frequency
+    (15 Hz) and comfortably below the FACTR publisher's own ~250 Hz."""
+
+    max_age_s: float = 0.5
+    """Freshness gate for readers: a ``factr/<side>`` sample older than this is
+    treated as a leader dropout (consumers hold their last real target; the
+    dashboard shows the leader as disconnected)."""
 
 
 @dataclass

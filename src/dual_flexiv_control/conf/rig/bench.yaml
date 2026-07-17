@@ -12,7 +12,7 @@ defaults:
   - /arm@arms.left: flexiv_dummy        # fabricated proprio — no robot connection
   - /control@arms.left.control: qpos
   - /camera@cameras.static: zed2_static # the real connected ZED 2i
-  - /factr: left                        # left leader only (:5000)
+  - /factr: left                        # left leader only (:5001)
   - _self_
 
 arms:

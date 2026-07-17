@@ -74,8 +74,20 @@ class FakeManager:
         self.commands.append(("start", phase, task, policy, host, port, skill))
         return True
 
+    def switch_run(self, phase, task, policy=None, host=None, port=None, skill=None):
+        self.commands.append(("switch", phase, task, policy, host, port, skill))
+        return True
+
     def stop_run(self):
         self.commands.append(("stop",))
+        return True
+
+    def reconnect_arm(self, side):
+        self.commands.append(("reconnect_arm", side))
+        return True
+
+    def respawn_camera(self, name):
+        self.commands.append(("respawn_camera", name))
         return True
 
     def log_tail(self, n=25):
@@ -133,6 +145,57 @@ def test_launch_refused_while_run_active():
     with pytest.raises(RuntimeError, match="still active"):
         registry.launch(_task(), "eval")
     assert mgr.commands == []
+
+
+def test_switch_launch_allowed_while_run_active():
+    """switch=True skips only the run-active refusal (the daemon stops the run
+    itself) and sends a switch command; the other gates still apply."""
+    registry, mgr = _registry()
+    mgr.set_view(state="collection", task="fake", phase="collection")
+    registry.launch(_task(), "eval", rig="bimanual", switch=True)
+    assert mgr.commands == [("switch", "eval", "fake", None, None, None, None)]
+
+    mgr.commands.clear()
+    mgr.set_view(state="down")
+    with pytest.raises(RuntimeError, match="not running"):
+        registry.launch(_task(), "eval", rig="bimanual", switch=True)
+    mgr.set_view(state="collection")
+    with pytest.raises(RuntimeError, match="rig"):
+        registry.launch(_task(), "eval", rig="bench", switch=True)
+    assert mgr.commands == []
+
+
+def test_recovery_command_passthroughs():
+    registry, mgr = _registry()
+    assert registry.reconnect_arm("left") is True
+    assert registry.respawn_camera("zed:static") is True
+    assert ("reconnect_arm", "left") in mgr.commands
+    assert ("respawn_camera", "zed:static") in mgr.commands
+
+
+def test_layout_key_follows_a_pending_switch():
+    """A queued switch keys the viewer layout on the TARGET phase throughout
+    the transition, so the layout flips exactly once (no flash of the viewing
+    layout in the idle gap between the two runs)."""
+    from dual_flexiv_control.dashboard.runner import _layout_key
+    from dual_flexiv_control.dashboard.session import SessionView
+
+    assert _layout_key(SessionView(state="viewing")) == ("viewing", None)
+    assert _layout_key(SessionView(state="down")) == ("welcome", None)
+    running = dict(state="collection", phase="collection", task="t")
+    assert _layout_key(SessionView(**running)) == ("collection", "t")
+
+    pend = {"phase": "eval", "task": "t2", "skill": None}
+    # From switch click, through saving, through the idle gap: one stable key.
+    assert _layout_key(SessionView(**running, pending=pend)) == ("eval", "t2")
+    assert _layout_key(
+        SessionView(state="saving", phase="collection", task="t", pending=pend)
+    ) == ("eval", "t2")
+    assert _layout_key(SessionView(state="viewing", pending=pend)) == ("eval", "t2")
+
+    # A pending skill run is labelled by its skill name.
+    sk = {"phase": "skill", "task": "default", "skill": "wave"}
+    assert _layout_key(SessionView(state="viewing", pending=sk)) == ("skill", "wave")
 
 
 def test_launch_refused_when_session_down_or_starting():

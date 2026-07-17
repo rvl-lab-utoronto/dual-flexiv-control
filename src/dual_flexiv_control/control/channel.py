@@ -24,14 +24,41 @@ from ..streams.stream import StreamReader
 
 log = logging.getLogger(__name__)
 
-#: Logical leaf names for an arm's two control channels.
+#: Logical leaf names for an arm's control channels. ``setpoint`` (high-rate,
+#: latest-wins joint/cartesian targets) and ``command`` (reliable discrete events)
+#: are always present for a control-enabled arm; ``gripper`` is an optional
+#: latest-wins mailbox carrying the normalized (0..1) gripper target, opened only
+#: when the arm has ``gripper.enabled`` (kept off the joint setpoint vector so the
+#: per-kind control schema stays orthogonal to whether a gripper is attached).
 SETPOINT = "setpoint"
 COMMAND = "command"
+GRIPPER = "gripper"
 
 
 def control_channel_name(side: str, leaf: str) -> str:
     """The logical name of a control channel, e.g. ``cmd/left/setpoint``."""
     return f"cmd/{side}/{leaf}"
+
+
+def gripper_channel_name(side: str) -> str:
+    """The logical name of an arm's gripper mailbox, e.g. ``cmd/left/gripper``."""
+    return control_channel_name(side, GRIPPER)
+
+
+def gripper_spec(side: str, ch_cfg) -> StreamSpec:
+    """The ``StreamSpec`` for one arm's gripper mailbox (a latest-wins scalar).
+
+    Sized off the same :class:`ControlChannelCfg` as the setpoint channel — a
+    shallow latest-wins ring at the setpoint rate — since the gripper target is
+    posted alongside the setpoints and read the same drop-stale way.
+    """
+    return StreamSpec(
+        name=gripper_channel_name(side),
+        dim=1,
+        capacity=ch_cfg.setpoint_capacity,
+        dtype=ch_cfg.dtype,
+        rate_hz=ch_cfg.rate_hz,
+    )
 
 
 def setpoint_dim(ctrl_cfg) -> int:

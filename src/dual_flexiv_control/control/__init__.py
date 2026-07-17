@@ -15,6 +15,7 @@ the two categories never alias during discovery.
 """
 
 from .channel import COMMAND
+from .channel import GRIPPER
 from .channel import SETPOINT
 from .channel import CommandCursor
 from .channel import action_dim
@@ -23,6 +24,8 @@ from .channel import action_hold_fields
 from .channel import control_channel_name
 from .channel import control_specs
 from .channel import estimate_chunk_end
+from .channel import gripper_channel_name
+from .channel import gripper_spec
 from .channel import horizon_kind
 from .channel import horizon_signals
 from .channel import pack_action
@@ -46,6 +49,8 @@ __all__ = [
     "control_channel_name",
     "control_specs",
     "estimate_chunk_end",
+    "gripper_channel_name",
+    "gripper_spec",
     "horizon_kind",
     "horizon_signals",
     "setpoint_dim",
@@ -58,4 +63,5 @@ __all__ = [
     "offsets_from_straight_pose",
     "SETPOINT",
     "COMMAND",
+    "GRIPPER",
 ]

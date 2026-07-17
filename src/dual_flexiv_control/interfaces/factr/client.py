@@ -64,12 +64,12 @@ class FactrServerClient:
         self,
         *,
         side: str,
-        host: str = "localhost",
-        port: int = 5000,
-        endpoint: str = "get_joint_positions",
-        dof: int = 7,
-        timeout_s: float = 0.5,
-        sim: bool = False,
+        host: str,
+        port: int,
+        endpoint: str,
+        dof: int,
+        timeout_s: float,
+        sim: bool,
     ) -> None:
         self.side = side
         self.host = host

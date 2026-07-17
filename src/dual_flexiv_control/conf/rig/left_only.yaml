@@ -11,16 +11,36 @@ defaults:
   - /arm@arms.left: flexiv
   - /control@arms.left.control: qpos
   - /camera@cameras.static: zed2_static
-  - /factr: left                        # left leader only (:5000)
+  - /factr: left                        # left leader only (:5001)
   - _self_
 
 arms:
   left:
-    convention: { offsets_deg: [0, -80, 90, 80, 90, 90.00, 0], sign_flip_joints: [2, 5] }
     name: "Lauer"
     serial: Rizon4s-062841
     control_enabled: true
-    # convention: { gripper_open: 0.0, gripper_closed: 1.2 }  # see rig/bimanual.yaml
+    # `convention` stays a single inline line — the dashboard's calibration Sync
+    # rewrites it in place (and preserves the gripper_open/gripper_closed endpoints).
+    # gripper_open/gripper_closed: the raw FACTR servo radians at the fully-open and
+    # fully-closed trigger, mapped to 0.0 (open) and 1.0 (closed). WITHOUT them the raw
+    # radians are sent unmapped, so the follower only travels part of its range (the
+    # trigger reads ~0..0.5, capping short of a full close). Re-measure per startup
+    # pose: `python scripts/factr_gripper_calibrate.py --side left`. If squeezing the
+    # trigger DECREASES the reading, swap them (open > closed) — reversed is handled.
+    convention: { offsets_deg: [-78.05, 96.68, 97.47, 152.23, 1.32, 89.56, 75.94], sign_flip_joints: [5], gripper_open: 0.0, gripper_closed: 0.5 }
+    gripper:
+      enabled: true
+      # Gripper device name (the Gripper.Enable arg) — must match the device configured
+      # in Flexiv Elements Studio. This robot uses the Flexiv GN01 gripper, whose
+      # standard device name is "Flexiv-GN01" (Flexiv's Flexiv-<model> convention);
+      # verify in Elements Studio's device panel. Empty or wrong => not actuated
+      # (warns, arm keeps running).
+      name: "Flexiv-GN01"
+      velocity: 0.1          # Move velocity [m/s] (clamped to the gripper's params)
+      force: 20.0            # Move force [N]      (clamped to the gripper's params)
+      # open_width: 0.10     # override physical width [m] at 0.0 (default: params max_width)
+      # closed_width: 0.0    # override physical width [m] at 1.0 (default: params min_width)
+      # move_rate_hz: 15.0   # max Move rate; deadband: 0.02; init_on_start: true
 
 cameras:
   static:

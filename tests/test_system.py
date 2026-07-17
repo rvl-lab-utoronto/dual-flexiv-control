@@ -75,6 +75,74 @@ def test_build_nodes_rejects_bad_phase(tmp_path):
         build_nodes(cfg, make_run_id())
 
 
+def test_control_session_actuates_gripper_from_mailbox(tmp_path):
+    """End-to-end (in-process, sim): a control session discovers the gripper mailbox,
+    sets the gripper up during bootstrap, and drives it from posted normalized targets.
+
+    Runs the interface's real ``_control_session`` in a thread (not a spawned process)
+    so its ``FakeFlexivSource`` stays directly inspectable, while the test plays the
+    brain — opening setpoint/command/gripper channels and posting targets.
+    """
+    import threading
+
+    from dual_flexiv_control.configs import ControlCoeffsCfg
+    from dual_flexiv_control.control import COMMAND
+    from dual_flexiv_control.control import SETPOINT
+    from dual_flexiv_control.control import control_specs
+    from dual_flexiv_control.control import gripper_spec
+    from dual_flexiv_control.control import pack_streamed
+    from dual_flexiv_control.streams.stream import StreamWriter
+
+    config = _make_config(
+        tmp_path,
+        "arms.left.control_enabled=true",
+        "arms.left.control_rate_hz=200",
+        "arms.left.gripper.enabled=true",
+        "arms.left.gripper.name=G",
+    )
+    arm = config.arms["left"]
+    run_id = make_run_id()
+
+    node = FlexivInterface("left", arm, config.runtime, run_id)
+    # Set up exactly like run() before a session: telemetry writers + sim source.
+    registry = StreamRegistry(tmp_path, run_id)
+    for spec in node.declare_streams():
+        node._writers[spec.name] = StreamWriter.create(spec, run_id, registry)
+    node.open_source()
+    source = node._source  # keep a handle (teardown nulls node._source)
+
+    stop = threading.Event()
+    th = threading.Thread(
+        target=node._control_session, args=(stop, ControlCoeffsCfg()), daemon=True
+    )
+    th.start()
+
+    creg = StreamRegistry(tmp_path, run_id, sub="control")
+    specs = control_specs("left", arm.control)
+    # Gripper channel FIRST (as brain.open_control does) so it exists once the arm
+    # sees setpoint+command and looks it up.
+    gw = StreamWriter.create(gripper_spec("left", arm.control.channel), run_id, creg)
+    sw = StreamWriter.create(specs[SETPOINT], run_id, creg)
+    cw = StreamWriter.create(specs[COMMAND], run_id, creg)
+    try:
+        q_d = np.linspace(0.0, 0.3, 7)
+        setpoint = pack_streamed(arm.control, {"q_d": q_d, "dq_d": np.zeros(7)})
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline and source.last_gripper is None:
+            sw.write(setpoint)                      # keep the setpoint fresh (deadman)
+            gw.write(np.array([0.7], dtype=np.float64))
+            time.sleep(0.02)
+        assert source.last_gripper == pytest.approx(0.7), "gripper mailbox never actuated"
+    finally:
+        stop.set()
+        th.join(timeout=5.0)
+        for w in (gw, sw, cw):
+            w.close()
+            w.unlink()
+        node._teardown(registry)
+        cleanup_run(tmp_path, run_id)
+
+
 def test_flexiv_sim_streams_cross_process(tmp_path):
     """A spawned sim Flexiv interface streams proprio that a parent reader sees."""
     config = _make_config(tmp_path, "arms.left.rate_hz=500")
@@ -308,6 +376,10 @@ def test_shutdown_lets_the_recording_node_finish_saving(monkeypatch, tmp_path):
     saver = ctx.Process(target=_exit_after, args=(1.5,), name="collection")
     hw = ctx.Process(target=_exit_now, name="flexiv:left")
     saver.start(); hw.start()
+    # Let the immediately-exiting hardware node finish booting first: under a
+    # loaded machine, spawn latency alone can exceed the 0.3s window and the
+    # SIGTERM escalation would race the interpreter start, flaking the test.
+    hw.join(timeout=30.0)
     t0 = time.monotonic()
     system_mod._shutdown([hw, saver], stop, save_grace_s=10.0)
     elapsed = time.monotonic() - t0
