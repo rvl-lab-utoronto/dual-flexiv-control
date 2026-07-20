@@ -285,6 +285,20 @@ class RunRegistry:
             _log_event("FACTR server stop requested")
         return ok
 
+    def enable_grav_comp(self) -> bool:
+        """Ask the daemon to ramp every leader's grav-comp gain up (0→1 over ~1s)."""
+        ok = self.manager.enable_grav_comp()
+        if ok:
+            _log_event("grav comp enable requested (leaders energizing)")
+        return ok
+
+    def disable_grav_comp(self) -> bool:
+        """Ask the daemon to ramp every leader's grav-comp gain down (1→0 over ~1s)."""
+        ok = self.manager.disable_grav_comp()
+        if ok:
+            _log_event("grav comp disable requested (leaders de-energizing)")
+        return ok
+
     def reset(self) -> None:
         """Stop any active run and clear the history — a clean slate."""
         view = self.manager.view()

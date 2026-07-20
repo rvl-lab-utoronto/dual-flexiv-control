@@ -497,18 +497,15 @@ def _render_factr_teleop_row(name: str, unit_state: str, log_path: str | None) -
 
 @st.fragment(run_every="2s")
 def _render_factr_section(registry: _runner.RunRegistry) -> None:
-    """The Grav comp section: launch/stop the FACTR-Server processes + live state.
+    """The Grav comp section: live leader health + the two grav-comp ramp controls.
 
-    The daemon owns the processes (one grav-comp teleop per leader + the API
-    relay — see ``factr.launch``); this section is the operator's switch and
-    window: a pose-warning launch with a live calibration countdown, per-process
-    lifecycle rows read from the health logs, and a SIGINT stop (the only stop
-    that de-energizes the leader servos). Buttons mirror the daemon's gates (no
-    launch during a run, no stop mid-collection) so they read as disabled
-    instead of bouncing refusals.
+    The FACTR-Server processes (one grav-comp teleop per leader + the API relay —
+    see ``factr.launch``) auto-start with the daemon and stay up; the leaders boot
+    limp (master output gain 0). This section shows their live health (per-process
+    rows read from the health logs) and two controls that trigger the leaders'
+    OWN gain ramp over HTTP — no process launch/stop involved: Enable ramps every
+    leader 0→1 (energize), Disable ramps it 1→0 (de-energize), each over ~1s.
     """
-    import time as _time
-
     st.subheader("Grav comp")
     view = registry.session_view()
     info = view.factr_servers
@@ -519,90 +516,57 @@ def _render_factr_section(registry: _runner.RunRegistry) -> None:
         )
         return
     state = info.get("state")
-    pose = info.get("calib_pose") or "the calibration pose"
     logs = info.get("logs") or {}
-
-    if state == "off":
-        st.caption(
-            f"Leaders de-energized. Pose them at **{pose}** (all joints), "
-            "then launch — calibration reads that pose after the countdown."
-        )
-        if st.button(
-            "▶ Launch grav comp", key="factr_launch", use_container_width=True,
-            disabled=view.run_active or view.pending is not None,
-            help=(
-                "Spawn the FACTR-Server processes: one gravity-compensation "
-                "teleop per leader (torque ON) and the API relay. The teleops "
-                "calibrate at boot, so the countdown is your window to pose "
-                "the leader arms. Disabled while a run is active."
-            ),
-        ):
-            if registry.start_factr_servers():
-                st.toast("Launch armed — pose the leader arms now.", icon="🤖")
-            else:
-                st.warning("Session daemon not reachable.", icon="⚠️")
-            st.rerun(scope="fragment")
-        return
-
-    if state == "countdown":
-        ends = float(info.get("countdown_ends_ts") or 0.0)
-        total = float(info.get("countdown_total_s") or 0.0)
-        remaining = max(0.0, ends - _time.time())
-        frac = 1.0 if total <= 0 else min(1.0, max(0.0, 1.0 - remaining / total))
-        st.progress(
-            frac,
-            text=f"🤖 Pose the leader arm(s) at **{pose}** — "
-                 f"calibration reads them in **{remaining:.0f}s**",
-        )
-        if st.button(
-            "✕ Cancel launch", key="factr_cancel", use_container_width=True,
-            help="Cancel before anything spawns; the servos are not touched.",
-        ):
-            if registry.stop_factr_servers():
-                st.toast("Launch cancelled.", icon="✕")
-            else:
-                st.warning("Session daemon not reachable.", icon="⚠️")
-            st.rerun(scope="fragment")
-        return
-
-    # running / stopping: per-process rows, then the stop control.
     units = info.get("units") or {}
-    for name, unit_state in units.items():
-        if name.startswith("teleop:"):
-            _render_factr_teleop_row(name, unit_state, logs.get(name))
-        elif unit_state == "down":
-            st.markdown("🔴 **API relay** · :red[down] — respawned automatically")
-        elif unit_state == "stopping":
-            st.markdown("⚫ **API relay** · :gray[stopping…]")
-        else:
-            st.markdown("🟢 **API relay** · :green[serving the leader endpoints]")
 
-    if state == "stopping":
-        st.caption(":gray[Stopping — the leader arms are de-energizing (SIGINT)…]")
-        return
+    if state in ("off", "countdown"):
+        # The service auto-starts with the daemon; this is only seen briefly at
+        # boot (or if it was stopped via the legacy start_factr/stop_factr path).
+        st.caption(":gray[FACTR service starting…]")
+    elif state == "stopping":
+        st.caption(":gray[FACTR service stopping — the leaders are de-energizing…]")
+    else:  # running: per-process rows + the health-log tails
+        for name, unit_state in units.items():
+            if name.startswith("teleop:"):
+                _render_factr_teleop_row(name, unit_state, logs.get(name))
+            elif unit_state == "down":
+                st.markdown("🔴 **API relay** · :red[down] — respawned automatically")
+            else:
+                st.markdown("🟢 **API relay** · :green[serving the leader endpoints]")
+        with st.expander("Health logs (tail)"):
+            for name in units:
+                path = logs.get(name)
+                if not path:
+                    continue
+                tail = _factr_srv.tail_lines(path)[-12:]
+                if tail:
+                    st.caption(_factr_unit_label(name))
+                    st.code("\n".join(tail), language="text")
 
-    with st.expander("Health logs (tail)"):
-        for name in units:
-            path = logs.get(name)
-            if not path:
-                continue
-            tail = _factr_srv.tail_lines(path)[-12:]
-            if tail:
-                st.caption(_factr_unit_label(name))
-                st.code("\n".join(tail), language="text")
-
-    collecting = view.state in ("collection", "saving")
     if st.button(
-        "■ Stop grav comp (de-energize)", key="factr_stop",
-        use_container_width=True, disabled=collecting,
+        "▶ Enable grav comp", key="factr_enable", use_container_width=True,
         help=(
-            "SIGINT the FACTR-Server processes: the teleops zero + disable the "
-            "leader servos and close their boards. Disabled during collection — "
-            "teleop is fed by these leaders."
+            "Ramp every leader's master output gain 0→1 over ~1s — the arms go "
+            "from limp to gravity-compensated. The teleop processes stay up "
+            "(they auto-start with the daemon)."
         ),
     ):
-        if registry.stop_factr_servers():
-            st.toast("Stopping grav comp — leaders de-energizing…", icon="🔻")
+        if registry.enable_grav_comp():
+            st.toast("Enabling grav comp — leaders energizing…", icon="🤖")
+        else:
+            st.warning("Session daemon not reachable.", icon="⚠️")
+        st.rerun(scope="fragment")
+    if st.button(
+        "■ Disable grav comp (de-energize)", key="factr_disable",
+        use_container_width=True,
+        help=(
+            "Ramp every leader's master output gain 1→0 over ~1s — the arms go "
+            "limp (energized but applying no torque). The processes stay up; "
+            "use Enable to re-energize."
+        ),
+    ):
+        if registry.disable_grav_comp():
+            st.toast("Disabling grav comp — leaders de-energizing…", icon="🔻")
         else:
             st.warning("Session daemon not reachable.", icon="⚠️")
         st.rerun(scope="fragment")

@@ -25,9 +25,61 @@ Entity-path scheme (kept in one place):
 
 from __future__ import annotations
 
+import os
+
 import rerun.blueprint as rrb
+from rerun.blueprint.components import PlayState
 
 SIDES = ("left", "right")
+
+#: Default trailing window (seconds) the live plots render, tunable with
+#: ``DFC_DASHBOARD_PLOT_WINDOW_S`` (``0`` or negative = show the full history).
+DEFAULT_PLOT_WINDOW_S = 30.0
+
+
+def _plot_window_s() -> float:
+    """Trailing plot window in seconds (env-overridable; falls back on garbage)."""
+    try:
+        return float(os.environ.get("DFC_DASHBOARD_PLOT_WINDOW_S", DEFAULT_PLOT_WINDOW_S))
+    except (TypeError, ValueError):
+        return DEFAULT_PLOT_WINDOW_S
+
+
+def _live_window() -> "rrb.VisibleTimeRange | None":
+    """Scrolling last-N-seconds visible range for a live time-series view.
+
+    Anchored to the play cursor (which tracks the live edge while streaming), so
+    each plot draws only the trailing window instead of the whole accumulated
+    ``elapsed`` history — keeping render cost flat no matter how long the
+    dashboard has been streaming. Returns ``None`` (view keeps its default
+    full-history range) when the window is disabled.
+    """
+    window = _plot_window_s()
+    if window <= 0:
+        return None
+    return rrb.VisibleTimeRange(
+        "elapsed",
+        start=rrb.TimeRangeBoundary.cursor_relative(seconds=-window),
+        end=rrb.TimeRangeBoundary.cursor_relative(seconds=0.0),
+    )
+
+
+def _live_time_panel() -> rrb.TimePanel:
+    """Pin the viewer to the ``elapsed`` timeline (and follow the live edge).
+
+    The mirror stamps every sample on ``elapsed``, but ``rr.log`` also auto-adds
+    ``log_time`` / ``log_tick``. Without pinning the active timeline the viewer is
+    free to plot against ``log_time`` — on which the ``elapsed`` visible-time-range
+    window (see :func:`_live_window`) has no effect, so the scroll never clips.
+    Forcing ``elapsed`` makes the window bite and the time axis read in seconds.
+    While windowed we also start in *Following* so the trailing range tracks the
+    live edge; with the window off we leave the play state alone (free scrubbing
+    over the full history).
+    """
+    return rrb.TimePanel(
+        timeline="elapsed",
+        play_state=PlayState.Following if _plot_window_s() > 0 else None,
+    )
 
 # -- entity paths (the contract with the emitter) ---------------------------
 
@@ -151,10 +203,13 @@ def _arm_column(side: str, signals: tuple[str, ...]) -> rrb.Vertical:
     layout containers have no visible header in the viewport, so the tag is what keeps
     the left and right columns unambiguous.
     """
+    win = _live_window()
     return rrb.Vertical(
         *[
             rrb.TimeSeriesView(
-                origin=f"/{proprio_path(sig, side)}", name=f"{PROPRIO_TITLES[sig]} · {side}"
+                origin=f"/{proprio_path(sig, side)}",
+                name=f"{PROPRIO_TITLES[sig]} · {side}",
+                time_ranges=win,
             )
             for sig in signals
         ],
@@ -170,10 +225,13 @@ def _factr_column(side: str) -> rrb.Vertical:
     is plugged in — the absent side's views simply stay empty (the emitter logs
     nothing for a leader it cannot reach).
     """
+    win = _live_window()
     return rrb.Vertical(
         *[
             rrb.TimeSeriesView(
-                origin=f"/{factr_path(sig, side)}", name=f"{FACTR_TITLES[sig]} · {side}"
+                origin=f"/{factr_path(sig, side)}",
+                name=f"{FACTR_TITLES[sig]} · {side}",
+                time_ranges=win,
             )
             for sig in FACTR_SERIES
         ],
@@ -188,14 +246,17 @@ def _policy_comm_row() -> rrb.Horizontal:
     in-flight wave marking the gap between them); the latency panel plots one
     round-trip point per completed request.
     """
+    win = _live_window()
     return rrb.Horizontal(
         rrb.TimeSeriesView(
             origin=f"/{POLICY_COMM_ROOT}",
             name="Policy server — packets (sent · received · errors · in-flight)",
+            time_ranges=win,
         ),
         rrb.TimeSeriesView(
             origin=f"/{POLICY_LATENCY_PATH}",
             name="Policy server — round-trip latency (ms)",
+            time_ranges=win,
         ),
         name="Policy server comms",
     )
@@ -233,6 +294,7 @@ def _proprio_blueprint(phase: str, task_name: str | None) -> rrb.Blueprint:
             rrb.Vertical(*rows, row_shares=row_shares),
             column_shares=[4, 1],
         ),
+        _live_time_panel(),
         collapse_panels=True,
     )
 
@@ -261,6 +323,7 @@ def eval_probe_blueprint(task_name: str | None = None) -> rrb.Blueprint:
             ),
             column_shares=[4, 1],
         ),
+        _live_time_panel(),
         collapse_panels=True,
     )
 
@@ -273,5 +336,6 @@ def welcome_blueprint() -> rrb.Blueprint:
             rrb.TextDocumentView(origin=f"/{README}", name="Dashboard"),
             column_shares=[4, 1],
         ),
+        _live_time_panel(),
         collapse_panels=True,
     )

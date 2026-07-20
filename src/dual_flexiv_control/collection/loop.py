@@ -311,6 +311,7 @@ class CollectionNode(ProcessNode):
         conventions = {side: self.arms[side].convention for side in record_sides}
 
         # LeRobot recorder — raises RecorderUnavailable if lerobot is not installed
+        # or an existing dataset's schema doesn't match this rig's features
         # (run_node catches, logs, and brings the system down with a clear message).
         recorder = LeRobotRecorder(self.cfg, self.recording, builder.features())
 

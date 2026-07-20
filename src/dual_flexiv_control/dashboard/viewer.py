@@ -29,8 +29,13 @@ DEFAULT_APP_ID = "dual-flexiv-experiments"
 #: Default gRPC (data) and HTTP (viewer) ports.
 DEFAULT_GRPC_PORT = 9876
 DEFAULT_WEB_PORT = 9090
-#: gRPC server memory cap; oldest non-static data is dropped past this.
-DEFAULT_MEMORY_LIMIT = "2GiB"
+#: gRPC server memory cap; oldest non-static data is dropped past this. With the
+#: live plots windowed (see :mod:`~.blueprints`), the viewer only ever needs a
+#: bounded trailing slice, so this stays small — keeping the server's buffer (and
+#: what a freshly-reloaded page must ingest) from growing with session uptime.
+#: Static styling (series names/colours, README) is exempt from the drop.
+#: Override with ``DFC_DASHBOARD_MEMORY_LIMIT``.
+DEFAULT_MEMORY_LIMIT = os.environ.get("DFC_DASHBOARD_MEMORY_LIMIT", "256MiB")
 
 # Process-global singletons, with two deliberately-split lifetimes:
 #

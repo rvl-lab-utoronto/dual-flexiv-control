@@ -25,7 +25,9 @@ log = logging.getLogger(__name__)
 
 
 class RecorderUnavailable(RuntimeError):
-    """Raised when a real LeRobot recorder cannot be constructed (missing dep)."""
+    """Raised when a real LeRobot recorder cannot be constructed — the ``lerobot``
+    dependency is missing, or an existing dataset at the destination cannot
+    safely be appended to (schema mismatch / resume disabled)."""
 
 
 @contextlib.contextmanager
@@ -48,6 +50,46 @@ def _hub_offline():
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+
+def _disk_features(dataset_dir: str) -> dict:
+    """The ``features`` dict recorded in an existing dataset's ``meta/info.json``."""
+    try:
+        info = json.loads(open(os.path.join(dataset_dir, "meta", "info.json")).read())
+    except (OSError, ValueError):
+        return {}
+    feats = info.get("features")
+    return feats if isinstance(feats, dict) else {}
+
+
+def _schema_mismatches(existing: dict, expected: dict) -> list[str]:
+    """Differences between an existing dataset's features and this run's (empty =
+    safe to append).
+
+    Only the keys this writer produces are compared — LeRobot's bookkeeping
+    features (timestamp, indices) are its own. ``names`` are compared too, when
+    both sides carry them: the same state dim can hide a different per-side
+    layout. The reverse direction matters as well: a feature the dataset has but
+    this run no longer produces (a removed camera, a dropped arm) would fail
+    ``add_frame`` just the same.
+    """
+    diffs: list[str] = []
+    for key, spec in expected.items():
+        have = existing.get(key)
+        if have is None:
+            diffs.append(f"{key}: not in the existing dataset")
+            continue
+        want_shape = [int(x) for x in spec.get("shape", ())]
+        have_shape = [int(x) for x in have.get("shape", ())]
+        if have_shape != want_shape:
+            diffs.append(f"{key}: shape {have_shape} on disk vs {want_shape} in this run")
+        elif (have.get("names") and spec.get("names")
+              and list(have["names"]) != list(spec["names"])):
+            diffs.append(f"{key}: same shape but a different layout (names differ)")
+    for key in existing:
+        if key.startswith("observation.") and key not in expected:
+            diffs.append(f"{key}: in the existing dataset but not produced by this run")
+    return diffs
 
 
 def _resumable(dataset_dir: str) -> bool:
@@ -85,7 +127,9 @@ class LeRobotRecorder:
     (root, encoders, writer threading). ``features`` is the spec from
     :meth:`FrameBuilder.features`. The dataset lives at ``root/repo_id``; when
     ``resume`` and that folder already exists it is opened for append, otherwise
-    it is created.
+    it is created. Appending is gated on the on-disk features matching this
+    run's: a dataset recorded under a different rig raises
+    :class:`RecorderUnavailable` (and is never overwritten).
     """
 
     def __init__(self, cfg, recording, features: dict, robot_type: str = "dual_flexiv") -> None:
@@ -105,13 +149,42 @@ class LeRobotRecorder:
             create_kwargs["streaming_encoding"] = bool(recording.streaming_encoding)
 
         has_meta = os.path.isdir(os.path.join(dataset_dir, "meta"))
-        if recording.resume and has_meta and _resumable(dataset_dir):
+        resumable = has_meta and _resumable(dataset_dir)
+        if recording.resume and resumable:
+            # Appending is only safe when the on-disk features match what this run
+            # records. A dataset recorded under a different rig (single-arm vs
+            # bimanual, different cameras or state signals) would otherwise resume
+            # fine and then explode mid-run at the first add_frame — after the arms
+            # are already in control. Refuse up front, and never touch the data.
+            diffs = _schema_mismatches(_disk_features(dataset_dir), features)
+            if diffs:
+                raise RecorderUnavailable(
+                    f"existing dataset at {dataset_dir} was recorded with a "
+                    "different schema than this run produces — appending would "
+                    "corrupt it, so it is left untouched:\n  - "
+                    + "\n  - ".join(diffs)
+                    + "\nThis usually means the rig / cameras / state signals "
+                    "changed since it was recorded (e.g. single-arm vs bimanual). "
+                    "Record to a fresh dataset with e.g. "
+                    "task.collection.repo_id=<namespace>/<name>, or move the "
+                    "existing folder away."
+                )
             log.info("resuming LeRobot dataset at %s", dataset_dir)
             # resume() (not the read-only constructor) opens the dataset in WRITE mode
             # with the async image writer + streaming encoder — same kwargs as create().
             with _hub_offline():   # local-only; never fall back to the Hub (401)
                 self._ds = LeRobotDataset.resume(cfg.repo_id, root=dataset_dir, **create_kwargs)
         else:
+            # A COMPLETE dataset only lands here when resume is disabled; recorded
+            # episodes are never deleted on the recorder's own initiative.
+            if resumable:
+                raise RecorderUnavailable(
+                    f"a complete dataset already exists at {dataset_dir} and "
+                    "recording.resume is disabled — refusing to delete recorded "
+                    "episodes. Re-enable resume to append, record elsewhere via "
+                    "task.collection.repo_id=<namespace>/<name>, or move the "
+                    "existing folder away."
+                )
             # A leftover half-written dataset (meta/ present but not resumable — e.g. a
             # prior crashed run) would make create() fail on the existing dir; clear it.
             if has_meta:

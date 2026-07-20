@@ -27,7 +27,10 @@ session drops back to VIEWING with the hardware untouched.
   "name": "zed:<name>"}`` (replace that hardware node now, when no run needs
   it), ``{"cmd": "start_factr"}`` / ``{"cmd": "stop_factr"}`` (launch/stop the
   external FACTR-Server processes — grav-comp leaders + API relay — when
-  ``factr.launch.enabled``; start arms a pose-then-calibrate countdown),
+  ``factr.launch.enabled``; start arms a pose-then-calibrate countdown — legacy,
+  the services now auto-start with the daemon), ``{"cmd": "enable_grav_comp"}`` /
+  ``{"cmd": "disable_grav_comp"}`` (POST every leader relay to ramp its master
+  gain up / down over ~1s — energize / de-energize the always-running leaders),
   ``{"cmd": "shutdown"}``. stdin EOF == shutdown, so a dead dashboard can
   never leave an orphaned daemon holding robots.
 * state — ``<runtime_dir>/session.json``, atomically replaced (same pattern as the
@@ -596,6 +599,19 @@ class SessionDaemon:
         """The supervise loop; returns the process exit code."""
         self._start_stdin_listener()
         self.start_hardware()
+        if self.factr_servers is not None:
+            # Auto-start the FACTR-Server processes with the daemon: the leaders
+            # boot limp (master gain 0) and energize only on the dashboard's
+            # grav-comp ramp, so there is no pose-then-calibrate countdown to wait
+            # out. Safe at fresh boot — self.run is None, no arms in control.
+            # Never let a spawn failure take the whole daemon down before it comes
+            # up: the arms/cameras must still serve even if the FACTR leaders don't.
+            try:
+                _, detail = self.factr_servers.start_now()
+                log.info("FACTR auto-start: %s", detail)
+            except Exception:
+                log.exception("FACTR auto-start failed; continuing without the FACTR leaders")
+            self.state.factr_servers = self.factr_servers.status()
         self.state_file.write(self.state)
         last_beat = time.monotonic()
         last_status_poll = 0.0
@@ -711,6 +727,10 @@ class SessionDaemon:
                 self._handle_start_factr()
             elif kind == "stop_factr":
                 self._handle_stop_factr()
+            elif kind == "enable_grav_comp":
+                self._handle_grav_comp(enable=True)
+            elif kind == "disable_grav_comp":
+                self._handle_grav_comp(enable=False)
             else:
                 self.state.message = f"unknown command {kind!r}"
                 log.warning("unknown command: %r", cmd)
@@ -866,6 +886,20 @@ class SessionDaemon:
                     refusal += (
                         " The servers are not launched — use ▶ Launch leaders "
                         "in the dashboard's Teleop leaders panel."
+                    )
+            else:
+                # Fresh streams only prove the producer is publishing — not that
+                # the leaders are energized. Grav comp OFF (or ramping) means the
+                # leaders are limp/sagging; a recording started against them would
+                # drag the followers. Require every server to report the leader
+                # actually holding full grav comp before allowing collection.
+                limp = self._factr_grav_comp_disabled_sides()
+                if limp:
+                    refusal = (
+                        "start refused — grav comp not enabled on FACTR "
+                        f"leader(s): {', '.join(limp)}. Enable grav comp (the "
+                        "dashboard's Teleop leaders panel) and wait for the "
+                        "leader(s) to energize, then retry."
                     )
         if refusal is not None:
             log.error("start %s task=%s refused by preflight: %s", phase, task, refusal)
@@ -1122,6 +1156,128 @@ class SessionDaemon:
         ok, detail = self.factr_servers.request_stop()
         self.state.message = detail
         self.state.factr_servers = self.factr_servers.status()
+
+    def _handle_grav_comp(self, enable: bool) -> None:
+        """Trigger the leaders' own grav-comp gain ramp over HTTP (energize/de-energize).
+
+        The teleops boot limp and ramp their master output gain themselves —
+        0→1 on enable, 1→0 on disable — over ~1s when signalled; the daemon just
+        fans a bodyless POST out to every configured server's per-side route
+        (``/{enable,disable}_grav_comp_{side}``). Best-effort: a per-server
+        failure is logged and folded into the operator message, never raised
+        (this runs on the command loop and must not crash it). No-op under
+        ``runtime.sim`` — the producer fabricates leader data, there are no
+        real servers to signal.
+        """
+        import http.client
+
+        verb = "enable" if enable else "disable"
+        if self.config.runtime.sim:
+            self.state.message = f"grav comp {verb}: sim runtime — no FACTR servers to signal"
+            log.info("grav comp %s requested but runtime is sim — no-op", verb)
+            return
+        servers = self.config.factr.servers
+        if not servers:
+            self.state.message = f"grav comp {verb}: no FACTR servers configured"
+            return
+        # DISABLED (2026-07-19): pushing convention.offsets_deg as the grav-comp offset is
+        # WRONG on the hardware -- offsets_deg calibrate the follower MAPPING, not the leader-
+        # URDF grav frame; the two diverge up to ~28 deg (left) / ~90 deg (right) vs the
+        # working pose-based offsets, which sagged the left arm. The FACTR side now pins its
+        # own pose-based grav offset (factr_rizon_*.yaml: joint_offsets). Left dormant rather
+        # than deleted pending a decision on the calibration-passthrough design.
+        # if enable:
+        #     self._push_factr_calibration(servers)
+        ok: list[str] = []
+        failed: list[str] = []
+        for side, srv in servers.items():
+            route = f"/{verb}_grav_comp_{side}"
+            try:
+                conn = http.client.HTTPConnection(srv.host, srv.port, timeout=srv.request_timeout_s)
+                try:
+                    conn.request("POST", route)
+                    resp = conn.getresponse()
+                    resp.read()  # drain the body so the socket closes cleanly
+                    if resp.status != 200:
+                        raise http.client.HTTPException(f"HTTP {resp.status}")
+                finally:
+                    conn.close()
+            except (OSError, http.client.HTTPException) as exc:
+                failed.append(side)
+                log.error("grav comp %s: POST http://%s:%s%s failed: %s",
+                          verb, srv.host, srv.port, route, exc)
+                continue
+            ok.append(side)
+            log.info("grav comp %s: signalled %s leader (%s:%s)",
+                     verb, side, srv.host, srv.port)
+        # On disable the leader gain ramps to 0 → it goes limp and SAGS while
+        # still streaming its (sagging) joint positions. A live collection run's
+        # consumer would keep feeding that sag to the followers as fresh
+        # setpoints → uncommanded real-robot motion. The daemon never commands
+        # the arms directly during a run (the consumer does), so its one lever
+        # over follower motion is the run itself: stopping it cuts the setpoint
+        # stream and each follower deadman-holds its last target, then Stop()s
+        # back to IDLE. Only collection tracks the leader; eval/skill runs don't,
+        # so they are left alone. Best-effort — a halt failure must never crash
+        # the command loop, and no active collection run is a safe no-op.
+        halted = False
+        if (not enable and self.run is not None
+                and self.run.phase == COLLECTION and not self.run.stopping):
+            try:
+                self._handle_stop()
+                halted = True
+            except Exception:  # noqa: BLE001 - halt is best-effort on the command loop
+                log.exception("grav comp disable: follower halt failed")
+        halt_note = " — collection halted (followers holding)" if halted else ""
+        if failed:
+            self.state.message = (
+                f"grav comp {verb}: {', '.join(ok) or 'none'} ok; "
+                f"{', '.join(failed)} unreachable{halt_note}"
+            )
+        else:
+            gerund = "energizing" if enable else "de-energizing"
+            self.state.message = (
+                f"grav comp {verb}d — leader(s) {gerund} ({', '.join(ok)}){halt_note}"
+            )
+
+    def _push_factr_calibration(self, servers) -> None:
+        """POST each leader's ``convention.offsets_deg`` to its FACTR relay (``/set_calibration_<side>``).
+
+        The relay republishes it to the teleop, which converts it to that leader's
+        gravity-comp joint offset. This makes DFC's ``arms.<side>.convention`` the single
+        source of truth for the leader calibration -- FACTR keeps only a boot-time
+        bootstrap in its own config. Best-effort and never raises (runs on the command
+        loop): a per-server failure just leaves that leader on its bootstrap offset.
+        """
+        import http.client
+        import json
+
+        arms = self.config.arms
+        for side, srv in servers.items():
+            arm = arms.get(side)
+            conv = getattr(arm, "convention", None) if arm is not None else None
+            offsets = list(getattr(conv, "offsets_deg", []) or []) if conv is not None else []
+            if not offsets:
+                log.info("calibration push: %s has no convention.offsets_deg — skipped", side)
+                continue
+            route = f"/set_calibration_{side}"
+            body = json.dumps({"offsets_deg": [float(o) for o in offsets]})
+            try:
+                conn = http.client.HTTPConnection(srv.host, srv.port, timeout=srv.request_timeout_s)
+                try:
+                    conn.request("POST", route, body=body, headers={"Content-Type": "application/json"})
+                    resp = conn.getresponse()
+                    resp.read()  # drain so the socket closes cleanly
+                    if resp.status != 200:
+                        raise http.client.HTTPException(f"HTTP {resp.status}")
+                finally:
+                    conn.close()
+            except (OSError, http.client.HTTPException) as exc:
+                log.error("calibration push: POST http://%s:%s%s failed: %s",
+                          srv.host, srv.port, route, exc)
+                continue
+            log.info("calibration push: %s <- offsets_deg %s",
+                     side, [round(float(o), 2) for o in offsets])
 
     def _tend_factr_servers(self) -> bool:
         """One supervisor beat + state sync; alerts on a teleop dying mid-teleop.
@@ -1519,6 +1675,51 @@ class SessionDaemon:
             if not fresh:
                 stale.append(side)
         return stale
+
+    def _factr_grav_comp_disabled_sides(self) -> list[str]:
+        """Configured FACTR sides not reporting full grav comp (or unreachable).
+
+        The collection start gate's energize check — fresh ``factr/<side>``
+        streams (:meth:`_factr_stale_sides`) prove only that the producer is
+        publishing, not that the leaders hold torque. Each server's
+        ``GET /status_<side>`` must report ``grav_comp_enabled`` true: the leader
+        actually holding full grav comp (``force_gain ≥ 0.99``), not limp or
+        mid-ramp. A side is returned when its server is unreachable, errors, or
+        reports the leader not fully energized — fail safe, never start a
+        recording against an un-energized or unknown leader. Empty under
+        ``runtime.sim`` (no real leaders; the producer fabricates data) or when
+        no servers are configured. Mirrors :meth:`_handle_grav_comp`'s HTTP
+        style; per-server errors are folded in, never raised (this runs on the
+        command loop's start path).
+        """
+        import http.client
+
+        if self.config.runtime.sim:
+            return []
+        disabled: list[str] = []
+        for side, srv in self.config.factr.servers.items():
+            route = f"/status_{side}"
+            enabled = False
+            try:
+                conn = http.client.HTTPConnection(srv.host, srv.port, timeout=srv.request_timeout_s)
+                try:
+                    conn.request("GET", route)
+                    resp = conn.getresponse()
+                    body = resp.read()  # drain the body so the socket closes cleanly
+                    if resp.status != 200:
+                        raise http.client.HTTPException(f"HTTP {resp.status}")
+                    enabled = bool(json.loads(body).get("grav_comp_enabled"))
+                finally:
+                    conn.close()
+            except (OSError, http.client.HTTPException, ValueError) as exc:
+                # ValueError covers json.JSONDecodeError (malformed status body).
+                log.error("grav comp gate: GET http://%s:%s%s failed: %s",
+                          srv.host, srv.port, route, exc)
+                disabled.append(side)
+                continue
+            if not enabled:
+                disabled.append(side)
+        return disabled
 
 
 def main() -> None:

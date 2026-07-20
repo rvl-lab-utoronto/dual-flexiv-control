@@ -15,11 +15,12 @@ signal target the python process itself, with no shell wrapper in between.
 
 Lifecycle, mirroring the task's semantics:
 
-* **Start is user-initiated, never automatic.** Energizing the leader servos
-  runs a calibration read at boot, so the operator must first pose the arms at
-  the calibration pose. ``request_start()`` arms a countdown
-  (``cfg.calib_delay_s``, surfaced live in the dashboard) and the processes
-  spawn when it expires.
+* **Start is automatic at daemon boot** (:meth:`start_now`). The leader teleops
+  now boot limp — energized at master output gain 0 — and ramp that gain up only
+  when told to over HTTP, so there is no pose to hold and no calibration window
+  to honour. The legacy user-initiated path (``request_start()`` arms a
+  ``cfg.calib_delay_s`` pose-then-calibrate countdown, spawning when it expires)
+  is kept but is no longer the primary route.
 * **Stop means SIGINT.** The teleop nodes de-energize (zero + disable torque,
   close the serial port) only from ``KeyboardInterrupt``; SIGTERM kills them
   with the servos still energized. Escalation past ``cfg.stop_grace_s`` is
@@ -149,6 +150,20 @@ class FactrServerSupervisor:
             f"FACTR launch armed — pose the leader arm(s) at {self.cfg.calib_pose} "
             f"NOW; calibration reads them in {delay:.0f}s"
         )
+
+    def start_now(self) -> tuple[bool, str]:
+        """Spawn the processes immediately, skipping the pose-then-calibrate countdown.
+
+        The daemon's boot auto-start: the leader teleops now boot limp (master
+        output gain 0 — energized but applying no torque) and ramp that gain up
+        only on the dashboard's grav-comp signal, so there is nothing to pose for
+        and no calibration window to wait out. Idempotent — a no-op once the
+        servers are counting down, running, or stopping (guards double-start).
+        """
+        if self.state in (COUNTDOWN, RUNNING, STOPPING):
+            return False, "FACTR servers already started"
+        self._spawn_all()  # straight to state RUNNING, no countdown
+        return True, "FACTR servers started (grav-comp leaders limp; API relay up)"
 
     def request_stop(self) -> tuple[bool, str]:
         """SIGINT every live process (the only de-energizing stop); cancel a countdown."""

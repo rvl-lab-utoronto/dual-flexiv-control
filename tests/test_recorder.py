@@ -1,7 +1,8 @@
 """Tests for LeRobotRecorder resume/create handling.
 
-``_resumable`` is pure (file checks, no lerobot). The recreate-on-corrupt and
-resume-and-append round-trip build a real dataset, so they are gated on lerobot.
+``_resumable`` and ``_schema_mismatches`` are pure (file/dict checks, no
+lerobot). The recreate-on-corrupt and resume-and-append round-trip build a real
+dataset, so they are gated on lerobot.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import numpy as np
 import pytest
 
 from dual_flexiv_control.collection.recorder import _resumable
+from dual_flexiv_control.collection.recorder import _schema_mismatches
 
 
 # --------------------------------------------------------------------------- #
@@ -48,6 +50,50 @@ def test_resumable_false_when_absent(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# _schema_mismatches (pure)
+# --------------------------------------------------------------------------- #
+
+_STATE_14 = {
+    "observation.state": {"dtype": "float32", "shape": (14,),
+                          "names": [f"{s}.q.{i}" for s in ("left", "right") for i in range(7)]},
+    "action": {"dtype": "float32", "shape": (16,), "names": ["..."] * 16},
+}
+
+
+def test_schema_match_ignores_bookkeeping_features():
+    disk = {k: {**v, "shape": list(v["shape"])} for k, v in _STATE_14.items()}
+    disk["timestamp"] = {"dtype": "float32", "shape": [1]}
+    disk["episode_index"] = {"dtype": "int64", "shape": [1]}
+    assert _schema_mismatches(disk, _STATE_14) == []
+
+
+def test_schema_mismatch_on_shape():
+    # the field failure: a single-arm dataset (state 7) resumed by a bimanual run
+    disk = {"observation.state": {"dtype": "float32", "shape": [7],
+                                  "names": [f"left.q.{i}" for i in range(7)]},
+            "action": {"dtype": "float32", "shape": [8], "names": ["..."] * 8}}
+    diffs = _schema_mismatches(disk, _STATE_14)
+    assert any("observation.state" in d and "[7]" in d and "[14]" in d for d in diffs)
+    assert any("action" in d for d in diffs)
+
+
+def test_schema_mismatch_on_names_at_same_shape():
+    disk = {k: {**v, "shape": list(v["shape"])} for k, v in _STATE_14.items()}
+    disk["observation.state"]["names"] = [f"{s}.dq.{i}" for s in ("left", "right") for i in range(7)]
+    assert any("layout" in d for d in _schema_mismatches(disk, _STATE_14))
+
+
+def test_schema_mismatch_on_camera_missing_from_run():
+    disk = {k: {**v, "shape": list(v["shape"])} for k, v in _STATE_14.items()}
+    disk["observation.images.static"] = {"dtype": "video", "shape": [720, 1280, 3]}
+    assert any("observation.images.static" in d for d in _schema_mismatches(disk, _STATE_14))
+
+
+def test_schema_mismatch_on_feature_missing_from_disk():
+    assert any("not in the existing dataset" in d for d in _schema_mismatches({}, _STATE_14))
+
+
+# --------------------------------------------------------------------------- #
 # create / resume round-trip (needs lerobot)
 # --------------------------------------------------------------------------- #
 
@@ -66,11 +112,15 @@ def _cfg_and_features(root, repo_id):
     GlobalHydra.instance().clear()
     with initialize_config_module(config_module="dual_flexiv_control.conf", version_base=None):
         cfg = OmegaConf.to_object(compose(config_name="config", overrides=[
-            "rig=bimanual",  # wrist_left exists only on the full rig
-            "cameras.wrist_left.width=32", "cameras.wrist_left.height=24",
+            "rig=bimanual",
+            # the test brings its own tiny camera so it doesn't depend on which
+            # cameras the rig currently enables
+            "+camera@cameras.testcam=zedx_wrist",
+            "cameras.testcam.placement=static",
+            "cameras.testcam.width=32", "cameras.testcam.height=24",
             f"recording.root={root}", f"task.collection.repo_id={repo_id}",
         ]))
-    cfg.cameras = {"wrist_left": cfg.cameras["wrist_left"]}
+    cfg.cameras = {"testcam": cfg.cameras["testcam"]}
     b = FrameBuilder(cfg.arms, list(cfg.arms), cfg.cameras, cfg.task.language_instruction,
                      cfg.task.state_signals, video=True)
     return cfg, b
@@ -82,13 +132,63 @@ def _record_episode(rec, builder, cfg, ep):
     def smp(v, dt=np.float64):
         return Samples(np.asarray(v, dt).reshape(1, -1), np.array([1], np.int64), np.array([0], np.int64))
 
-    cam = cfg.cameras["wrist_left"]
+    cam = cfg.cameras["testcam"]
     for i in range(5):
         obs = {"left/q": smp(np.zeros(7)), "right/q": smp(np.ones(7)),
-               "cam/wrist_left/left": smp((np.arange(cam.height * cam.width * 3) % 256).astype(np.uint8), np.uint8)}
+               "cam/testcam/left": smp((np.arange(cam.height * cam.width * 3) % 256).astype(np.uint8), np.uint8)}
         rec.add_frame(builder.build(obs, {"left": 0.01 * ep * np.ones(7), "right": 0.02 * ep * np.ones(7)},
                                     {"left": 0.1 * ep, "right": 0.2 * ep}))
     rec.save_episode()
+
+
+def _seed_complete_dataset(root, repo_id, features, episodes=5):
+    """A minimal on-disk dataset that passes _resumable: meta/info.json with
+    committed episodes + the given features, and a tasks.parquet stub."""
+    dd = os.path.join(root, repo_id, "meta")
+    os.makedirs(dd, exist_ok=True)
+    feats = {k: {**v, "shape": list(v["shape"])} for k, v in features.items()}
+    with open(os.path.join(dd, "info.json"), "w") as f:
+        json.dump({"total_episodes": episodes, "fps": 15, "features": feats}, f)
+    with open(os.path.join(dd, "tasks.parquet"), "wb") as f:
+        f.write(b"\0")
+    return os.path.join(root, repo_id)
+
+
+def test_recorder_refuses_resume_onto_mismatched_schema(tmp_path):
+    from dual_flexiv_control.collection import LeRobotRecorder
+    from dual_flexiv_control.collection.recorder import RecorderUnavailable
+
+    root = str(tmp_path)
+    cfg, builder = _cfg_and_features(root, "dual_flexiv/mismatched")
+    feats = builder.features()
+
+    # the field failure: the dataset on disk was recorded single-arm (state 7)
+    old = dict(feats)
+    old["observation.state"] = {"dtype": "float32", "shape": (7,),
+                                "names": [f"left.q.{i}" for i in range(7)]}
+    old["action"] = {"dtype": "float32", "shape": (8,),
+                     "names": [f"left.q_d.{j}" for j in range(7)] + ["left.gripper"]}
+    dataset_dir = _seed_complete_dataset(root, "dual_flexiv/mismatched", old)
+
+    with pytest.raises(RecorderUnavailable, match="different schema"):
+        LeRobotRecorder(cfg.task.collection, cfg.recording, feats)
+    # the mismatched dataset is left untouched, never recreated
+    assert os.path.isfile(os.path.join(dataset_dir, "meta", "info.json"))
+
+
+def test_recorder_never_deletes_complete_dataset_when_resume_off(tmp_path):
+    from dual_flexiv_control.collection import LeRobotRecorder
+    from dual_flexiv_control.collection.recorder import RecorderUnavailable
+
+    root = str(tmp_path)
+    cfg, builder = _cfg_and_features(root, "dual_flexiv/noresume")
+    feats = builder.features()
+    dataset_dir = _seed_complete_dataset(root, "dual_flexiv/noresume", feats)
+
+    cfg.recording.resume = False
+    with pytest.raises(RecorderUnavailable, match="refusing to delete"):
+        LeRobotRecorder(cfg.task.collection, cfg.recording, feats)
+    assert os.path.isfile(os.path.join(dataset_dir, "meta", "info.json"))
 
 
 def test_recorder_recreates_corrupt_leftover_then_resumes(tmp_path):

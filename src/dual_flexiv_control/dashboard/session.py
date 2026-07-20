@@ -334,6 +334,14 @@ class SessionManager:
         """Stop the FACTR-Server processes (SIGINT — the leaders de-energize)."""
         return self.send({"cmd": "stop_factr"})
 
+    def enable_grav_comp(self) -> bool:
+        """Ramp every leader's grav-comp master gain up (0→1 over ~1s)."""
+        return self.send({"cmd": "enable_grav_comp"})
+
+    def disable_grav_comp(self) -> bool:
+        """Ramp every leader's grav-comp master gain down (1→0 over ~1s)."""
+        return self.send({"cmd": "disable_grav_comp"})
+
     # -- state -------------------------------------------------------------------
 
     def view(self) -> SessionView:

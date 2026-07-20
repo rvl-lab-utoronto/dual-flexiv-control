@@ -8,7 +8,7 @@ defaults:
 # `control_coeffs@task.collection.coeffs=stiff` (presets: compliant|stiff|default).
 language_instruction: "Perform the bimanual task."
 collection:
-  repo_id: dfc/default  # LeRobot dataset for this task (under the recording root)
+  repo_id: dfc/bimanual  # LeRobot dataset for this task (under the recording root)
   num_episodes: 50      # demonstrations to teleoperate and record
 eval:
   num_timesteps: 400    # rollout horizon (max steps before an eval episode is cut off)

@@ -10,38 +10,44 @@ defaults:
   - /arm@arms.right: flexiv
   - /control@arms.left.control: qpos
   - /control@arms.right.control: qpos
-  - /camera@cameras.wrist_left: zedx_wrist
-  - /camera@cameras.wrist_right: zedx_wrist
+  # - /camera@cameras.wrist_left: zedx_wrist
+  # - /camera@cameras.wrist_right: zedx_wrist
   - /camera@cameras.static: zed2_static
   - /factr: bimanual
   - _self_
 
 arms:
   left:
-    name: "Lauer"          # display name (dashboard); customize freely
+    name: "Lauer"
     serial: Rizon4s-062841
-    # FACTR serves the trailing gripper as un-normalized servo radians. To record
-    # the gripper action as a 0..1 fraction, measure the raw leader gripper value
-    # (radians) at the fully-open and fully-closed trigger and set both here (open→0,
-    # closed→1, clipped) — see scripts/factr_gripper_calibrate.py. Because the
-    # read-only FACTR publisher re-zeroes the gripper at startup, measure against a
-    # consistent startup pose. Example (replace with measured values):
-    # convention: { gripper_open: 0.0, gripper_closed: 1.2 }
+    control_enabled: true
+    convention: { offsets_deg: [-78.05, 96.68, 97.47, 152.23, 1.32, 89.56, 75.94], sign_flip_joints: [5], gripper_open: 1.0799, gripper_closed: 1.6153 }
+    gripper:
+      enabled: true
+      name: "Flexiv-GN01"
+      velocity: 0.1          # Move velocity [m/s] (clamped to the gripper's params)
+      force: 20.0            # Move force [N]      (clamped to the gripper's params)
+      # open_width: 0.10     # override physical width [m] at 0.0 (default: params max_width)
+      # closed_width: 0.0    # override physical width [m] at 1.0 (default: params min_width)
+      # move_rate_hz: 15.0   # max Move rate; deadband: 0.02; init_on_start: true
   right:
+    convention: { offsets_deg: [-97.03, 1.05, 90.35, -158.47, -172.53, -172.35, 93.08], sign_flip_joints: [], gripper_open: 2.4, gripper_closed: 3 }
     name: "Rogers"
     serial: Rizon4s-062837
+    control_enabled: true
     # convention: { gripper_open: 0.0, gripper_closed: 1.2 }   # measure per leader
-
+    gripper:
+      enabled: true
+      name: "Flexiv-GN01"
+      velocity: 0.1          # Move velocity [m/s] (clamped to the gripper's params)
+      force: 20.0            # Move force [N]      (clamped to the gripper's params)
+      # open_width: 0.10     # override physical width [m] at 0.0 (default: params max_width)
+      # closed_width: 0.0    # override physical width [m] at 1.0 (default: params m
 # `serial` "" opens the first available camera; set each camera's real (numeric)
 # ZED serial to bind a process to a specific device. `auto_serial: true` binds to
 # whatever single ZED is connected (overrides `serial`).
+
 cameras:
-  wrist_left:
-    placement: wrist_left
-    serial: ""
-  wrist_right:
-    placement: wrist_right
-    serial: ""
   static:
     placement: static
     serial: ""
