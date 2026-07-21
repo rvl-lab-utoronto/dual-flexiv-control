@@ -16,3 +16,6 @@ command:
   wrench_d: 6          # feedforward wrench [f(3), m(3)] [N]:[Nm]
 streamed: [pose_d, twist_d]   # dim 13
 force_control_axes: [false, false, false, false, false, false]   # pure motion
+cartesian_impedance:
+  K_x: [2000.0, 2000.0, 2000.0, 200.0, 200.0, 200.0]
+  Z_x: [0.7, 0.7, 0.7, 0.7, 0.7, 0.7]

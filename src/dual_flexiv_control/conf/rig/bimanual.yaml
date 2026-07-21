@@ -8,8 +8,6 @@
 defaults:
   - /arm@arms.left: flexiv
   - /arm@arms.right: flexiv
-  - /control@arms.left.control: qpos
-  - /control@arms.right.control: qpos
   # - /camera@cameras.wrist_left: zedx_wrist
   # - /camera@cameras.wrist_right: zedx_wrist
   - /camera@cameras.static: zed2_static
@@ -18,10 +16,10 @@ defaults:
 
 arms:
   left:
+    control: ${task.control}
     name: "Lauer"
     serial: Rizon4s-062841
     control_enabled: true
-    convention: { offsets_deg: [-78.05, 96.68, 97.47, 152.23, 1.32, 89.56, 75.94], sign_flip_joints: [5], gripper_open: 1.0799, gripper_closed: 1.6153 }
     gripper:
       enabled: true
       name: "Flexiv-GN01"
@@ -31,11 +29,10 @@ arms:
       # closed_width: 0.0    # override physical width [m] at 1.0 (default: params min_width)
       # move_rate_hz: 15.0   # max Move rate; deadband: 0.02; init_on_start: true
   right:
-    convention: { offsets_deg: [-97.03, 1.05, 90.35, -158.47, -172.53, -172.35, 93.08], sign_flip_joints: [], gripper_open: 2.4, gripper_closed: 3 }
+    control: ${task.control}
     name: "Rogers"
     serial: Rizon4s-062837
     control_enabled: true
-    # convention: { gripper_open: 0.0, gripper_closed: 1.2 }   # measure per leader
     gripper:
       enabled: true
       name: "Flexiv-GN01"

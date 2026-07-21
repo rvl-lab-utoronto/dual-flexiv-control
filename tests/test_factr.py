@@ -192,11 +192,15 @@ def test_preflight_passes_in_sim_without_servers():
 def test_factr_interface_declares_one_stream_per_side():
     from dual_flexiv_control.interfaces.factr import FactrInterface
     from dual_flexiv_control.interfaces.factr import factr_stream_name
+    from dual_flexiv_control.interfaces.factr import raw_factr_stream_name
 
     cfg = _factr_cfg(("localhost", 5000), ("localhost", 5000))
     node = FactrInterface(cfg, SimpleNamespace(runtime_dir="/tmp", sim=False), "rid")
     specs = {s.name: s for s in node.declare_streams()}
-    assert set(specs) == {factr_stream_name("left"), factr_stream_name("right")}
+    assert set(specs) == {
+        factr_stream_name("left"), factr_stream_name("right"),
+        raw_factr_stream_name("left"), raw_factr_stream_name("right"),
+    }
     assert specs[factr_stream_name("left")].dim == 7  # the fixture's server dof
     assert specs[factr_stream_name("left")].dtype == "float64"
 

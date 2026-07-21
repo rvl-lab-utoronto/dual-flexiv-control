@@ -30,8 +30,8 @@ import numpy as np
 from ..cameras import RGB_VIEWS
 from ..cameras import camera_stream_name
 from ..cameras import view_shape
-from ..control import convert_factr_to_rizon
-from ..control import normalize_gripper
+from ..interfaces.factr.interface import factr_stream_name
+from ..interfaces.factr.interface import raw_factr_stream_name
 
 log = logging.getLogger(__name__)
 
@@ -94,6 +94,10 @@ class FrameBuilder:
             self.action_names += [f"{side}.q_d.{j}" for j in range(dof)]
             self.action_names.append(f"{side}.gripper")
         self.action_dim = len(self.action_names)
+        self._factr_streams = [
+            name for side in self._action_sides
+            for name in (factr_stream_name(side), raw_factr_stream_name(side))
+        ]
 
         # -- image layout: one RGB view per camera stream ----------------------
         # (name, view, feature_key, stream_name, shape)
@@ -144,7 +148,7 @@ class FrameBuilder:
     @property
     def stream_names(self) -> list[str]:
         """Every stream the loop must subscribe to (proprio state + camera views)."""
-        return list(self._state_reads) + [img[3] for img in self._images]
+        return list(self._state_reads) + self._factr_streams + [img[3] for img in self._images]
 
     @property
     def image_keys(self) -> list[str]:
@@ -167,6 +171,15 @@ class FrameBuilder:
                 "names": self.action_names,
             },
         }
+        for side in self._action_sides:
+            dim = int(self.arms[side].dof) + 1
+            names = [f"{side}.joint.{j}" for j in range(dim - 1)] + [f"{side}.gripper"]
+            feats[f"observation.factr.{side}"] = {
+                "dtype": "float32", "shape": (dim,), "names": names,
+            }
+            feats[f"observation.factr_raw.{side}"] = {
+                "dtype": "float32", "shape": (dim,), "names": names,
+            }
         for _name, _view, key, _stream, shape in self._images:
             feats[key] = {
                 "dtype": _IMAGE_DTYPE[self.video],
@@ -175,16 +188,16 @@ class FrameBuilder:
             }
         return feats
 
-    # -- per-tick action from raw leader samples ------------------------------
+    # -- per-tick action from ingestion-converted leader samples --------------
 
-    def actions_from_leaders(self, leaders: dict, conventions: dict) -> dict:
-        """``{side: q_d}`` converted targets + ``{side: gripper}`` from FACTR leaders.
+    def actions_from_leaders(self, leaders: dict, conventions=None) -> dict:
+        """``{side: q_d}`` targets + ``{side: gripper}`` from FACTR streams.
 
-        ``leaders`` maps side -> raw leader sample (``dof+1``, rad); ``conventions``
-        maps side -> ``JointConventionCfg``. Sides absent from ``leaders`` are
-        skipped (a failed read that tick). The trailing value is the gripper (raw
-        FACTR servo radians), normalized to a 0..1 fraction when the convention's
-        ``gripper_open``/``gripper_closed`` are calibrated (else passed through raw).
+        ``leaders`` maps side -> DFC-coordinate sample (``dof+1``, rad), converted
+        once by :class:`FactrInterface`. Sides absent from ``leaders`` are skipped.
+        The trailing value is already normalized to a 0..1 gripper fraction using
+        calibration owned by the FACTR leader YAML. ``conventions`` is accepted only
+        for compatibility with older callers and is ignored.
         """
         q_d: dict = {}
         grip: dict = {}
@@ -193,8 +206,8 @@ class FrameBuilder:
             if raw is None:
                 continue
             raw = np.asarray(raw, dtype=np.float64).ravel()
-            q_d[side] = convert_factr_to_rizon(raw, conventions[side])
-            grip[side] = normalize_gripper(raw[-1], conventions[side]) if raw.size else 0.0
+            q_d[side] = raw[:self._action_dof[side]]
+            grip[side] = float(raw[-1]) if raw.size else 0.0
         return {"q_d": q_d, "gripper": grip}
 
     # -- frame assembly -------------------------------------------------------
@@ -231,6 +244,17 @@ class FrameBuilder:
             "action": action,
             "task": self.instruction,
         }
+        for side in self._action_sides:
+            converted = observation.get(factr_stream_name(side))
+            raw = observation.get(raw_factr_stream_name(side))
+            if converted is None or converted.newest is None or raw is None or raw.newest is None:
+                return None
+            frame[f"observation.factr.{side}"] = np.asarray(
+                converted.newest, dtype=np.float32
+            ).ravel()
+            frame[f"observation.factr_raw.{side}"] = np.asarray(
+                raw.newest, dtype=np.float32
+            ).ravel()
 
         # camera images (software-synchronised: newest of each at this tick)
         for _name, _view, key, stream, shape in self._images:

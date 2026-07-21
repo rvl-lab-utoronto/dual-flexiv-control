@@ -1,8 +1,8 @@
 """FACTR teleoperation: the leader-arm stream producer + its HTTP clients.
 
 :class:`FactrInterface` is the ONE process that polls the FACTR FastAPI
-server(s) and publishes each leader's raw payload as a ``factr/<side>``
-shared-memory stream (see :func:`factr_stream_name`). Every consumer — the
+server(s) and publishes each leader as converted ``factr/<side>`` and untouched
+``factr/raw/<side>`` shared-memory streams. Every consumer — the
 collection loop, the brain, the dashboard mirror and status probe — attaches
 read-only to those streams; nothing else talks to the servers directly, so the
 viewer and the control path see identical samples by construction.
@@ -22,6 +22,7 @@ from .interface import FactrInterface
 from .interface import factr_stream_name
 from .interface import fresh_leader_positions
 from .interface import leader_stream_names
+from .interface import raw_factr_stream_name
 from .interface import wait_leaders_fresh
 from .launch import FactrServerSupervisor
 
@@ -34,5 +35,6 @@ __all__ = [
     "factr_stream_name",
     "fresh_leader_positions",
     "leader_stream_names",
+    "raw_factr_stream_name",
     "wait_leaders_fresh",
 ]

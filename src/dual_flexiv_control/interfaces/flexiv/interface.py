@@ -67,11 +67,12 @@ log = logging.getLogger(__name__)
 #: from "disconnected" (and to show operation mode + E-stop). Published as
 #: ``"<side>/status"`` — the consumer counterpart is ``dashboard.arms.STATUS_STREAM``.
 STATUS_SIGNAL = "status"
-#: 3-vector ``[operational_status_code, estop_pressed, control_active]``. The last
+#: 5-vector ``[operational_status_code, estop_pressed, control_active,
+#: servo_enabled, mode_code]``. The third
 #: element is 1.0 while this arm is inside a control session (COLLECTION/EVAL) and
 #: 0.0 while IDLE — the session supervisor watches it to detect an arm that dropped
 #: out of control mid-run (fault/deadman/safety halt), and the dashboard shows it.
-STATUS_DIM = 3
+STATUS_DIM = 5
 #: Refresh the (slow-changing) operation-mode/E-stop read at ~10 Hz regardless of the
 #: telemetry/control loop rate: the RDK status calls are pointless to run at 1 kHz and
 #: this keeps them off the hot control path's per-tick budget.
@@ -154,7 +155,7 @@ class FlexivInterface(StreamProducerNode):
         return specs
 
     def _status_signal(self, now_ns: int) -> np.ndarray:
-        """``[op_status_code, estop_pressed, control_active]`` for the status stream.
+        """Operational/E-stop/control/servo/mode vector for the status stream.
 
         The mode/E-stop half is read from the source, cached, and refreshed at
         ~``STATUS_RATE_HZ``; ``control_active`` is this node's own live state and is
@@ -169,9 +170,13 @@ class FlexivInterface(StreamProducerNode):
             except Exception:  # noqa: BLE001 - status is cosmetic; never kill the loop
                 log.debug("[%s] status read failed; reusing last", self.name, exc_info=True)
                 if self._status_cache is None:
-                    self._status_cache = np.zeros(2)  # UNKNOWN, estop clear
+                    self._status_cache = np.zeros(4)  # UNKNOWN, clear, servo off, UNKNOWN mode
             self._status_next_ns = now_ns + int(1e9 / STATUS_RATE_HZ)
-        return np.append(self._status_cache[:2], 1.0 if self._control_active else 0.0)
+        return np.concatenate((
+            self._status_cache[:2],
+            [1.0 if self._control_active else 0.0],
+            self._status_cache[2:4],
+        ))
 
     def open_source(self) -> None:
         # A stream marked `dummy` means "fabricate, don't read hardware". One robot
@@ -530,4 +535,3 @@ class FlexivInterface(StreamProducerNode):
             # HOME / SWITCH_MODE / SERVO_ON: surfaced for now; richer handling later.
             log.info("[%s] control command %s (args=%s)", self.name, cmd.kind.name, cmd.args)
         return False
-

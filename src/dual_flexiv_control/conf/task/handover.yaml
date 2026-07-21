@@ -1,5 +1,7 @@
 defaults:
   - base_task
+  - /control@control: qpos_overdamped
+  - _self_
 
 # Example task. Select with `task=handover`.
 language_instruction: "Pick up the object with the left arm and hand it to the right arm."

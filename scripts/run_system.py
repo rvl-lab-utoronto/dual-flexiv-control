@@ -13,7 +13,7 @@ on the CLI, Hydra-style:
         arms.left.serial=Rizon4-XXXXXX arms.right.serial=Rizon4-YYYYYY
 
     # Pick a controller per arm / retune rates
-    python scripts/run_system.py control@arms.left.control=force brain.rate_hz=200
+    python scripts/run_system.py control@task.control=force brain.rate_hz=200
 
     # See the fully composed config without running
     python scripts/run_system.py --cfg job

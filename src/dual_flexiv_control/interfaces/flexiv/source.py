@@ -57,7 +57,7 @@ def _integrate_pose(pose: np.ndarray, twist: np.ndarray, dt: float) -> np.ndarra
 #: of ``flexivrdk.OperationalStatus.READY`` in RDK 1.8.0) with the E-stop clear, so
 #: a sim run shows the dashboard "connected · Auto (Remote)" instead of disconnected.
 #: Hard-coded rather than importing flexivrdk to keep this source usable with no wheel.
-_SIM_STATUS = np.array([1.0, 0.0], dtype=np.float64)  # [OperationalStatus.READY, estop_pressed]
+_SIM_STATUS = np.array([1.0, 0.0, 1.0, 1.0], dtype=np.float64)
 
 
 class SafetyHalt(RuntimeError):
@@ -140,7 +140,7 @@ class FlexivSource:
         return self._robot.states()
 
     def read_status(self) -> np.ndarray:
-        """``[operational_status_code, estop_pressed]`` for the dashboard status stream.
+        """Operational state, E-stop, servo state, and actual RDK mode.
 
         Read from the ``Robot`` object (not ``RobotStates``): ``operational_status()``
         returns a ``flexivrdk.OperationalStatus`` enum whose ``.value`` the dashboard
@@ -152,6 +152,8 @@ class FlexivSource:
             [
                 float(self._robot.operational_status().value),
                 float(not self._robot.estop_released()),
+                float(self._robot.operational()),
+                float(self._robot.mode().value),
             ],
             dtype=np.float64,
         )
@@ -204,8 +206,8 @@ class FlexivSource:
 
         if kind in ("qpos", "qvel"):
             # `ctrl_cfg.mode` is NRT_JOINT_POSITION for the default qpos/qvel
-            # configs, or NRT_JOINT_IMPEDANCE for `qpos_impedance` (low-authority
-            # joint tracking via SetJointImpedance in _apply_coeffs below) — both
+            # configs, or NRT_JOINT_IMPEDANCE for `qpos_overdamped` (explicit
+            # joint damping via SetJointImpedance in _apply_coeffs below) — both
             # drive through the same SendJointPosition call in send_control().
             if kind == "qpos":
                 # Smooth MoveJ to the first commanded pose to avoid a startup jump.
@@ -258,9 +260,9 @@ class FlexivSource:
 
         robot = self._robot
         if ctrl_cfg.mode == "NRT_CARTESIAN_MOTION_FORCE":
-            if coeffs.cartesian_impedance is not None:
+            if ctrl_cfg.cartesian_impedance is not None:
                 robot.SetCartesianImpedance(
-                    coeffs.cartesian_impedance.K_x, coeffs.cartesian_impedance.Z_x
+                    ctrl_cfg.cartesian_impedance.K_x, ctrl_cfg.cartesian_impedance.Z_x
                 )
             if coeffs.max_contact_wrench is not None:
                 robot.SetMaxContactWrench(coeffs.max_contact_wrench)
@@ -273,7 +275,7 @@ class FlexivSource:
                 coord = getattr(flexivrdk.CoordType, ctrl_cfg.force_control_frame.root_coord)
                 robot.SetForceControlFrame(coord, ctrl_cfg.force_control_frame.T_in_root)
         elif ctrl_cfg.mode == "NRT_JOINT_IMPEDANCE":
-            imp = coeffs.joint_impedance
+            imp = ctrl_cfg.joint_impedance
             if imp is not None:
                 if imp.K_q_fraction is not None:
                     # Fraction of THIS robot's own nominal stiffness, read live —
@@ -525,7 +527,7 @@ class FakeFlexivSource:
         )
 
     def read_status(self) -> np.ndarray:
-        """Synthetic status: operational (``READY``) with the E-stop clear."""
+        """Synthetic status: READY, E-stop clear, servo on, actual mode IDLE."""
         return _SIM_STATUS.copy()
 
     # -- control half (no hardware; mirrors FlexivSource's contract) ----------

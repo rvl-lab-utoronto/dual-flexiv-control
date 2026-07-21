@@ -1180,14 +1180,8 @@ class SessionDaemon:
         if not servers:
             self.state.message = f"grav comp {verb}: no FACTR servers configured"
             return
-        # DISABLED (2026-07-19): pushing convention.offsets_deg as the grav-comp offset is
-        # WRONG on the hardware -- offsets_deg calibrate the follower MAPPING, not the leader-
-        # URDF grav frame; the two diverge up to ~28 deg (left) / ~90 deg (right) vs the
-        # working pose-based offsets, which sagged the left arm. The FACTR side now pins its
-        # own pose-based grav offset (factr_rizon_*.yaml: joint_offsets). Left dormant rather
-        # than deleted pending a decision on the calibration-passthrough design.
-        # if enable:
-        #     self._push_factr_calibration(servers)
+        if enable:
+            self._log_factr_calibration_diagnostics(servers)
         ok: list[str] = []
         failed: list[str] = []
         for side, srv in servers.items():
@@ -1210,6 +1204,11 @@ class SessionDaemon:
             ok.append(side)
             log.info("grav comp %s: signalled %s leader (%s:%s)",
                      verb, side, srv.host, srv.port)
+        if enable and not failed:
+            # FACTR republishes diagnostics at 2 Hz. Wait for the first post-enable
+            # snapshot, then mirror the synchronized control-tick capture into DFC's log.
+            time.sleep(0.65)
+            self._log_factr_enable_capture(servers)
         # On disable the leader gain ramps to 0 → it goes limp and SAGS while
         # still streaming its (sagging) joint positions. A live collection run's
         # consumer would keep feeding that sag to the followers as fresh
@@ -1240,17 +1239,97 @@ class SessionDaemon:
                 f"grav comp {verb}d — leader(s) {gerund} ({', '.join(ok)}){halt_note}"
             )
 
+    def _log_factr_calibration_diagnostics(self, servers) -> None:
+        """Strictly fetch and compare each FACTR startup calibration before enable."""
+        import numpy as np
+
+        from .interfaces.factr.client import FactrClient
+        from .interfaces.factr.interface import FactrInterface
+        from .control.convention import convert_factr_to_rizon
+
+        client = FactrClient.from_config(self.config.factr, sim=False)
+        try:
+            for side in servers:
+                payload = client.wait_diagnostics_for(
+                    side, timeout_s=self.config.factr.calibration_timeout_s
+                )
+                if not payload.get("available", False):
+                    raise RuntimeError(f"FACTR {side} diagnostics unavailable")
+                required = (
+                    "raw_q_rad", "configured_home_q_rad", "joint_offsets_rad",
+                    "model_signs", "model_q_rad",
+                )
+                vectors = {
+                    key: np.asarray(payload.get(key), dtype=float) for key in required
+                }
+                bad = [key for key, value in vectors.items()
+                       if value.shape != (7,) or not np.all(np.isfinite(value))]
+                if bad:
+                    raise RuntimeError(f"FACTR {side} invalid diagnostics fields: {bad}")
+                conv = FactrInterface._convention_from_diagnostics(
+                    side, self.config.factr.servers[side].dof, payload
+                )
+                raw_with_gripper = np.append(vectors["raw_q_rad"], 0.0)
+                dfc_q = convert_factr_to_rizon(raw_with_gripper, conv)
+                delta = dfc_q - vectors["model_q_rad"]
+                log.info(
+                    "GRAV COMP CALIBRATION %s: raw_q_rad=%s; "
+                    "factr_home_q_rad=%s; factr_offsets_rad=%s; "
+                    "factr_model_signs=%s; factr_model_q_rad=%s; "
+                    "leader_yaml_dfc_offsets_deg=%s; leader_yaml_dfc_sign_flip_joints=%s; "
+                    "dfc_converted_q_rad=%s; dfc_minus_factr_rad=%s",
+                    side,
+                    vectors["raw_q_rad"].tolist(),
+                    vectors["configured_home_q_rad"].tolist(),
+                    vectors["joint_offsets_rad"].tolist(),
+                    vectors["model_signs"].tolist(),
+                    vectors["model_q_rad"].tolist(),
+                    list(conv.offsets_deg),
+                    list(conv.sign_flip_joints),
+                    dfc_q.tolist(),
+                    delta.tolist(),
+                )
+        finally:
+            client.close()
+
+    def _log_factr_enable_capture(self, servers) -> None:
+        """Strictly fetch FACTR's first synchronized control tick after enable."""
+        from .interfaces.factr.client import FactrClient
+
+        client = FactrClient.from_config(self.config.factr, sim=False)
+        try:
+            for side in servers:
+                payload = client.get_diagnostics_for(side)
+                samples = payload.get("enable_samples") or []
+                if not samples:
+                    raise RuntimeError(f"FACTR {side} produced no enable capture")
+                first = samples[0]
+                required = (
+                    "raw_q_rad", "model_q_rad", "model_dq_rad_s", "home_error_rad",
+                    "limit_torque_nm", "null_torque_nm", "gravity_torque_nm",
+                    "friction_torque_nm", "total_torque_pre_gain_nm",
+                    "applied_torque_nm",
+                )
+                if any(not isinstance(first.get(key), list) or len(first[key]) != 7
+                       for key in required):
+                    raise RuntimeError(f"FACTR {side} malformed enable capture: {first!r}")
+                log.info("FACTR ENABLE CAPTURE %s: %s", side, first)
+        finally:
+            client.close()
+
     def _push_factr_calibration(self, servers) -> None:
         """POST each leader's ``convention.offsets_deg`` to its FACTR relay (``/set_calibration_<side>``).
 
         The relay republishes it to the teleop, which converts it to that leader's
         gravity-comp joint offset. This makes DFC's ``arms.<side>.convention`` the single
-        source of truth for the leader calibration -- FACTR keeps only a boot-time
-        bootstrap in its own config. Best-effort and never raises (runs on the command
-        loop): a per-server failure just leaves that leader on its bootstrap offset.
+        source of truth for the leader calibration.  This is deliberately fail-fast:
+        enabling a leader without a positively acknowledged, byte-for-byte equivalent
+        convention is unsafe, so any missing config, transport failure, malformed reply,
+        or acknowledgement mismatch raises and terminates the session daemon.
         """
         import http.client
         import json
+        import math
 
         arms = self.config.arms
         for side, srv in servers.items():
@@ -1258,26 +1337,67 @@ class SessionDaemon:
             conv = getattr(arm, "convention", None) if arm is not None else None
             offsets = list(getattr(conv, "offsets_deg", []) or []) if conv is not None else []
             if not offsets:
-                log.info("calibration push: %s has no convention.offsets_deg — skipped", side)
-                continue
+                raise RuntimeError(
+                    f"calibration push: {side} has no convention.offsets_deg"
+                )
+            expected_dof = int(srv.dof) - int(getattr(conv, "drop_trailing", 0))
+            if len(offsets) != expected_dof:
+                raise RuntimeError(
+                    f"calibration push: {side} has {len(offsets)} offsets; "
+                    f"expected {expected_dof}"
+                )
+            if not all(math.isfinite(float(o)) for o in offsets):
+                raise RuntimeError(f"calibration push: {side} offsets must all be finite")
             route = f"/set_calibration_{side}"
-            body = json.dumps({"offsets_deg": [float(o) for o in offsets]})
+            flips = list(getattr(conv, "sign_flip_joints", []) or [])
+            if any(int(j) < 0 or int(j) >= expected_dof for j in flips):
+                raise RuntimeError(
+                    f"calibration push: {side} sign_flip_joints out of range: {flips}"
+                )
+            body = json.dumps({
+                "offsets_deg": [float(o) for o in offsets],
+                "sign_flip_joints": [int(j) for j in flips],
+            })
             try:
                 conn = http.client.HTTPConnection(srv.host, srv.port, timeout=srv.request_timeout_s)
                 try:
                     conn.request("POST", route, body=body, headers={"Content-Type": "application/json"})
                     resp = conn.getresponse()
-                    resp.read()  # drain so the socket closes cleanly
+                    response_body = resp.read()  # drain so the socket closes cleanly
                     if resp.status != 200:
-                        raise http.client.HTTPException(f"HTTP {resp.status}")
+                        raise RuntimeError(
+                            f"calibration push: {side} returned HTTP {resp.status}: "
+                            f"{response_body[:200]!r}"
+                        )
                 finally:
                     conn.close()
-            except (OSError, http.client.HTTPException) as exc:
-                log.error("calibration push: POST http://%s:%s%s failed: %s",
-                          srv.host, srv.port, route, exc)
-                continue
-            log.info("calibration push: %s <- offsets_deg %s",
-                     side, [round(float(o), 2) for o in offsets])
+            except OSError as exc:
+                raise RuntimeError(
+                    f"calibration push: POST http://{srv.host}:{srv.port}{route} failed"
+                ) from exc
+            try:
+                acknowledgement = json.loads(response_body)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"calibration push: {side} returned malformed JSON acknowledgement"
+                ) from exc
+            expected_offsets = [float(o) for o in offsets]
+            expected_flips = sorted(set(int(j) for j in flips))
+            if acknowledgement != {
+                "side": side,
+                "offsets_deg": expected_offsets,
+                "sign_flip_joints": expected_flips,
+            }:
+                raise RuntimeError(
+                    f"calibration push: {side} acknowledgement mismatch: "
+                    f"expected offsets={expected_offsets}, flips={expected_flips}; "
+                    f"received {acknowledgement!r}"
+                )
+            log.info(
+                "calibration push audit: %s request offsets_deg=%s "
+                "sign_flip_joints=%s; exact acknowledgement=%r",
+                side, expected_offsets, expected_flips, acknowledgement,
+            )
 
     def _tend_factr_servers(self) -> bool:
         """One supervisor beat + state sync; alerts on a teleop dying mid-teleop.

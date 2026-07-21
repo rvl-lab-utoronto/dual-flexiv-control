@@ -531,13 +531,11 @@ def _ghost_configs(leader_samples: dict, conventions: dict) -> dict:
     the ghost stands where teleop is *commanding* the follower to go. Sides without a
     known convention are skipped.
     """
-    from ..control.convention import convert_factr_to_rizon
-
     ghost: dict = {}
     for side, jp in leader_samples.items():
         conv = conventions.get(side)
         if conv is not None:
-            ghost[side] = convert_factr_to_rizon(jp, conv)
+            ghost[side] = np.asarray(jp, dtype=float)[:7]
     return ghost
 
 

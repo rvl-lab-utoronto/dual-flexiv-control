@@ -79,7 +79,7 @@ class JointImpedanceCfg:
     across joints), resolved live at apply-time instead of a hand-picked absolute
     ``K_q``. Takes precedence over ``K_q`` when set — the safer way to ask for
     "a small fraction of however stiff this robot's joints nominally are" without
-    guessing per-model Nm/rad numbers (see :func:`very_compliant_coeffs`)."""
+    guessing per-model Nm/rad numbers."""
 
 
 @dataclass
@@ -136,28 +136,18 @@ class ControlChannelCfg:
 
 @dataclass
 class ControlCoeffsCfg:
-    """Per-phase controller coefficients (impedances + motion limits).
+    """Per-phase motion, contact, and null-space limits.
 
     A separate importable config group (``control_coeffs``) so each task can give
     different coefficients to collection (training) vs eval. The arm controller
     applies, AFTER ``SwitchMode``, only the subset its mode accepts (verified
     against flexivrdk 1.8.0):
 
-    * NRT_JOINT_POSITION (qpos/qvel): uses ``max_joint_vel``/``max_joint_acc`` as
-      the ``max_vel``/``max_acc`` args of ``SendJointPosition``. ``joint_impedance``
-      is NOT settable in this mode and is ignored.
-    * NRT_JOINT_IMPEDANCE (qpos over ``control/qpos_impedance`` instead of the
-      default ``control/qpos``): same ``SendJointPosition`` call, but the arm's
-      tracking authority comes from ``joint_impedance`` (``SetJointImpedance``)
-      rather than a fixed high-gain position loop — this is the only way to make
-      joint control genuinely *soft* (see :func:`very_compliant_coeffs`).
-    * NRT_CARTESIAN_MOTION_FORCE (end_effector/eef_vel/force): SetCartesianImpedance,
-      SetMaxContactWrench, SetNullSpacePosture apply; ``max_{linear,angular}_*``
-      feed the scalar limit args of ``SendCartesianMotionForce``.
+    Joint limits feed ``SendJointPosition``; Cartesian limits feed
+    ``SendCartesianMotionForce``. Impedance is applied separately from the selected
+    :class:`ControlCfg`, after ``SwitchMode``.
     """
 
-    joint_impedance: Optional[JointImpedanceCfg] = None         # SetJointImpedance(K_q,Z_q) — impedance modes only
-    cartesian_impedance: Optional[CartesianImpedanceCfg] = None # SetCartesianImpedance(K_x,Z_x) — cartesian modes
     max_contact_wrench: Optional[List[float]] = None            # [6] SetMaxContactWrench [N,Nm]
     null_space_posture: Optional[List[float]] = None            # [DoF] SetNullSpacePosture [rad]
     # NRT joint motion limits -> SendJointPosition(..., max_vel, max_acc):
@@ -170,27 +160,16 @@ class ControlCoeffsCfg:
     max_angular_acc: float = 5.0     # [rad/s^2]
 
 
-# -- named coefficient presets (single source of truth; registered as ConfigStore
-#    options of the `control_coeffs` group, so `control_coeffs@task.eval.coeffs=compliant`
-#    style swaps keep working without any YAML). joint_impedance stays unset in
-#    compliant/stiff/default: SetJointImpedance only takes effect under the
-#    NRT_JOINT_IMPEDANCE mode (``control/qpos_impedance``), not the default
-#    NRT_JOINT_POSITION qpos/qvel — per-phase joint aggressiveness there is via
-#    motion limits instead. very_compliant (below) is the one preset meant for
-#    that impedance-mode control kind.
+# -- named per-phase limit presets. Controller impedance is intentionally absent:
+#    it lives explicitly in conf/control/*.yaml.
 
 
 def compliant_coeffs() -> ControlCoeffsCfg:
     """Low stiffness + gentle motion limits — safe teleoperated collection.
 
-    The operator feels less resistance and contacts are softer. The schema default
-    for ``task.collection.coeffs``.
+    Gentle motion/contact limits for ``task.collection.coeffs``.
     """
     return ControlCoeffsCfg(
-        cartesian_impedance=CartesianImpedanceCfg(
-            K_x=[1200.0, 1200.0, 1200.0, 120.0, 120.0, 120.0],
-            Z_x=[0.7, 0.7, 0.7, 0.7, 0.7, 0.7],
-        ),
         max_contact_wrench=[40.0, 40.0, 40.0, 12.0, 12.0, 12.0],
         max_joint_vel=1.5,
         max_joint_acc=2.0,
@@ -207,10 +186,6 @@ def stiff_coeffs() -> ControlCoeffsCfg:
     The schema default for ``task.eval.coeffs``.
     """
     return ControlCoeffsCfg(
-        cartesian_impedance=CartesianImpedanceCfg(
-            K_x=[2500.0, 2500.0, 2500.0, 250.0, 250.0, 250.0],
-            Z_x=[0.7, 0.7, 0.7, 0.7, 0.7, 0.7],
-        ),
         max_contact_wrench=[60.0, 60.0, 60.0, 18.0, 18.0, 18.0],
         max_joint_vel=2.5,
         max_joint_acc=3.5,
@@ -224,10 +199,6 @@ def stiff_coeffs() -> ControlCoeffsCfg:
 def default_coeffs() -> ControlCoeffsCfg:
     """Moderate middle ground between :func:`compliant_coeffs` and :func:`stiff_coeffs`."""
     return ControlCoeffsCfg(
-        cartesian_impedance=CartesianImpedanceCfg(
-            K_x=[2000.0, 2000.0, 2000.0, 200.0, 200.0, 200.0],
-            Z_x=[0.7, 0.7, 0.7, 0.7, 0.7, 0.7],
-        ),
         max_contact_wrench=[50.0, 50.0, 50.0, 15.0, 15.0, 15.0],
         max_joint_vel=2.0,
         max_joint_acc=3.0,
@@ -239,19 +210,8 @@ def default_coeffs() -> ControlCoeffsCfg:
 
 
 def very_compliant_coeffs() -> ControlCoeffsCfg:
-    """Insanely low joint stiffness — cautious first policy eval on real hardware.
-
-    Only meaningful paired with a control kind on the NRT_JOINT_IMPEDANCE mode
-    (``control/qpos_impedance``, not the default ``control/qpos``): ``K_q_fraction``
-    asks for a small fraction of the connected robot's own nominal joint stiffness
-    (resolved live, so it stays "insanely low" regardless of the exact Nm/rad this
-    robot model reports) rather than a hand-picked absolute ``K_q``. A bad action
-    from an unverified/non-finetuned checkpoint then barely resists being pushed
-    off target instead of tracking it with full authority. Motion limits are
-    slower than :func:`compliant_coeffs` for the same reason.
-    """
+    """Legacy cautious limit preset; impedance is selected independently by control."""
     return ControlCoeffsCfg(
-        joint_impedance=JointImpedanceCfg(K_q_fraction=0.1, Z_q=[0.7] * 7),
         max_joint_vel=1.0,
         max_joint_acc=1.5,
     )
@@ -274,9 +234,8 @@ class ControlCfg:
       eef_vel       NRT_CARTESIAN_MOTION_FORCE SendCartesianMotionForce  (twist_d primary; pose_d integrated)
       force         NRT_CARTESIAN_MOTION_FORCE SendCartesianMotionForce  (wrench_d primary)
 
-    ``qpos``'s command/streamed schema also backs ``control/qpos_impedance``, the
-    NRT_JOINT_IMPEDANCE variant used for genuinely soft joint tracking (pair it
-    with the ``very_compliant`` coeffs preset) — same table row, different ``mode``.
+    ``qpos``'s command/streamed schema also backs ``control/qpos_overdamped`` —
+    the same table row with NRT_JOINT_IMPEDANCE and explicit damping.
     """
 
     kind: str = MISSING          # qpos | qvel | end_effector | eef_vel | force
@@ -286,6 +245,10 @@ class ControlCfg:
     streamed: List[str] = field(default_factory=list)   # fields posted per tick on the setpoint channel
 
     channel: ControlChannelCfg = field(default_factory=ControlChannelCfg)
+
+    # Impedance belongs to the control choice (conf/control/*.yaml), not a task phase.
+    joint_impedance: Optional[JointImpedanceCfg] = None
+    cartesian_impedance: Optional[CartesianImpedanceCfg] = None
 
     # Structural force-control config (cartesian `force` kind only; NOT a tunable coeff):
     force_control_axes: Optional[List[bool]] = None        # [6] [X,Y,Z,Rx,Ry,Rz] force-controlled axes
@@ -355,8 +318,7 @@ class CollectionCfg:
     recording root. Required per task so tasks never silently share a dataset."""
 
     coeffs: ControlCoeffsCfg = field(default_factory=compliant_coeffs)
-    """Controller coefficients during collection; compliant by default (safe teleop).
-    Swap with ``control_coeffs@task.collection.coeffs=<preset>``."""
+    """Motion/contact limits during collection. Impedance lives on ``TaskCfg.control``."""
 
     frequency_hz: float = 15.0
     """Collection loop rate: command + record cadence (also the dataset ``fps``)."""
@@ -398,6 +360,7 @@ class TaskCfg:
     """
 
     language_instruction: str = MISSING                            # shared by both phases
+    control: ControlCfg = MISSING
     state_signals: List[str] = field(default_factory=lambda: ["q"])
     """Proprio signals concatenated (per arm, side order) into ``observation.state``
     — shared by collection (recorded) and eval (observed) by construction."""
@@ -413,27 +376,22 @@ class TaskCfg:
 
 @dataclass
 class JointConventionCfg:
-    """FACTR leader → Rizon follower joint mapping (used by the brain, pure math).
+    """Leader-owned FACTR → Rizon mapping loaded from FACTR diagnostics.
 
-    Captured from the hardware-validated teleop test. ``offsets_deg`` is added
+    This is a runtime value object, not an ``ArmCfg``/follower setting. ``offsets_deg`` is added
     per-joint after converting the leader's radians to degrees; ``sign_flip_joints``
     negates those joint indices; the result is wrapped to ``[-180,180]`` and
     converted back to radians. ``drop_trailing`` discards FACTR's trailing gripper
-    value(s) (its payload is ``DoF+1``). Only the LEFT arm's values are known from
-    the test — the right arm's must be measured (do NOT assume symmetry).
+    value(s) (its payload is ``DoF+1``). The values must come from the corresponding
+    FACTR leader YAML; DFC deliberately has no calibrated defaults.
 
     ``gripper_open``/``gripper_closed`` calibrate that trailing gripper value. FACTR
-    serves it as an **un-normalized servo angle in radians** (it stores no open/closed
-    endpoints and, with the read-only publisher, zeroes the gripper at startup). Set
-    BOTH to the raw radian readings at the fully-open and fully-closed trigger to
-    record the gripper action as a 0..1 fraction (open→0, closed→1, clipped); leave
-    either ``None`` to record the raw radian value unchanged. Because the read-only
-    publisher re-zeroes at startup, measure these against a consistent startup pose
-    (see :func:`~dual_flexiv_control.control.normalize_gripper`).
+    serves it as an un-normalized servo angle in radians. Both endpoints are required
+    by the strict ingestion contract and map open→0 and closed→1 (clipped).
     """
 
-    offsets_deg: List[float] = field(default_factory=lambda: [180.0, -90.0, -90.0, 90.0, 90.0, 180.0, -90.0])
-    sign_flip_joints: List[int] = field(default_factory=lambda: [1, 2, 3])
+    offsets_deg: List[float] = field(default_factory=list)
+    sign_flip_joints: List[int] = field(default_factory=list)
     wrap_deg: bool = True
     drop_trailing: int = 1
     gripper_open: Optional[float] = None       # raw FACTR gripper value [rad] mapped to normalized 0.0
@@ -522,7 +480,6 @@ class ArmCfg:
                                          # run start. Off: enable only after the channels
                                          # attach (the arm is never enabled for a consumer
                                          # that dies before publishing them).
-    convention: JointConventionCfg = field(default_factory=JointConventionCfg)
     gripper: GripperCfg = field(default_factory=GripperCfg)   # follower gripper (opt-in)
 
 
@@ -666,6 +623,11 @@ class FactrCfg:
     """Freshness gate for readers: a ``factr/<side>`` sample older than this is
     treated as a leader dropout (consumers hold their last real target; the
     dashboard shows the leader as disconnected)."""
+
+    calibration_timeout_s: float = 30.0
+    """Maximum startup wait for each leader's diagnostics snapshot. Connection refusal
+    or ``available=false`` is treated as startup-in-progress until this deadline;
+    malformed calibration still fails immediately."""
 
     launch: FactrLaunchCfg = field(default_factory=FactrLaunchCfg)
     """Daemon-managed launch of the FACTR-Server processes (off by default)."""

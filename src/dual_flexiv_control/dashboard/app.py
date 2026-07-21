@@ -16,6 +16,7 @@ embedded viewer updates itself from the gRPC stream independently of these rerun
 from __future__ import annotations
 
 import os
+import time
 
 import streamlit as st
 
@@ -64,8 +65,7 @@ LOG_REFRESH = "2s"
 
 #: Trim the default top padding, style the tab bar (its labels use monochrome
 #: Material icons — forced white so the active tab's accent colour never tints
-#: them), enlarge the controls-column section headers (scoped via the explicit
-#: ``anchor=`` ids their ``st.subheader`` calls pin), and enlarge the
+#: them), and enlarge the
 #: per-episode action icons in the Storage tab (scoped via the
 #: ``st-key-stor_rows`` container class).
 _PAGE_CSS = """
@@ -73,11 +73,25 @@ _PAGE_CSS = """
 [data-testid="stMainBlockContainer"], .block-container {
     padding-top: 1.5rem !important;
 }
-h3#sec-experiment, h3#sec-status {
-    font-size: 1.9rem;
-    text-align: center;
-}
 .stTabs [data-baseweb="tab-list"] button { padding: 1rem 2.2rem; }
+.st-key-collection_launch button {
+    background-color: #2563eb !important;
+    border-color: #2563eb !important;
+    color: white !important;
+}
+.st-key-collection_launch button:hover {
+    background-color: #1d4ed8 !important;
+    border-color: #1d4ed8 !important;
+}
+.st-key-eval_launch button {
+    background-color: #16a34a !important;
+    border-color: #16a34a !important;
+    color: white !important;
+}
+.st-key-eval_launch button:hover {
+    background-color: #15803d !important;
+    border-color: #15803d !important;
+}
 .stTabs [data-baseweb="tab-list"] button [data-testid="stMarkdownContainer"] p {
     font-size: 1.35rem;
     font-weight: 600;
@@ -228,7 +242,6 @@ def _render_controls(
     tasks: list[TaskInfo], rig: RigInfo | None, registry: _runner.RunRegistry
 ) -> None:
 
-    st.subheader("Experiment", anchor="sec-experiment")
     if not tasks:
         st.error(
             "No tasks found in `conf/task/`. Add one (copy `task/default.yaml`) "
@@ -245,7 +258,8 @@ def _render_controls(
     # (what is demonstrated/evaluated — conf/task). The rig is fixed at launch
     # (``dfc-dashboard --rig <name>``) — switching it means restarting the session
     # daemon, which is too destructive to offer as a live control.
-    st.markdown(
+    rig_cols = st.columns([4, 1], vertical_alignment="center")
+    rig_cols[0].markdown(
         f"Rig: **`{rig.name}`**",
         help=(
             "Hardware setup from conf/rig — arms, cameras, FACTR leaders, serials. "
@@ -253,28 +267,27 @@ def _render_controls(
             "`dfc-dashboard --rig <name>` (or the VSCode dashboard tasks) to switch."
         ),
     )
-    if rig.description:
-        st.caption(rig.description)
-
-    by_name = {t.name: t for t in tasks}
-    selected = st.selectbox(
-        "Task", list(by_name),
-        help="Manipulation task from conf/task — instruction, dataset, episode counts.",
-    )
-    task = by_name[selected]
-
-    edit_cols = st.columns(2)
-    if edit_cols[0].button(
-        "✏️ Task YAML", use_container_width=True,
-        help=f"Open conf/task/{task.path.name} in VSCode on this machine.",
-    ):
-        result = open_in_vscode(task.path)
-        st.toast(result.message, icon="📝") if result.ok else st.warning(result.message)
-    if edit_cols[1].button(
+    if rig_cols[1].button(
         "✏️ Rig YAML", use_container_width=True,
         help=f"Open conf/rig/{rig.path.name} in VSCode on this machine.",
     ):
         result = open_in_vscode(rig.path)
+        st.toast(result.message, icon="📝") if result.ok else st.warning(result.message)
+    if rig.description:
+        st.caption(rig.description)
+
+    by_name = {t.name: t for t in tasks}
+    task_cols = st.columns([4, 1], vertical_alignment="bottom")
+    selected = task_cols[0].selectbox(
+        "Task", list(by_name),
+        help="Manipulation task from conf/task — instruction, dataset, episode counts.",
+    )
+    task = by_name[selected]
+    if task_cols[1].button(
+        "✏️ Task YAML", use_container_width=True,
+        help=f"Open conf/task/{task.path.name} in VSCode on this machine.",
+    ):
+        result = open_in_vscode(task.path)
         st.toast(result.message, icon="📝") if result.ok else st.warning(result.message)
 
     # Launchable only from VIEWING with every rig camera streaming and every
@@ -289,6 +302,7 @@ def _render_controls(
 
     if st.button(
         "⇄ Collection" if switching else "▶ Collection",
+        key="collection_launch",
         use_container_width=True, disabled=not (launchable or switching),
         help=(
             "Teleoperated demonstration gathering (real recording run). While "
@@ -300,8 +314,8 @@ def _render_controls(
 
     # One compact row: labels collapsed (the column is narrow), meaning carried
     # by tooltips + the resolution caption underneath.
-    eval_cols = st.columns([0.85, 1.1, 1.1, 0.6], vertical_alignment="center")
-    policy_choice = eval_cols[1].selectbox(
+    eval_cols = st.columns([1.1, 1.1, 0.6, 0.85], vertical_alignment="center")
+    policy_choice = eval_cols[0].selectbox(
         "Policy type", ["default", *discover_policies()], key="eval_policy_type",
         label_visibility="collapsed",
         help=(
@@ -312,7 +326,7 @@ def _render_controls(
     )
     policy = None if policy_choice == "default" else policy_choice
     by_alias = {h.alias: h.address for h in discover_ssh_hosts()}
-    host_choice = eval_cols[2].selectbox(
+    host_choice = eval_cols[1].selectbox(
         "Policy host", ["default", *by_alias], key="eval_policy_host",
         label_visibility="collapsed",
         help=(
@@ -322,7 +336,7 @@ def _render_controls(
         ),
     )
     host = by_alias.get(host_choice)
-    port_raw = eval_cols[3].text_input(
+    port_raw = eval_cols[2].text_input(
         "Policy port", key="eval_policy_port", placeholder="port",
         label_visibility="collapsed",
         help=(
@@ -331,8 +345,9 @@ def _render_controls(
         ),
     )
     port, port_error = _parse_port(port_raw)
-    if eval_cols[0].button(
+    if eval_cols[3].button(
         "⇄ Eval" if switching else "▶ Eval",
+        key="eval_launch",
         type="primary", use_container_width=True,
         disabled=not (launchable or switching) or port_error is not None,
         help=(
@@ -353,6 +368,8 @@ def _render_controls(
             f"{host or 'config host'}:{port or 'config port'}]"
         )
 
+    _reset_services_button(registry, key="reset_all_services", all_services=True)
+
     st.caption("Each launch runs a single episode.")
 
     if view.run_active:
@@ -366,25 +383,32 @@ def _render_controls(
         st.caption("Session daemon is not running — see the Logs tab or Reset services.")
 
     st.divider()
-    _render_factr_section(registry)
-
-    st.divider()
     _render_status(registry)
 
 
 def _render_arm_row(s: ArmStatus) -> None:
     connected = s.source == "live"
     dot = "🟢" if connected else "⚫"
-    mode = s.mode if connected else f":gray[{s.mode}]"
+    operation = s.operational_status if connected else f":gray[{s.operational_status}]"
     if s.control_active:
-        mode += " · :orange[controlling]"
+        operation += " · :orange[controlling]"
     if s.estop_pressed:
         estop = ":red[🛑 **E-STOP PRESSED**]"
     elif s.estop_pressed is False:
         estop = ":green[clear]"
     else:
         estop = ":gray[—]"
-    st.markdown(f"{dot} **{s.info.name}** · {mode}  \nE-stop: {estop}")
+    if s.servo_enabled is True:
+        servo = ":green[on]"
+    elif s.servo_enabled is False:
+        servo = ":gray[off]"
+    else:
+        servo = ":gray[—]"
+    mode = f"`{s.mode}`" if connected else ":gray[—]"
+    st.markdown(
+        f"{dot} **{s.info.name}** · {operation}  \n"
+        f"E-stop: {estop} · Servo: {servo} · Mode: {mode}"
+    )
 
 
 @st.fragment(run_every="2s")
@@ -416,6 +440,15 @@ def _render_leader_row(s: LeaderStatus) -> None:
     dot = "🟢" if s.reachable else "⚫"
     if s.reachable:
         detail = ":orange[sim]" if s.sim else ":green[live]"
+        if not s.sim:
+            _, grav_detail = _arms.grav_comp_display(
+                None if s.grav_comp_enabled is None else {
+                    "grav_comp_enabled": s.grav_comp_enabled,
+                    "force_gain": s.force_gain,
+                    "force_gain_target": s.force_gain_target,
+                }
+            )
+            detail += f" · {grav_detail}"
         detail += f" · {s.dof} joints"
         if s.gripper is not None:
             detail += f" · grip `{s.gripper:+.2f}`"
@@ -425,8 +458,8 @@ def _render_leader_row(s: LeaderStatus) -> None:
 
 
 @st.fragment(run_every="2s")
-def _leader_status_rows() -> None:
-    """Read-only per-leader (FACTR teleop arm) reachability rows, refreshed periodically."""
+def _leader_status_rows(registry: _runner.RunRegistry) -> None:
+    """Per-leader live/grav-comp status with that leader's scrollable log."""
     try:
         sides = configured_leader_sides()
     except Exception as exc:  # noqa: BLE001 - broken factr conf -> compact, visible note
@@ -435,78 +468,36 @@ def _leader_status_rows() -> None:
     if not sides:
         st.caption(":gray[No teleop leaders configured.]")
         return
+    info = registry.session_view().factr_servers or {}
+    logs = info.get("logs") or {}
+    # This fragment runs every 2 s. Convention discovery is deliberately a
+    # non-blocking observer poll and cannot bring down the dashboard.
+    _arms.discover_conventions()
     for side in sides:
-        _render_leader_row(read_leader_status(side))
-
-
-def _factr_unit_label(name: str) -> str:
-    """``teleop:left`` -> ``Left leader``; ``api`` -> ``API relay``."""
-    if name.startswith("teleop:"):
-        return f"{name.split(':', 1)[1].capitalize()} leader"
-    return "API relay" if name == "api" else name
-
-
-def _render_factr_teleop_row(name: str, unit_state: str, log_path: str | None) -> None:
-    """One grav-comp teleop's row: process state + its lifecycle from the health log.
-
-    The health log narrates the boot the leader stream can't show (nothing is
-    published until the start pose is matched): calibrating → match the start
-    pose (with the operator's distance-to-go) → grav comp with per-servo
-    temperatures. Fault lines (a servo latching HARDWARE ERROR or silently
-    dropping its own torque — the classic dead-grav-comp cause) surface loudly.
-    """
-    label = _factr_unit_label(name)
-    if unit_state == "down":
-        st.markdown(
-            f"🔴 **{label}** · :red[process died] — stop + relaunch "
-            "(the arm must be re-posed for calibration)"
-        )
-        return
-    if unit_state == "stopping":
-        st.markdown(f"⚫ **{label}** · :gray[de-energizing…]")
-        return
-    health = _factr_srv.read_teleop_health(log_path) if log_path else None
-    if health is None:
-        st.markdown(f"🟡 **{label}** · :gray[booting…]")
-        return
-    if health.phase == _factr_srv.CALIBRATING:
-        st.markdown(f"🟡 **{label}** · calibrating (reading the pose)…")
-    elif health.phase == _factr_srv.MATCHING:
-        err = "" if health.match_error is None else f" · error `{health.match_error:.2f}`"
-        st.markdown(
-            f"🟡 **{label}** · **move it to the start pose**{err}",
-            help="The teleop waits here until the leader roughly matches the "
-                 "follower's start configuration; the error is its distance to go.",
-        )
-    else:  # grav comp running
-        detail = ":green[grav comp]"
-        hottest = health.hottest
-        if hottest is not None:
-            color = "red" if hottest.temp_c >= 60 else ("orange" if hottest.temp_c >= 50 else "gray")
-            detail += f" · :{color}[id{hottest.sid} {hottest.temp_c}°C]"
-        if health.age_s is not None and health.age_s > 5.0:
-            detail += f" · :orange[health {health.age_s:.0f}s stale]"
-        st.markdown(f"🟢 **{label}** · {detail}")
-        if health.servos:
-            st.caption(
-                ":gray[" + "  ".join(f"id{s.sid} {s.temp_c}°" for s in health.servos) + "]"
+        cols = st.columns([5, 1], vertical_alignment="center")
+        with cols[0]:
+            _render_leader_row(read_leader_status(side))
+            poll = _arms.convention_poll_status(side)
+            icon = {"live": "🟢", "stale": "🟠", "reset": "🔄"}.get(
+                poll.get("state"), "⚪"
             )
-    for alert in health.alerts[-2:]:
-        st.error(alert, icon="🔥")
+            attempted = poll.get("attempted_at")
+            age = f" · {max(0, int(time.time() - attempted))}s ago" if attempted else ""
+            st.caption(f"{icon} calibration: {poll.get('message', 'polling')}{age}")
+        with cols[1].popover("Logs", use_container_width=True):
+            path = logs.get(f"teleop:{side}")
+            tail = _factr_srv.tail_lines(path)[-100:] if path else []
+            with st.container(height=320):
+                if tail:
+                    st.code("\n".join(tail), language="text")
+                else:
+                    st.caption(":gray[No log output available.]")
 
 
 @st.fragment(run_every="2s")
 def _render_factr_section(registry: _runner.RunRegistry) -> None:
-    """The Grav comp section: live leader health + the two grav-comp ramp controls.
-
-    The FACTR-Server processes (one grav-comp teleop per leader + the API relay —
-    see ``factr.launch``) auto-start with the daemon and stay up; the leaders boot
-    limp (master output gain 0). This section shows their live health (per-process
-    rows read from the health logs) and two controls that trigger the leaders'
-    OWN gain ramp over HTTP — no process launch/stop involved: Enable ramps every
-    leader 0→1 (energize), Disable ramps it 1→0 (de-energize), each over ~1s.
-    """
-    st.subheader("Grav comp")
+    """The shared grav-comp controls; per-leader state is shown above."""
+    st.markdown("##### Grav comp")
     view = registry.session_view()
     info = view.factr_servers
     if info is None:
@@ -516,8 +507,6 @@ def _render_factr_section(registry: _runner.RunRegistry) -> None:
         )
         return
     state = info.get("state")
-    logs = info.get("logs") or {}
-    units = info.get("units") or {}
 
     if state in ("off", "countdown"):
         # The service auto-starts with the daemon; this is only seen briefly at
@@ -525,23 +514,6 @@ def _render_factr_section(registry: _runner.RunRegistry) -> None:
         st.caption(":gray[FACTR service starting…]")
     elif state == "stopping":
         st.caption(":gray[FACTR service stopping — the leaders are de-energizing…]")
-    else:  # running: per-process rows + the health-log tails
-        for name, unit_state in units.items():
-            if name.startswith("teleop:"):
-                _render_factr_teleop_row(name, unit_state, logs.get(name))
-            elif unit_state == "down":
-                st.markdown("🔴 **API relay** · :red[down] — respawned automatically")
-            else:
-                st.markdown("🟢 **API relay** · :green[serving the leader endpoints]")
-        with st.expander("Health logs (tail)"):
-            for name in units:
-                path = logs.get(name)
-                if not path:
-                    continue
-                tail = _factr_srv.tail_lines(path)[-12:]
-                if tail:
-                    st.caption(_factr_unit_label(name))
-                    st.code("\n".join(tail), language="text")
 
     if st.button(
         "▶ Enable grav comp", key="factr_enable", use_container_width=True,
@@ -675,7 +647,7 @@ def _run_status_panel(registry: _runner.RunRegistry) -> None:
         st.session_state["_session_state_seen"] = view.state
         if prev is not None:
             st.rerun(scope="app")
-    if view.message:
+    if view.message and _service_message_section(view.message) is None:
         st.warning(view.message, icon="⚠️")
     if view.pending:
         st.info(
@@ -750,13 +722,38 @@ def _run_status_panel(registry: _runner.RunRegistry) -> None:
 
 
 def _render_status(registry: _runner.RunRegistry) -> None:
-    st.subheader("Status", anchor="sec-status")
-    st.markdown("#### Arms")
-    _arm_status_rows(registry)
-    st.markdown("#### Teleop leaders")
-    _leader_status_rows()
-    st.markdown("#### Cameras")
-    _camera_status_rows()
+    view = registry.session_view()
+    with st.container(border=True):
+        with st.container(
+            horizontal=True, horizontal_alignment="left",
+            vertical_alignment="center", gap="small",
+        ):
+            st.markdown("#### Follower Arms (Flexiv Rizon 4s)", width="content")
+            _reset_services_button(registry, key="reset_follower_services")
+        if view.message and _service_message_section(view.message) == "arms":
+            st.info(view.message)
+        _arm_status_rows(registry)
+    with st.container(border=True):
+        with st.container(
+            horizontal=True, horizontal_alignment="left",
+            vertical_alignment="center", gap="small",
+        ):
+            st.markdown("#### Followers (FACTR)", width="content")
+            _reset_services_button(registry, key="reset_factr_services")
+        if view.message and _service_message_section(view.message) == "factr":
+            st.info(view.message)
+        _leader_status_rows(registry)
+        _render_factr_section(registry)
+    with st.container(border=True):
+        with st.container(
+            horizontal=True, horizontal_alignment="left",
+            vertical_alignment="center", gap="small",
+        ):
+            st.markdown("#### Cameras", width="content")
+            _reset_services_button(registry, key="reset_camera_services")
+        if view.message and _service_message_section(view.message) == "cameras":
+            st.info(view.message)
+        _camera_status_rows()
     st.divider()
     _run_status_panel(registry)
 
@@ -769,10 +766,28 @@ def _render_status(registry: _runner.RunRegistry) -> None:
                     f"{record.task:<14} {record.status}"
                 )
 
-    st.divider()
+def _service_message_section(message: str) -> str | None:
+    """Route hardware-service messages to their owning status card."""
+    text = message.lower()
+    if "factr" in text or "grav comp" in text or "leader" in text:
+        return "factr"
+    if "camera" in text:
+        return "cameras"
+    if "arm" in text:
+        return "arms"
+    return None
+
+
+def _reset_services_button(
+    registry: _runner.RunRegistry, *, key: str, all_services: bool = False
+) -> None:
+    """Render a consistently safe reset control at the requested UI location."""
     if st.button(
-        "🔄 Reset services",
-        use_container_width=True,
+        "Reset all services" if all_services else "↻",
+        key=key,
+        type="secondary",
+        use_container_width=all_services,
+        disabled=registry.session_view().run_active,
         help=(
             "Restart the session daemon (fresh arm/camera connections), reload "
             "config from conf, and return the viewers to idle. Stop any active "
@@ -1233,23 +1248,10 @@ def _render_calibration_tab() -> None:
             st.rerun()
 
         flips_sorted = sorted(flips)
-        if st.button("💾 Sync to rig file", key=f"calib_sync::{side}", type="primary",
-                     use_container_width=True,
-                     help="Write arms.<side>.convention into the rig YAML, then Reset services."):
-            try:
-                path = _calibration.apply_to_rig(
-                    side, offsets, flips_sorted,
-                    gripper_open=grip_open, gripper_closed=grip_closed,
-                )
-                st.success(f"Wrote `arms.{side}.convention` to `{path}` — hit **Reset services** to apply.")
-            except Exception as exc:  # noqa: BLE001 - surface the write failure, don't crash
-                st.error(f"Sync failed: {exc}", icon="🛑")
+        st.info("Calibration is leader-owned. Copy the values below into the FACTR arm YAML and restart FACTR.")
         with st.expander("Preview / copy the config"):
             st.code(_calibration.format_yaml(side, offsets, flips_sorted, grip_open, grip_closed),
                     language="yaml")
-            st.caption("…or as a Hydra CLI override:")
-            st.code(_calibration.format_overrides(side, offsets, flips_sorted, grip_open, grip_closed),
-                    language="bash")
 
     with right:
         # OFF by default: st.tabs renders every tab body on each rerun and run_every

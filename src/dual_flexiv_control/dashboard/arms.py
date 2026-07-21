@@ -3,12 +3,9 @@
 Display **names** come from the composed Hydra config (`arms.<side>.name` in
 `conf/config.yaml`, customizable per arm; falls back to the side).
 
-**Operation mode** (Auto / Auto-Remote / Manual / …) and the **E-stop** state are
-*read-only*: `flexivrdk` can read them (`Robot.operational_status()`,
-`Robot.estop_released`) but cannot switch operation mode — that's a physical
-slide switch + Flexiv Elements. They are read live from a per-arm status stream
-``<side>/status`` ( ``[operational_status_code, estop_pressed]`` ) when the
-running system publishes it; otherwise the arm reads as **disconnected**.
+The operational state (Auto / Manual / fault), actual RDK control mode, servo
+state, and E-stop are read-only telemetry from ``Robot``. They are published on
+the per-arm ``<side>/status`` stream; otherwise the arm reads as disconnected.
 
 This is a **monitoring view, not a safety interlock.**
 """
@@ -17,6 +14,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,7 +22,8 @@ import numpy as np
 
 SIDES = ("left", "right")
 
-#: Per-arm status stream: ``[operational_status_code, estop_pressed, control_active]``.
+#: Per-arm status stream: ``[operational_status_code, estop_pressed, control_active,
+#: servo_enabled, mode_code]``.
 #: ``operational_status_code`` is ``flexivrdk.OperationalStatus(...).value``;
 #: ``control_active`` is 1.0 while the arm is inside a control session (a
 #: collection/eval run) and 0.0 while idle (viewing). Older 2-wide streams (no
@@ -86,6 +85,8 @@ class ArmStatus:
     estop_pressed: bool | None  # None = unknown
     source: str  # "live" | "disconnected"
     control_active: bool | None = None  # in a control session? None = unknown/old stream
+    servo_enabled: bool | None = None
+    operational_status: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,9 @@ class LeaderStatus:
     dof: int  # arm joints (trailing gripper dropped), when reachable
     gripper: float | None  # raw trailing gripper reading, when reachable
     sim: bool  # runtime.sim -> the reading is synthetic, not real hardware
+    grav_comp_enabled: bool | None = None  # None = status endpoint unavailable
+    force_gain: float | None = None  # live master output multiplier, 0..1
+    force_gain_target: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +112,11 @@ _LOCK = threading.Lock()
 #: Cached single compose of the bits the dashboard needs: arms, sim flag, FACTR cfg,
 #: per-side leader→Rizon joint conventions.
 _SNAPSHOT: tuple[tuple[ArmInfo, ...], bool, object, dict] | None = None
+_LEADER_STATUS_LOCK = threading.Lock()
+_LEADER_STATUS_CLIENT = None
+_LEADER_CONVENTION_LOCK = threading.Lock()
+_LEADER_CONVENTIONS: dict = {}
+_LEADER_CONVENTION_STATUS: dict[str, dict] = {}
 #: The rig the dashboard composes against (``rig=<name>`` override); None = the
 #: config default. Owned here so every dashboard compose (arms, cameras, storage)
 #: follows the same selection.
@@ -163,14 +172,71 @@ def discover_factr() -> object:
 
 
 def discover_conventions() -> dict:
-    """Per-side FACTR-leader → Rizon joint conventions (``{side: JointConventionCfg}``).
+    """Poll leader conventions without making FACTR a dashboard dependency.
 
-    Plain dataclass instances (resolved via ``OmegaConf.to_object``) so
-    :func:`~dual_flexiv_control.control.convention.convert_factr_to_rizon` can read
-    ``offsets_deg`` / ``sign_flip_joints`` / ``wrap_deg`` / ``drop_trailing`` directly.
-    Used to render each leader's *commanded* Rizon config (the teleop ghost).
+    A failed/unavailable endpoint returns the last valid per-side value (or omits the
+    side before the first success). Dashboard reruns call this again and recover
+    automatically when FACTR appears.
     """
-    return dict(_compose()[3])
+    from ..configs import JointConventionCfg
+    from ..interfaces.factr.client import FactrClient
+    from ..interfaces.factr.interface import FactrInterface
+
+    _arms_info, sim, factr, _legacy = _compose()
+    if sim:
+        return {
+            side: JointConventionCfg(
+                offsets_deg=[0.0] * (int(server.dof) - 1), sign_flip_joints=[],
+                drop_trailing=1, wrap_deg=True, gripper_open=0.0, gripper_closed=1.0,
+            )
+            for side, server in factr.servers.items()
+        }
+    discovered = {}
+    attempts = {}
+    client = FactrClient.from_config(factr, sim=False)
+    try:
+        for side, server in factr.servers.items():
+            attempted_at = time.time()
+            try:
+                data = client.get_diagnostics_for(side)
+                if data.get("available") is True:
+                    discovered[side] = FactrInterface._convention_from_diagnostics(
+                        side, int(server.dof), data
+                    )
+                    attempts[side] = {
+                        "state": "live", "attempted_at": attempted_at,
+                        "succeeded_at": attempted_at, "message": "calibration received",
+                    }
+                else:
+                    attempts[side] = {
+                        "state": "waiting", "attempted_at": attempted_at,
+                        "message": "FACTR is starting; diagnostics not available yet",
+                    }
+            except Exception as exc:  # FACTR is optional; poll again next fragment rerun.
+                attempts[side] = {
+                    "state": "unreachable", "attempted_at": attempted_at,
+                    "message": str(exc),
+                }
+    finally:
+        client.close()
+    with _LEADER_CONVENTION_LOCK:
+        _LEADER_CONVENTIONS.update(discovered)
+        for side, attempt in attempts.items():
+            previous = _LEADER_CONVENTION_STATUS.get(side, {})
+            if side not in discovered and previous.get("succeeded_at") is not None:
+                attempt["succeeded_at"] = previous["succeeded_at"]
+                attempt["state"] = "stale"
+                attempt["message"] += "; retaining last valid calibration"
+            _LEADER_CONVENTION_STATUS[side] = attempt
+        return dict(_LEADER_CONVENTIONS)
+
+
+def convention_poll_status(side: str) -> dict:
+    """Latest non-blocking dashboard diagnostics-poll state for one leader."""
+    with _LEADER_CONVENTION_LOCK:
+        return dict(_LEADER_CONVENTION_STATUS.get(side, {
+            "state": "waiting", "message": "waiting for first diagnostics poll",
+        }))
 
 
 def reset() -> None:
@@ -181,9 +247,22 @@ def reset() -> None:
     so edits to ``conf`` (or a changed ``runtime.sim``) take effect without a
     process restart.
     """
-    global _SNAPSHOT
+    global _SNAPSHOT, _LEADER_STATUS_CLIENT
     with _LOCK:
         _SNAPSHOT = None
+    with _LEADER_STATUS_LOCK:
+        if _LEADER_STATUS_CLIENT is not None:
+            _LEADER_STATUS_CLIENT.close()
+            _LEADER_STATUS_CLIENT = None
+    with _LEADER_CONVENTION_LOCK:
+        _LEADER_CONVENTIONS.clear()
+        _LEADER_CONVENTION_STATUS.clear()
+        now = time.time()
+        for side in configured_leader_sides():
+            _LEADER_CONVENTION_STATUS[side] = {
+                "state": "reset", "attempted_at": now,
+                "message": "calibration cache reset; waiting for next 2 s poll",
+            }
 
 
 def _compose() -> tuple[tuple[ArmInfo, ...], bool, object, dict]:
@@ -214,7 +293,6 @@ def _compose_uncached() -> tuple[tuple[ArmInfo, ...], bool, object, dict]:
         cfg = compose(config_name="config", overrides=compose_overrides())
 
     arms: list[ArmInfo] = []
-    conventions: dict = {}
     for side, arm in cfg.arms.items():
         name = (str(getattr(arm, "name", "") or "")).strip() or str(side).capitalize()
         arms.append(
@@ -225,11 +303,8 @@ def _compose_uncached() -> tuple[tuple[ArmInfo, ...], bool, object, dict]:
                 dof=int(getattr(arm, "dof", 7)),
             )
         )
-        conv = getattr(arm, "convention", None)
-        if conv is not None:
-            conventions[str(side)] = OmegaConf.to_object(conv)
     sim = bool(getattr(cfg.runtime, "sim", False))
-    return tuple(arms), sim, cfg.factr, conventions
+    return tuple(arms), sim, cfg.factr, {}
 
 
 # ---------------------------------------------------------------------------
@@ -246,12 +321,17 @@ def read_arm_status(arm: ArmInfo, runtime_dir: str | None = None) -> ArmStatus:
     """
     live = _read_live_status(arm, runtime_dir)
     if live is not None:
-        code, estop, control = live
+        code, estop, control, servo, actual_mode = live
         return ArmStatus(
-            arm, _label_for_code(code), bool(estop), "live",
+            arm, _mode_label(actual_mode), bool(estop), "live",
             control_active=None if control is None else bool(control),
+            servo_enabled=None if servo is None else bool(servo),
+            operational_status=_label_for_code(code),
         )
-    return ArmStatus(arm, mode="disconnected", estop_pressed=None, source="disconnected")
+    return ArmStatus(
+        arm, mode="unknown", estop_pressed=None, source="disconnected",
+        operational_status="disconnected",
+    )
 
 
 def configured_leader_sides() -> list[str]:
@@ -307,7 +387,63 @@ def read_leader_status(side: str) -> LeaderStatus:
         return LeaderStatus(side, name, reachable=False, dof=0, gripper=None, sim=sim)
     jp = np.asarray(jp, dtype=float).ravel()
     grip = float(jp[-1]) if jp.size else None
-    return LeaderStatus(side, name, reachable=True, dof=max(0, jp.size - 1), gripper=grip, sim=sim)
+    enabled = None
+    gain = None
+    gain_target = None
+    if sim:
+        enabled = False
+        gain = 0.0
+        gain_target = 0.0
+    else:
+        payload = read_leader_grav_comp_status(side)
+        if payload is not None:
+            try:
+                enabled = bool(payload["grav_comp_enabled"])
+                gain = float(payload["force_gain"])
+                gain_target = float(payload.get("force_gain_target", gain))
+            except (KeyError, TypeError, ValueError):
+                enabled = None
+                gain = None
+                gain_target = None
+    return LeaderStatus(
+        side, name, reachable=True, dof=max(0, jp.size - 1), gripper=grip, sim=sim,
+        grav_comp_enabled=enabled, force_gain=gain, force_gain_target=gain_target,
+    )
+
+
+def read_leader_grav_comp_status(side: str) -> dict | None:
+    """Read the authoritative per-leader gain state without changing it."""
+    from ..interfaces.factr.client import FactrClient
+
+    global _LEADER_STATUS_CLIENT
+    with _LEADER_STATUS_LOCK:
+        try:
+            if _LEADER_STATUS_CLIENT is None:
+                _LEADER_STATUS_CLIENT = FactrClient.from_config(discover_factr(), sim=False)
+            if side not in _LEADER_STATUS_CLIENT.sides:
+                return None
+            return _LEADER_STATUS_CLIENT.get_status_for(side)
+        except Exception:  # noqa: BLE001 - status is optional; stream still proves reachability
+            return None
+
+
+def grav_comp_display(status: dict | None) -> tuple[str, str]:
+    """Return the dashboard icon and label for a leader's actual output gain."""
+    if status is None:
+        return "🟡", ":gray[grav comp unknown]"
+    try:
+        gain = float(status["force_gain"])
+        target = float(status["force_gain_target"])
+        enabled = status["grav_comp_enabled"] is True
+    except (KeyError, TypeError, ValueError):
+        return "🟡", ":gray[grav comp unknown]"
+    if enabled:
+        return "🟢", f":green[grav comp enabled] · gain `{gain:.2f}`"
+    if target >= 0.99 and gain < 0.99:
+        return "🟡", f":orange[enabling grav comp] · gain `{gain:.2f}`"
+    if target <= 0.01 and gain > 0.01:
+        return "🟡", f":orange[disabling grav comp] · gain `{gain:.2f}`"
+    return "⚫", f":gray[grav comp disabled (limp)] · gain `{gain:.2f}`"
 
 
 def _runtime_root(runtime_dir: str | None) -> Path:
@@ -367,12 +503,14 @@ def _read_live_stream_newest(stream: str, runtime_dir: str | None) -> np.ndarray
 
 def _read_live_status(
     arm: ArmInfo, runtime_dir: str | None
-) -> tuple[float, float, float | None] | None:
+) -> tuple[float, float, float | None, float | None, float | None] | None:
     vec = _read_live_stream_newest(STATUS_STREAM.format(side=arm.side), runtime_dir)
     if vec is None or len(vec) < 2:
         return None
     control = float(vec[2]) if len(vec) >= 3 else None  # 2-wide: pre-session stream
-    return float(vec[0]), float(vec[1]), control
+    servo = float(vec[3]) if len(vec) >= 4 else None
+    actual_mode = float(vec[4]) if len(vec) >= 5 else None
+    return float(vec[0]), float(vec[1]), control, servo, actual_mode
 
 
 def read_live_joint_positions(side: str, runtime_dir: str | None = None) -> np.ndarray | None:
@@ -463,3 +601,15 @@ def _label_for_code(code: float) -> str:
     except Exception:  # noqa: BLE001 - flexivrdk absent / unknown code
         return f"status {int(code)}"
     return _MODE_LABELS.get(name, name.replace("_", " ").title())
+
+
+def _mode_label(code: float | None) -> str:
+    if code is None:
+        return "unknown"
+    try:
+        import flexivrdk
+
+        name = flexivrdk.Mode(int(code)).name
+    except Exception:  # noqa: BLE001 - SDK absent / unknown future mode
+        return f"mode {int(code)}"
+    return name.replace("NRT_", "NRT ").replace("_", " ").title()

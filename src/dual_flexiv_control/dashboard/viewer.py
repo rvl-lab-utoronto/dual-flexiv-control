@@ -18,7 +18,10 @@ first call. The Streamlit app guards it behind ``st.cache_resource``.
 from __future__ import annotations
 
 import os
+import socket
 import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from urllib.parse import quote
 
@@ -29,13 +32,17 @@ DEFAULT_APP_ID = "dual-flexiv-experiments"
 #: Default gRPC (data) and HTTP (viewer) ports.
 DEFAULT_GRPC_PORT = 9876
 DEFAULT_WEB_PORT = 9090
-#: gRPC server memory cap; oldest non-static data is dropped past this. With the
-#: live plots windowed (see :mod:`~.blueprints`), the viewer only ever needs a
-#: bounded trailing slice, so this stays small — keeping the server's buffer (and
-#: what a freshly-reloaded page must ingest) from growing with session uptime.
-#: Static styling (series names/colours, README) is exempt from the drop.
-#: Override with ``DFC_DASHBOARD_MEMORY_LIMIT``.
-DEFAULT_MEMORY_LIMIT = os.environ.get("DFC_DASHBOARD_MEMORY_LIMIT", "256MiB")
+#: gRPC server memory cap; oldest non-static data is dropped past this (static
+#: styling — series names/colours, README — is exempt). This is the ONLY bound on
+#: what a freshly-loaded viewer must replay: a full page refresh reconnects to the
+#: gRPC proxy, which streams the *entire retained store* from the start before it
+#: catches up to live — so this cap, not the plots' visible-time window (which is
+#: render-only; see :mod:`~.blueprints`), is what sets reload cost. The mirror logs
+#: ~3.4 MB/min (measured), so the old 256 MiB held ~75 min of history and a refresh
+#: replayed for *minutes*. 8 MiB holds ~2 min, bounding the backfill without
+#: reordering Rerun's store-initialization messages. Override with
+#: ``DFC_DASHBOARD_MEMORY_LIMIT``.
+DEFAULT_MEMORY_LIMIT = os.environ.get("DFC_DASHBOARD_MEMORY_LIMIT", "8MiB")
 
 # Process-global singletons, with two deliberately-split lifetimes:
 #
@@ -98,6 +105,55 @@ class RerunServers:
         return f"{self.web_base}/?url={quote(self.grpc_uri, safe='')}&persist=0&renderer=webgl"
 
 
+#: How long to wait for a torn-down gRPC listener to release its port, and for a
+#: freshly-served one to come up. Both are milliseconds in practice; the margin
+#: covers a loaded machine.
+_PORT_WAIT_S = 5.0
+
+
+def _port_listening(port: int) -> bool:
+    """True if something on this host accepts TCP connections on ``port``."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.25)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _await_port(port: int, *, listening: bool, timeout_s: float = _PORT_WAIT_S) -> bool:
+    """Poll until ``port`` is (not) accepting connections; False on timeout."""
+    deadline = time.monotonic() + timeout_s
+    while _port_listening(port) != listening:
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+def serve_grpc_checked(serve: Callable[[], str], grpc_port: int, what: str) -> str:
+    """Run a ``serve_grpc`` call and confirm a listener actually came up.
+
+    ``serve_grpc`` binds in a background thread and **returns a URI regardless**:
+    a bind failure (``Address already in use``) only kills that thread with a log
+    line, leaving a handle whose port nobody serves — a silently-black viewer.
+    The bind loses exactly when it races ``rerun_shutdown``, which releases the
+    previous listener *asynchronously*; *Reset services* re-serves immediately
+    after tearing down, so it lost that race routinely. So: wait for the previous
+    listener to clear, serve, then require the new one to answer — raising on
+    either timeout so the failure surfaces in the UI instead of as a dead iframe.
+    """
+    if not _await_port(grpc_port, listening=False):
+        raise RuntimeError(
+            f"port {grpc_port} is still in use, so the {what} gRPC server cannot "
+            "bind — is another dashboard running? Stop it and press Reset services."
+        )
+    uri = serve()
+    if not _await_port(grpc_port, listening=True):
+        raise RuntimeError(
+            f"the {what} gRPC server did not come up on port {grpc_port} — its "
+            "server thread died (see the dashboard log). Press Reset services to retry."
+        )
+    return uri
+
+
 def start_servers(
     app_id: str = DEFAULT_APP_ID,
     grpc_port: int = DEFAULT_GRPC_PORT,
@@ -115,9 +171,11 @@ def start_servers(
     recording, so anything that later calls ``rr.log`` / ``rr.send_blueprint``
     (including the emitter thread in :mod:`~.runner`) feeds this same recording.
 
-    A bind failure here (e.g. a stale dashboard still holding the port) raises —
-    it is not swallowed — so the problem surfaces immediately instead of leaving a
-    silently-black viewer.
+    A bind failure here (e.g. a stale dashboard still holding the port, or the
+    just-torn-down listener not yet released) raises via
+    :func:`serve_grpc_checked` — ``serve_grpc`` alone would not: its bind runs in
+    a background thread that dies with only a log line — so the problem surfaces
+    immediately instead of leaving a silently-black viewer.
     """
     global _SERVERS, _WEB_VIEWER_PORT
     with _LOCK:
@@ -126,10 +184,14 @@ def start_servers(
         rr.init(app_id, spawn=False)
         # cors_allow_origin="*": the embedded viewer (served on the web port) makes
         # a cross-origin request to this gRPC server (a different port), so allow it.
-        grpc_uri = rr.serve_grpc(
-            grpc_port=grpc_port,
-            server_memory_limit=memory_limit,
-            cors_allow_origin=["*"],
+        grpc_uri = serve_grpc_checked(
+            lambda: rr.serve_grpc(
+                grpc_port=grpc_port,
+                server_memory_limit=memory_limit,
+                cors_allow_origin=["*"],
+            ),
+            grpc_port,
+            what="metrics",
         )
         if _WEB_VIEWER_PORT is None:
             rr.serve_web_viewer(web_port=web_port, open_browser=False, connect_to=grpc_uri)

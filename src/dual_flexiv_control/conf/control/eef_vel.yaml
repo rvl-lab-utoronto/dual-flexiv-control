@@ -14,3 +14,6 @@ command:
   wrench_d: 6          # feedforward wrench
 streamed: [twist_d]   # brain posts twist; arm integrates to pose_d (dim 6)
 force_control_axes: [false, false, false, false, false, false]
+cartesian_impedance:
+  K_x: [2000.0, 2000.0, 2000.0, 200.0, 200.0, 200.0]
+  Z_x: [0.7, 0.7, 0.7, 0.7, 0.7, 0.7]

@@ -39,6 +39,7 @@ from urllib.parse import quote
 import numpy as np
 
 from . import arms as _arms
+from .viewer import serve_grpc_checked
 
 CALIB_APP_ID = "dual-flexiv-calibration"
 DEFAULT_CALIB_GRPC_PORT = 9881  # replay uses 9880; metrics 9876
@@ -62,10 +63,11 @@ def configured_leader_sides() -> list[str]:
 
 
 def current_convention(side: str):
-    """The active convention for ``side`` (from config), or a default if none is set."""
+    """Latest leader convention, or an uncalibrated UI placeholder while unavailable."""
     from ..configs import JointConventionCfg
 
-    return _arms.discover_conventions().get(side) or JointConventionCfg()
+    conventions = _arms.discover_conventions()
+    return conventions.get(side) or JointConventionCfg()
 
 
 def follower_dof(side: str) -> int:
@@ -233,18 +235,19 @@ def format_yaml(
     gripper_open: float | None = None,
     gripper_closed: float | None = None,
 ) -> str:
-    """A ``conf/rig`` snippet for one leader's measured convention (+ gripper if set)."""
+    """A FACTR leader-YAML initialization snippet for the measured convention."""
     lines = [
-        "arms:",
-        f"  {side}:",
-        "    convention:",
-        f"      offsets_deg: {_fmt_list(offsets_deg)}",
-        f"      sign_flip_joints: {list(sign_flip_joints)}",
+        "arm_teleop:",
+        "  initialization:",
+        f"    dfc_raw_offsets_deg: {_fmt_list(offsets_deg)}",
+        f"    dfc_sign_flip_joints: {list(sign_flip_joints)}",
+        "    dfc_wrap_deg: true",
+        "    dfc_drop_trailing: 1",
     ]
     if gripper_open is not None:
-        lines.append(f"      gripper_open: {float(gripper_open):.4f}")
+        lines.append(f"    dfc_gripper_open: {float(gripper_open):.4f}")
     if gripper_closed is not None:
-        lines.append(f"      gripper_closed: {float(gripper_closed):.4f}")
+        lines.append(f"    dfc_gripper_closed: {float(gripper_closed):.4f}")
     return "\n".join(lines)
 
 
@@ -255,7 +258,8 @@ def format_overrides(
     gripper_open: float | None = None,
     gripper_closed: float | None = None,
 ) -> str:
-    """Hydra CLI override for one leader's measured convention (+ gripper if set)."""
+    """Removed: leader conversion cannot be overridden through follower Hydra config."""
+    raise RuntimeError("FACTR conversion is leader-owned; edit the FACTR arm YAML")
     offsets = "[" + ",".join(f"{v:.2f}" for v in offsets_deg) + "]"
     flips = "[" + ",".join(str(int(j)) for j in sign_flip_joints) + "]"
     parts = [
@@ -412,7 +416,7 @@ def apply_to_rig(
     gripper_closed: float | None = None,
     rig: str | None = None,
 ):
-    """Write the measured convention into ``arms.<side>.convention`` of the rig YAML.
+    """Removed: conversion calibration belongs to the FACTR leader YAML.
 
     Sets offsets + sign flips, plus ``gripper_open``/``gripper_closed`` when provided
     (recorded endpoints win; unprovided endpoints fall back to any existing value).
@@ -421,6 +425,7 @@ def apply_to_rig(
     before the write, so a splice that would corrupt the file raises instead of leaving
     it broken. *Reset services* re-composes so the change takes effect.
     """
+    raise RuntimeError("refusing follower config write: edit the FACTR arm YAML")
     import yaml
 
     path = rig_path(rig)
@@ -512,7 +517,13 @@ def start_calib_viewer(web_port: int, grpc_port: int | None = None) -> CalibView
             return _VIEWER
         gp = grpc_port or grpc_port_from_env()
         rec = rr.RecordingStream(CALIB_APP_ID, recording_id="calibration")
-        uri = rec.serve_grpc(grpc_port=gp, default_blueprint=_blueprint(), cors_allow_origin=["*"])
+        uri = serve_grpc_checked(
+            lambda: rec.serve_grpc(
+                grpc_port=gp, default_blueprint=_blueprint(), cors_allow_origin=["*"]
+            ),
+            gp,
+            what="calibration",
+        )
         try:
             robot_view.log_scene(rec)  # static pedestal + arm geometry (home)
         except Exception:  # noqa: BLE001 - missing URDF must not break the tab

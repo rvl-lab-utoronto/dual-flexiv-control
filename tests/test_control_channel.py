@@ -31,8 +31,8 @@ from dual_flexiv_control.streams.stream import StreamWriter
 def _ctrl(kind: str):
     register_configs()
     with initialize_config_module(config_module="dual_flexiv_control.conf", version_base=None):
-        cfg = compose(config_name="config", overrides=[f"control@arms.left.control={kind}"])
-    return OmegaConf.to_object(cfg).arms["left"].control
+        cfg = compose(config_name="config", overrides=[f"control@task.control={kind}"])
+    return OmegaConf.to_object(cfg).task.control
 
 
 @pytest.mark.parametrize(
@@ -433,7 +433,7 @@ def test_send_control_safety_halt_covers_qpos_and_qvel():
 
 
 def test_start_control_switches_to_the_configured_mode_not_a_hardcoded_one():
-    """`qpos_impedance` must enter NRT_JOINT_IMPEDANCE, not the plain qpos mode."""
+    """`qpos_overdamped` must enter NRT_JOINT_IMPEDANCE, not plain qpos mode."""
     pytest.importorskip("flexivrdk")
     from types import SimpleNamespace
     from unittest.mock import MagicMock, patch
@@ -448,14 +448,14 @@ def test_start_control_switches_to_the_configured_mode_not_a_hardcoded_one():
 
     with patch.object(FlexivSource, "_bootstrap_movej", return_value=True):
         ok = src.start_control(
-            _ctrl("qpos_impedance"), ControlCoeffsCfg(), {"q_d": np.zeros(7)}, rs,
+            _ctrl("qpos_overdamped"), ControlCoeffsCfg(), {"q_d": np.zeros(7)}, rs,
         )
     assert ok is True
     src._robot.SwitchMode.assert_called_once_with(flexivrdk.Mode.NRT_JOINT_IMPEDANCE)
 
 
 def test_apply_coeffs_resolves_K_q_fraction_against_live_nominal_stiffness():
-    """`very_compliant`-style coeffs scale the robot's OWN K_q_nom, not a fixed number."""
+    """Control impedance fractions scale the robot's own K_q_nom."""
     pytest.importorskip("flexivrdk")
     from unittest.mock import MagicMock
 
@@ -466,10 +466,9 @@ def test_apply_coeffs_resolves_K_q_fraction_against_live_nominal_stiffness():
     src._robot = MagicMock()
     src._robot.info.return_value.K_q_nom = [1000.0] * 7
 
-    coeffs = ControlCoeffsCfg(joint_impedance=JointImpedanceCfg(K_q_fraction=0.1, Z_q=[0.7] * 7))
-    src._apply_coeffs(_ctrl("qpos_impedance"), coeffs)
+    src._apply_coeffs(_ctrl("qpos_overdamped"), ControlCoeffsCfg())
 
-    src._robot.SetJointImpedance.assert_called_once_with([100.0] * 7, [0.7] * 7)
+    src._robot.SetJointImpedance.assert_called_once_with([400.0] * 7, [0.8] * 7)
 
 
 def test_apply_coeffs_falls_back_to_absolute_K_q_without_a_fraction():
@@ -482,8 +481,9 @@ def test_apply_coeffs_falls_back_to_absolute_K_q_without_a_fraction():
     src = FlexivSource("sim", dof=7)
     src._robot = MagicMock()
 
-    coeffs = ControlCoeffsCfg(joint_impedance=JointImpedanceCfg(K_q=[50.0] * 7, Z_q=[0.7] * 7))
-    src._apply_coeffs(_ctrl("qpos_impedance"), coeffs)
+    ctrl = _ctrl("qpos_overdamped")
+    ctrl.joint_impedance = JointImpedanceCfg(K_q=[50.0] * 7, Z_q=[0.7] * 7)
+    src._apply_coeffs(ctrl, ControlCoeffsCfg())
 
     src._robot.info.assert_not_called()  # no live query needed for an absolute K_q
     src._robot.SetJointImpedance.assert_called_once_with([50.0] * 7, [0.7] * 7)

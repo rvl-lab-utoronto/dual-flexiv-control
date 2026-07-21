@@ -445,7 +445,7 @@ def test_action_layout_is_control_kind_aware():
     # Each arm's control kind sets its action space (primary field + width).
     for kind, field, dim in [("qvel", "dq_d", 7), ("eef_vel", "twist_d", 6),
                              ("end_effector", "pose_d", 7), ("force", "wrench_d", 6)]:
-        cfg = _config(f"control@arms.left.control={kind}")
+        cfg = _config(f"control@task.control={kind}")
         layout = ActionLayout(cfg.arms, ["left"])
         assert layout.field("left") == field
         assert layout.dim == dim + 1                         # primary + gripper
@@ -456,7 +456,7 @@ def test_action_layout_is_control_kind_aware():
 
 
 def test_loop_executes_qvel_and_zero_fills_nothing():
-    cfg = _config("control@arms.left.control=qvel")
+    cfg = _config("control@task.control=qvel")
     layout = ActionLayout(cfg.arms, ["left"])
     brain = _FakeBrain(cfg)
     policy = _ScriptedPolicy(layout.dim, horizon=3)
@@ -467,7 +467,7 @@ def test_loop_executes_qvel_and_zero_fills_nothing():
 
 
 def test_loop_executes_end_effector_zeros_feedforward_twist():
-    cfg = _config("control@arms.left.control=end_effector")
+    cfg = _config("control@task.control=end_effector")
     layout = ActionLayout(cfg.arms, ["left"])
     brain = _FakeBrain(cfg)
     policy = _ScriptedPolicy(layout.dim, horizon=3)
@@ -479,7 +479,7 @@ def test_loop_executes_end_effector_zeros_feedforward_twist():
 
 
 def test_loop_force_holds_measured_pose_from_eef():
-    cfg = _config("control@arms.left.control=force")
+    cfg = _config("control@task.control=force")
     layout = ActionLayout(cfg.arms, ["left"])
     measured_pose = np.array([0.1, 0.2, 0.3, 1.0, 0.0, 0.0, 0.0])
 
@@ -501,7 +501,7 @@ def test_loop_force_holds_measured_pose_from_eef():
 def test_loop_force_holds_command_when_pose_unavailable():
     # No eef stream in the snapshot -> can't build a force setpoint -> hold (no command),
     # rather than silently commanding a zero pose.
-    cfg = _config("control@arms.left.control=force")
+    cfg = _config("control@task.control=force")
     layout = ActionLayout(cfg.arms, ["left"])
     brain = _FakeBrain(cfg)                                   # snapshot has no left/eef
     policy = _ScriptedPolicy(layout.dim, horizon=3)
@@ -556,7 +556,7 @@ def test_loop_announces_horizon_end_target_per_inference():
 def test_loop_announces_integrated_horizon_for_qvel():
     """qvel has no joint target in the chunk: the horizon estimate integrates the
     velocity actions forward from the measured q (Euler, one step per action)."""
-    cfg = _config("control@arms.left.control=qvel")
+    cfg = _config("control@task.control=qvel")
     layout = ActionLayout(cfg.arms, ["left"])
     brain = _FakeBrain(cfg)
     policy = _ScriptedPolicy(layout.dim, horizon=3)
@@ -573,7 +573,7 @@ def test_loop_announces_integrated_horizon_for_qvel():
 def test_loop_announces_eef_horizon_for_end_effector():
     """Cartesian kinds predict a TCP position, not a joint config: the chunk-end
     pose_d's position is announced tagged \"eef\"."""
-    cfg = _config("control@arms.left.control=end_effector")
+    cfg = _config("control@task.control=end_effector")
     layout = ActionLayout(cfg.arms, ["left"])
     brain = _FakeBrain(cfg)
     policy = _ScriptedPolicy(layout.dim, horizon=3)
@@ -589,7 +589,7 @@ def test_loop_announces_eef_horizon_for_end_effector():
 def test_loop_announces_nothing_for_force():
     """A wrench chunk implies no kinematic displacement: no horizon prediction
     (rather than a fabricated one)."""
-    cfg = _config("control@arms.left.control=force")
+    cfg = _config("control@task.control=force")
     layout = ActionLayout(cfg.arms, ["left"])
     measured_pose = np.array([0.1, 0.2, 0.3, 1.0, 0.0, 0.0, 0.0])
 

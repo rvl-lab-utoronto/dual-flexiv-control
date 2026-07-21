@@ -113,7 +113,7 @@ def test_all_control_schemas_present_and_shaped():
     # Each arm carries one ControlCfg, composed from the `control` group. Verified
     # against flexivrdk 1.8.0: all NRT, flat send API, brain-driven over IPC.
     def ctrl(kind: str):
-        return _compose(f"control@arms.left.control={kind}").arms.left.control
+        return _compose(f"control@task.control={kind}").task.control
 
     # qpos -> NRT_JOINT_POSITION / SendJointPosition(q_d, dq_d, dq_max, ddq_max)
     qpos = ctrl("qpos")
@@ -127,9 +127,9 @@ def test_all_control_schemas_present_and_shaped():
     assert qvel.mode == "NRT_JOINT_POSITION"
     assert list(qvel.streamed) == ["dq_d"]
 
-    # qpos_impedance -> same schema as qpos, but NRT_JOINT_IMPEDANCE (low-authority
+    # qpos_overdamped -> same schema as qpos, but NRT_JOINT_IMPEDANCE
     # tracking via SetJointImpedance instead of a fixed high-gain position loop)
-    qpos_imp = ctrl("qpos_impedance")
+    qpos_imp = ctrl("qpos_overdamped")
     assert qpos_imp.mode == "NRT_JOINT_IMPEDANCE"
     assert qpos_imp.send_fn == "SendJointPosition"
     assert dict(qpos_imp.command) == dict(qpos.command)
@@ -161,27 +161,19 @@ def test_per_phase_control_coeffs_default_compliant_vs_stiff():
     obj = OmegaConf.to_object(_compose())
     coll = obj.task.collection.coeffs
     ev = obj.task.eval.coeffs
-    # compliant < stiff on cartesian stiffness and joint velocity limits
-    assert coll.cartesian_impedance.K_x[0] < ev.cartesian_impedance.K_x[0]
+    # phase presets still control motion limits, but no longer own impedance
     assert coll.max_joint_vel < ev.max_joint_vel
     # joint motion limits feed SendJointPosition max_vel/max_acc args
     assert coll.max_joint_vel == pytest.approx(1.5)
     assert ev.max_joint_vel == pytest.approx(2.5)
 
 
-def test_very_compliant_coeffs_preset_uses_fraction_of_nominal_stiffness():
-    # `very_compliant` asks for a small FRACTION of the live robot's own K_q_nom
-    # (resolved at apply-time; see FlexivSource._apply_coeffs) rather than a
-    # hard-coded absolute K_q, so it stays "insanely low" for any arm model.
-    cfg = _compose(
-        "control@arms.left.control=qpos_impedance",
-        "+control_coeffs@task.eval.coeffs=very_compliant",
-    )
-    imp = cfg.task.eval.coeffs.joint_impedance
+def test_qpos_overdamped_control_owns_impedance():
+    cfg = _compose("control@task.control=qpos_overdamped")
+    imp = cfg.task.control.joint_impedance
     assert imp is not None
-    assert 0.0 < imp.K_q_fraction < 0.3  # a small slice of nominal, not "None"/absolute
+    assert imp.K_q_fraction == pytest.approx(0.4)
     assert not imp.K_q  # no absolute K_q hard-coded alongside the fraction
-    assert cfg.task.eval.coeffs.max_joint_vel < cfg.task.eval.coeffs.max_joint_acc
 
 
 def test_control_coeffs_override_and_phase_selector():
@@ -196,6 +188,19 @@ def test_control_coeffs_override_and_phase_selector():
     assert cfg.task.eval.coeffs.max_joint_vel == pytest.approx(9.0)
     assert cfg.runtime.phase == "eval"
     assert cfg.arms.left.control_enabled is True
+
+
+def test_tasks_select_controls_and_impedance_lives_on_control():
+    default = OmegaConf.to_object(_compose("task=default", "rig=bimanual"))
+    assert default.task.control.mode == "NRT_JOINT_POSITION"
+    assert default.task.control.joint_impedance is None  # Flexiv SDK defaults
+    assert all(arm.control == default.task.control for arm in default.arms.values())
+
+    handover = OmegaConf.to_object(_compose("task=handover", "rig=bimanual"))
+    imp = handover.task.control.joint_impedance
+    assert handover.task.control.mode == "NRT_JOINT_IMPEDANCE"
+    assert imp.K_q_fraction == pytest.approx(0.4)
+    assert list(imp.Z_q) == [0.8] * 7
 
 
 def test_recording_group_defaults_and_task_dataset_identity():
@@ -282,7 +287,7 @@ def test_cli_style_overrides():
     cfg = _compose(
         "rig=bimanual",
         "runtime.sim=true",
-        "control@arms.left.control=force",
+        "control@task.control=force",
         "arms.left.serial=Rizon4-AAA",
         "brain.rate_hz=250",
         "arms.right.streams.tau.capacity=8192",

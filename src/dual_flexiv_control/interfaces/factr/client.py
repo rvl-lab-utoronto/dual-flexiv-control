@@ -102,6 +102,39 @@ class FactrServerClient:
             raise FactrError(f"FACTR request to {self.url} failed: {exc}") from exc
         return self._parse(payload)
 
+    def get_diagnostics(self) -> dict:
+        """Return FACTR's read-only startup-calibration snapshot."""
+        if self.sim:
+            return {}
+        path = f"/diagnostics_{self.side}"
+        try:
+            payload = self._get_json(path)
+        except (OSError, http.client.HTTPException, ValueError, json.JSONDecodeError) as exc:
+            self._reset_conn()
+            raise FactrError(f"FACTR diagnostics {self.side} failed: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise FactrError(f"FACTR diagnostics {self.side} returned non-object JSON")
+        return payload
+
+    def get_status(self) -> dict:
+        """Return this leader's live grav-comp state."""
+        if self.sim:
+            return {
+                "side": self.side,
+                "force_gain": 0.0,
+                "force_gain_target": 0.0,
+                "grav_comp_enabled": False,
+            }
+        path = f"/status_{self.side}"
+        try:
+            payload = self._get_json(path)
+        except (OSError, http.client.HTTPException, ValueError, json.JSONDecodeError) as exc:
+            self._reset_conn()
+            raise FactrError(f"FACTR status {self.side} failed: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise FactrError(f"FACTR status {self.side} returned non-object JSON")
+        return payload
+
     # -- HTTP -----------------------------------------------------------------
 
     def _connect(self) -> None:
@@ -115,10 +148,10 @@ class FactrServerClient:
                 pass
         self._conn = None
 
-    def _get_json(self):
+    def _get_json(self, path: str | None = None):
         if self._conn is None:
             self._connect()
-        self._conn.request("GET", self.path)
+        self._conn.request("GET", self.path if path is None else path)
         resp = self._conn.getresponse()
         body = resp.read()  # must fully read to reuse the keep-alive connection
         if resp.status != 200:
@@ -182,6 +215,37 @@ class FactrClient:
     def get_joint_positions_for(self, side: str) -> np.ndarray:
         """One leader's joint positions (queries only that leader's server)."""
         return self._servers[side].get_joint_positions()
+
+    def get_diagnostics_for(self, side: str) -> dict:
+        return self._servers[side].get_diagnostics()
+
+    def wait_diagnostics_for(self, side: str, timeout_s: float = 30.0) -> dict:
+        """Wait for FACTR startup to produce a diagnostics snapshot.
+
+        Transport failure and ``available=false`` mean the API/teleop is still starting.
+        The deadline remains strict: no snapshot raises :class:`FactrError` with the last
+        observed condition.
+        """
+        deadline = time.monotonic() + float(timeout_s)
+        last_error = "diagnostics not yet available"
+        while time.monotonic() < deadline:
+            try:
+                data = self.get_diagnostics_for(side)
+            except FactrError as exc:
+                last_error = str(exc)
+            else:
+                if data.get("available") is True:
+                    return data
+                last_error = "endpoint returned available=false"
+            time.sleep(0.1)
+        raise FactrError(
+            f"FACTR diagnostics {side} unavailable after {float(timeout_s):.1f}s: "
+            f"{last_error}"
+        )
+
+    def get_status_for(self, side: str) -> dict:
+        """One leader's live grav-comp state."""
+        return self._servers[side].get_status()
 
     def preflight(self) -> None:
         """Probe every configured leader once; raise if any is unreachable.

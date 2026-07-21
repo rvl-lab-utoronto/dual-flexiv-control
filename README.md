@@ -19,10 +19,8 @@ own process at its own rate:
    (`pyzed`)**, one process per camera, publishing image frames as streams: two
    **ZED X Nano** wrist cameras (one per arm) and one static external **ZED 2**
    stereo camera.
-4. **The FACTR client** (`interfaces/factr/`) — an **on-request** HTTP client
-   (no polling, no stream). The brain holds a `FactrClient`; calling
-   `get_joint_positions()` GETs the FACTR server's `get_joint_positions` endpoint
-   and returns both leaders' joint positions split per side (host/port configurable).
+4. **The FACTR interface** (`interfaces/factr/`) — polls each leader over HTTP and
+   publishes both its raw Dynamixel reading and its converted DFC/Rizon pose.
 
 ## Architecture
 
@@ -156,45 +154,43 @@ per tick (the rest are static limits from the coeffs). All paths are **NRT**
 | Controller | RDK mode | send fn | streamed (per-tick) |
 |---|---|---|---|
 | `qpos` | `NRT_JOINT_POSITION` | `SendJointPosition` | `q_d`, `dq_d` |
-| `qpos_impedance` | `NRT_JOINT_IMPEDANCE` | `SendJointPosition` | `q_d`, `dq_d` (low-authority tracking; needs a `joint_impedance` coeffs preset) |
+| `qpos_overdamped` | `NRT_JOINT_IMPEDANCE` | `SendJointPosition` | `q_d`, `dq_d` (overdamped) |
 | `qvel` | `NRT_JOINT_POSITION` | `SendJointPosition` | `dq_d` (arm integrates `q_d`) |
 | `end_effector` | `NRT_CARTESIAN_MOTION_FORCE` | `SendCartesianMotionForce` | `pose_d`, `twist_d` |
 | `eef_vel` | `NRT_CARTESIAN_MOTION_FORCE` | `SendCartesianMotionForce` | `twist_d` (arm integrates `pose_d`) |
 | `force` | `NRT_CARTESIAN_MOTION_FORCE` | `SendCartesianMotionForce` | `wrench_d`, `pose_d` |
 
-**Controller coefficients** (impedances + motion limits) default per phase from
-the schema — `task.collection.coeffs` is **compliant** (soft teleop) and
-`task.eval.coeffs` is **stiff** (precise tracking). The named presets
+Each task imports its controller under `task.control`, and each arm in the selected
+rig uses that controller. Impedance lives explicitly in the controller YAML; the
+default `qpos` leaves it to Flexiv's SDK, while `qpos_overdamped` and Cartesian
+controllers carry their own impedance blocks.
+
+**Controller coefficients** (motion/contact limits) default per phase from the
+schema. The named presets
 (`compliant`/`stiff`/`default`/`very_compliant`) are registered in
 [configs.py](src/dual_flexiv_control/configs.py) (single source of truth — no YAML
 files); swap one per phase with an appended group override, e.g.
 `'+control_coeffs@task.eval.coeffs=compliant'`, or tune fields directly
 (`task.eval.coeffs.max_joint_vel=2.0`). `runtime.phase` (`collection`|`eval`)
 selects which set the arms apply. The arm applies, after `SwitchMode`, only the
-coeffs its mode accepts (e.g. cartesian impedance for the Cartesian kinds;
-`dq_max`/`ddq_max` for the joint kinds).
-
-`qpos`'s `NRT_JOINT_POSITION` mode has no compliance knob at all (it is always a
-fixed high-gain position loop) — genuinely low joint stiffness needs the
-`qpos_impedance` control kind instead, paired with the `very_compliant` preset
-(`joint_impedance.K_q_fraction` — a small fraction of the connected arm's own
-nominal stiffness, resolved live rather than a hard-coded Nm/rad guess). Handy
-for a cautious first real-hardware pass of an unverified policy checkpoint:
-
-```bash
-dual-flexiv-control rig=left_only runtime.phase=eval policy=acme \
-    policy.host=<host> policy.port=<port> \
-    control@arms.left.control=qpos_impedance \
-    '+control_coeffs@task.eval.coeffs=very_compliant' \
-    arms.left.control_enabled=true
-```
+limits its mode accepts.
 
 ### Teleoperation (FACTR → follower)
 
-With `arm.control_enabled=true`, the brain's `process()` reads the FACTR leaders,
-maps them to Rizon joint targets via the per-arm `JointConventionCfg` (offsets,
-sign-flips, wrap, gripper drop — captured from the hardware test), and posts qpos
-setpoints. A hardware-free run:
+The convention boundary is intentionally at the FACTR interface. `factr/raw/<side>`
+is the untouched hardware payload; it is retained for diagnostics and datasets as
+`observation.factr_raw.<side>`. `factr/<side>` is converted once into the canonical
+DFC/Rizon convention and is what the viewer, brain, and
+`observation.factr.<side>` use. The FACTR server keeps a separate FACTR-model
+convention internally for leader gravity compensation. Its arm YAML stores the complete
+raw-Dynamixel→DFC convention (offsets, sign flips, wrapping, trailing-field handling,
+and gripper endpoints), the same physical home in DFC coordinates, and the explicit
+DFC→FACTR transform. DFC loads this contract from the leader diagnostics endpoint and
+crashes if it is absent or malformed; no leader conversion values live in the follower
+rig YAML and calibration is not pushed between services.
+
+With `arm.control_enabled=true`, the brain posts the already-converted FACTR pose as
+the Rizon qpos setpoint. A hardware-free run:
 
 ```bash
 dual-flexiv-control runtime.sim=true runtime.duration_s=3 \
@@ -220,7 +216,7 @@ dual-flexiv-control arms.left.serial=Rizon4-XXXXXX arms.right.serial=Rizon4-YYYY
 More overrides:
 
 ```bash
-dual-flexiv-control control@arms.left.control=force arms.left.wrench_frame=world \
+dual-flexiv-control control@task.control=force arms.left.wrench_frame=world \
                   brain.rate_hz=200 arms.right.streams.tau.capacity=8192
 dual-flexiv-control factr.host=192.168.1.50 factr.port=8080   # FACTR server location
 dual-flexiv-control --cfg job        # print the fully composed config and exit

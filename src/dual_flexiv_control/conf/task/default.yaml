@@ -1,11 +1,14 @@
 defaults:
   - base_task
+  - /control@control: qpos
+  - _self_
 
 # A manipulation task: the natural-language goal (shared by collection + eval),
 # its dataset, and the per-phase counts. Copy this file to add a task, then select
-# it with `task=<name>`. Controller coefficients default to compliant (collection)
-# / stiff (eval) from the schema; swap a preset per phase if needed, e.g.
-# `control_coeffs@task.collection.coeffs=stiff` (presets: compliant|stiff|default).
+# it with `task=<name>`.
+#
+# The defaults list selects this task's controller. ``qpos`` uses Flexiv's normal
+# SDK joint-position behavior; choose ``qpos_overdamped`` for heavier damping.
 language_instruction: "Perform the bimanual task."
 collection:
   repo_id: dfc/bimanual  # LeRobot dataset for this task (under the recording root)

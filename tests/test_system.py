@@ -55,10 +55,7 @@ def test_build_nodes_wires_per_phase_coeffs(tmp_path):
     assert arms_c, "expected FlexivInterface nodes"
     for n in arms_c:  # collection -> compliant
         assert n.coeffs.max_joint_vel == cfg_c.task.collection.coeffs.max_joint_vel
-        assert (
-            n.coeffs.cartesian_impedance.K_x[0]
-            == cfg_c.task.collection.coeffs.cartesian_impedance.K_x[0]
-        )
+        assert n.arm.control == cfg_c.task.control
 
     cfg_e = _make_config(tmp_path, "runtime.phase=eval")
     arms_e = [n for n in build_nodes(cfg_e, make_run_id()) if isinstance(n, FlexivInterface)]
@@ -173,15 +170,15 @@ def test_flexiv_sim_streams_cross_process(tmp_path):
         win = readers["left/q"].last(10)
         assert np.all(np.diff(win.t_ns) >= 0)
 
-        # Status stream: [operational_status_code, estop_pressed, control_active].
+        # Status: operational state, E-stop, control, servo state, actual RDK mode.
         # The sim reports READY (1) with the E-stop clear (0) — what makes the
         # dashboard show "connected" rather than "disconnected" — and this
-        # read-only node is never in a control session (control_active 0).
+        # producer enters its configured control session (control_active 1).
         status = readers["left/status"]
-        assert status.dim == 3
+        assert status.dim == 5
         assert status.last(1).n > 0, "sim Flexiv published no status"
         newest = status.latest().newest
-        assert newest[0] == 1.0 and newest[1] == 0.0 and newest[2] == 0.0
+        np.testing.assert_array_equal(newest, [1.0, 0.0, 1.0, 1.0, 1.0])
         for r in readers.values():
             r.close()
     finally:
@@ -221,7 +218,9 @@ def test_dashboard_reads_arm_as_connected_while_running(tmp_path):
             status = read_arm_status(info, runtime_dir=str(tmp_path))
 
         assert status.source == "live", "dashboard still reads the running arm as disconnected"
-        assert status.mode != "disconnected"
+        assert status.mode == "Idle"
+        assert status.operational_status == "Auto (Remote)"
+        assert status.servo_enabled is True
         assert status.estop_pressed is False  # sim E-stop clear
     finally:
         stop.set()

@@ -9,25 +9,16 @@
 # in defaults AND `wrist_left: { placement: wrist_left, serial: "" }` below.
 defaults:
   - /arm@arms.left: flexiv
-  - /control@arms.left.control: qpos
   - /camera@cameras.static: zed2_static
   - /factr: left                        # left leader only (:5001)
   - _self_
 
 arms:
   left:
+    control: ${task.control}
     name: "Lauer"
     serial: Rizon4s-062841
     control_enabled: true
-    # `convention` stays a single inline line — the dashboard's calibration Sync
-    # rewrites it in place (and preserves the gripper_open/gripper_closed endpoints).
-    # gripper_open/gripper_closed: the raw FACTR servo radians at the fully-open and
-    # fully-closed trigger, mapped to 0.0 (open) and 1.0 (closed). WITHOUT them the raw
-    # radians are sent unmapped, so the follower only travels part of its range (the
-    # trigger reads ~0..0.5, capping short of a full close). Re-measure per startup
-    # pose: `python scripts/factr_gripper_calibrate.py --side left`. If squeezing the
-    # trigger DECREASES the reading, swap them (open > closed) — reversed is handled.
-    convention: { offsets_deg: [-78.05, 96.68, 97.47, 152.23, 1.32, 89.56, 75.94], sign_flip_joints: [5], gripper_open: 0.0, gripper_closed: 0.5 }
     gripper:
       enabled: true
       # Gripper device name (the Gripper.Enable arg) — must match the device configured

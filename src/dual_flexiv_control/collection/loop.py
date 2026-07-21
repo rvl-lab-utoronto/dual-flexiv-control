@@ -160,7 +160,7 @@ class CollectionLoop:
         """Read + command + record one frame. Returns True if a frame was recorded."""
         # Fresh leader samples only — a dropped-out side is simply absent this tick.
         leaders = self._leaders()
-        acts = self.frames.actions_from_leaders(leaders, self.conventions)
+        acts = self.frames.actions_from_leaders(leaders)
         q_d, gripper = acts["q_d"], acts["gripper"]
 
         # Fill every recorded action side: fresh reading if we got one, else hold the
@@ -308,7 +308,8 @@ class CollectionNode(ProcessNode):
             specs_by_side[side] = specs
         brain.open_control(control_registry, specs_by_side)
         command_arms = {side: self.arms[side] for side in command_sides}
-        conventions = {side: self.arms[side].convention for side in record_sides}
+        # Leader conversion and gripper normalization already happened at FACTR ingestion.
+        conventions = {}
 
         # LeRobot recorder — raises RecorderUnavailable if lerobot is not installed
         # or an existing dataset's schema doesn't match this rig's features

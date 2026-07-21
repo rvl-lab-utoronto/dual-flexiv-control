@@ -45,6 +45,7 @@ import rerun.blueprint as rrb
 from . import robot_view
 from .robot_view import _POSE_TIMELINE  # shared timeline so arms + images + plots scrub together
 from .storage import _hub_offline
+from .viewer import serve_grpc_checked
 
 log = logging.getLogger(__name__)
 
@@ -299,10 +300,14 @@ def start_replay_viewer(web_port: int, grpc_port: int | None = None) -> ReplayVi
             return _VIEWER
         gp = grpc_port or grpc_port_from_env()
         _HOST = rr.RecordingStream(REPLAY_APP_ID, recording_id="replay-host")
-        _SERVER_URI = _HOST.serve_grpc(
-            grpc_port=gp,
-            default_blueprint=replay_blueprint([]),
-            cors_allow_origin=["*"],
+        _SERVER_URI = serve_grpc_checked(
+            lambda: _HOST.serve_grpc(
+                grpc_port=gp,
+                default_blueprint=replay_blueprint([]),
+                cors_allow_origin=["*"],
+            ),
+            gp,
+            what="replay",
         )
         _VIEWER = ReplayViewer(web_port=web_port, grpc_uri=_SERVER_URI)
         return _VIEWER

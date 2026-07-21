@@ -8,7 +8,7 @@
 # Override anything from the CLI, Hydra-style, e.g.:
 #   dual-flexiv-control runtime.sim=true runtime.duration_s=10
 #   dual-flexiv-control rig=bench runtime.phase=collection
-#   dual-flexiv-control control@arms.left.control=force brain.rate_hz=200
+#   dual-flexiv-control control@task.control=force brain.rate_hz=200
 #   dual-flexiv-control task=handover task.eval.num_timesteps=800
 defaults:
   - base_config            # structured schema (ConfigStore) -> validates everything below

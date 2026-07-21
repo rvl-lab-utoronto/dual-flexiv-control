@@ -24,9 +24,7 @@ from ..control import SETPOINT
 from ..control import COMMAND
 from ..control import GRIPPER
 from ..control import control_specs
-from ..control import convert_factr_to_rizon
 from ..control import gripper_spec
-from ..control import normalize_gripper
 from ..control import pack_streamed
 from ..interfaces.factr import fresh_leader_positions
 from ..interfaces.factr import leader_stream_names
@@ -303,16 +301,16 @@ class BrainNode(ProcessNode):
                         side, ctrl.kind,
                     )
                 continue
-            q_d = convert_factr_to_rizon(q_leader, arm.convention)
+            # FACTR interface already publishes arm joints in the canonical DFC/Rizon
+            # convention; ingestion is the only raw-leader conversion boundary.
+            q_d = np.asarray(q_leader, dtype=np.float64).ravel()[:arm.dof]
             setpoint = pack_streamed(ctrl, {"q_d": q_d, "dq_d": np.zeros_like(q_d)})
             self._brain.command(side, setpoint)
-            # Gripper rides its own latest-wins mailbox (no-op if disabled): the
-            # leader's trailing trigger value, normalized to 0..1 via the convention.
+            # Gripper rides its own latest-wins mailbox. FACTR ingestion already
+            # normalized the trailing value using the leader-owned convention.
             q_leader = np.asarray(q_leader, dtype=np.float64).ravel()
             if q_leader.size:
-                self._brain.command_gripper(
-                    side, normalize_gripper(q_leader[-1], arm.convention)
-                )
+                self._brain.command_gripper(side, float(q_leader[-1]))
 
     def _heartbeat(self, observation: dict[str, Samples]) -> None:
         fresh = sum(1 for s in observation.values() if s.n > 0)

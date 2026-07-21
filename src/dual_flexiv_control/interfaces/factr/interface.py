@@ -6,12 +6,14 @@ four keep-alive connections that could disagree about reachability and payload
 (the viewer showing live motion while control read the server's zeros
 placeholder). This node makes FACTR a first-class stream producer like the arms
 and cameras: it is the **only** HTTP reader, and everyone else attaches
-read-only to the ``factr/<side>`` shared-memory streams it publishes — so the
+read-only to the shared-memory streams it publishes — so the
 viewer and the control path see the *same samples* by construction.
 
-Stream contract: one ``factr/<side>`` stream per configured leader, dim =
-``server.dof`` (the raw payload: arm joints + the trailing gripper value, in
-radians), float64, at :attr:`FactrCfg.rate_hz`.
+Stream contract, each dim ``server.dof`` at :attr:`FactrCfg.rate_hz`:
+
+* ``factr/raw/<side>`` — untouched server/Dynamixel payload.
+* ``factr/<side>`` — arm joints converted once to DFC/Rizon coordinates, with
+  the untouched trailing gripper retained.
 
 Outage behavior: per-side tolerant, never crashes. An unreachable leader is
 logged once (and once on recovery) and simply publishes nothing — its stream
@@ -28,7 +30,10 @@ import time
 import numpy as np
 
 from ...configs import FactrCfg
+from ...configs import JointConventionCfg
 from ...configs import RuntimeCfg
+from ...control.convention import convert_factr_to_rizon
+from ...control.convention import normalize_gripper
 from ...process import StreamProducerNode
 from ...streams.spec import StreamSpec
 from .client import FactrClient
@@ -38,8 +43,13 @@ log = logging.getLogger(__name__)
 
 
 def factr_stream_name(side: str) -> str:
-    """The canonical stream name for one FACTR leader's raw payload."""
+    """DFC-coordinate leader pose plus trailing raw gripper value."""
     return f"factr/{side}"
+
+
+def raw_factr_stream_name(side: str) -> str:
+    """Unmodified FACTR-server/Dynamixel payload."""
+    return f"factr/raw/{side}"
 
 
 def leader_stream_names(cfg: FactrCfg) -> list[str]:
@@ -117,6 +127,7 @@ class FactrInterface(StreamProducerNode):
         self.cfg = cfg
         self.sim = runtime.sim
         self._client: FactrClient | None = None
+        self._conventions: dict[str, JointConventionCfg] = {}
         #: sides currently failing, so outages log once (and once on recovery).
         self._errored: set[str] = set()
 
@@ -125,19 +136,70 @@ class FactrInterface(StreamProducerNode):
         return list(self.cfg.servers)
 
     def declare_streams(self) -> list[StreamSpec]:
-        return [
-            StreamSpec(
-                name=factr_stream_name(side),
-                dim=server.dof,
-                capacity=4096,
-                dtype="float64",
-                rate_hz=self.cfg.rate_hz,
-            )
-            for side, server in self.cfg.servers.items()
-        ]
+        specs = []
+        for side, server in self.cfg.servers.items():
+            for name in (factr_stream_name(side), raw_factr_stream_name(side)):
+                specs.append(StreamSpec(
+                    name=name, dim=server.dof, capacity=4096,
+                    dtype="float64", rate_hz=self.cfg.rate_hz,
+                ))
+        return specs
 
     def open_source(self) -> None:
         self._client = FactrClient.from_config(self.cfg, sim=self.sim)
+        for side, server in self.cfg.servers.items():
+            if self.sim:
+                self._conventions[side] = JointConventionCfg(
+                    offsets_deg=[0.0] * (server.dof - 1),
+                    sign_flip_joints=[],
+                    drop_trailing=1,
+                    wrap_deg=True,
+                    gripper_open=0.0,
+                    gripper_closed=1.0,
+                )
+                continue
+            diagnostics = self._client.wait_diagnostics_for(
+                side, timeout_s=self.cfg.calibration_timeout_s
+            )
+            self._conventions[side] = self._convention_from_diagnostics(side, server.dof, diagnostics)
+
+    @staticmethod
+    def _convention_from_diagnostics(side: str, dof: int, data: dict) -> JointConventionCfg:
+        """Build the raw-leader conversion exclusively from the leader's YAML snapshot."""
+        if data.get("available") is not True:
+            raise RuntimeError(f"FACTR {side} diagnostics/calibration is unavailable")
+        required = (
+            "dfc_raw_offsets_deg", "dfc_sign_flip_joints", "dfc_wrap_deg",
+            "dfc_drop_trailing", "dfc_gripper_open", "dfc_gripper_closed",
+        )
+        missing = [key for key in required if data.get(key) is None]
+        if missing:
+            raise RuntimeError(f"FACTR {side} leader calibration missing {missing}")
+        drop = int(data["dfc_drop_trailing"])
+        arm_dof = dof - drop
+        offsets = [float(x) for x in data["dfc_raw_offsets_deg"]]
+        flips = [int(x) for x in data["dfc_sign_flip_joints"]]
+        if drop < 1 or arm_dof <= 0 or len(offsets) != arm_dof:
+            raise RuntimeError(
+                f"FACTR {side} invalid leader convention: dof={dof}, drop={drop}, "
+                f"offset count={len(offsets)}"
+            )
+        if len(set(flips)) != len(flips) or any(i < 0 or i >= arm_dof for i in flips):
+            raise RuntimeError(f"FACTR {side} invalid sign-flip indices: {flips}")
+        opened = float(data["dfc_gripper_open"])
+        closed = float(data["dfc_gripper_closed"])
+        if not np.all(np.isfinite(offsets + [opened, closed])) or opened == closed:
+            raise RuntimeError(f"FACTR {side} leader calibration contains invalid values")
+        conv = JointConventionCfg(
+            offsets_deg=offsets,
+            sign_flip_joints=flips,
+            wrap_deg=bool(data["dfc_wrap_deg"]),
+            drop_trailing=drop,
+            gripper_open=opened,
+            gripper_closed=closed,
+        )
+        log.info("[factr] %s convention loaded from leader diagnostics: %s", side, conv)
+        return conv
 
     def poll(self) -> dict[str, np.ndarray] | None:
         sample: dict[str, np.ndarray] = {}
@@ -155,7 +217,11 @@ class FactrInterface(StreamProducerNode):
             if side in self._errored:
                 self._errored.discard(side)
                 log.info("[factr] %s leader recovered", side)
-            sample[factr_stream_name(side)] = jp
+            conv = self._conventions[side]
+            q_dfc = convert_factr_to_rizon(jp, conv)
+            converted = np.append(q_dfc, normalize_gripper(jp[-1], conv))
+            sample[raw_factr_stream_name(side)] = jp
+            sample[factr_stream_name(side)] = converted
         return sample or None
 
     def close_source(self) -> None:

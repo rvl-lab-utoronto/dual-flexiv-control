@@ -19,6 +19,30 @@ _HAVE_RERUN = importlib.util.find_spec("rerun") is not None
 _needs_rerun = pytest.mark.skipif(not _HAVE_RERUN, reason="rerun-sdk not installed")
 
 
+@_needs_rerun
+def test_viewer_server_bounds_refresh_history(monkeypatch):
+    from dual_flexiv_control.dashboard import viewer
+
+    grpc_calls = []
+    monkeypatch.setattr(viewer.rr, "init", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        viewer.rr,
+        "serve_grpc",
+        lambda **kwargs: grpc_calls.append(kwargs) or "rerun+http://127.0.0.1:19876/proxy",
+    )
+    monkeypatch.setattr(viewer.rr, "serve_web_viewer", lambda **kwargs: None)
+    monkeypatch.setattr(viewer, "_SERVERS", None)
+    monkeypatch.setattr(viewer, "_WEB_VIEWER_PORT", None)
+
+    viewer.start_servers(grpc_port=19876, web_port=19090)
+
+    assert grpc_calls == [{
+        "grpc_port": 19876,
+        "server_memory_limit": viewer.DEFAULT_MEMORY_LIMIT,
+        "cors_allow_origin": ["*"],
+    }]
+
+
 def test_discover_tasks_finds_shipped_tasks():
     tasks = {t.name: t for t in discover_tasks()}
     assert {"default", "handover"} <= set(tasks)
@@ -525,8 +549,10 @@ def test_read_arm_status_placeholder_when_no_run(tmp_path):
     status = read_arm_status(arm, runtime_dir=str(tmp_path))
     assert isinstance(status, ArmStatus)
     assert status.source == "disconnected"
-    assert status.mode == "disconnected"
+    assert status.mode == "unknown"
+    assert status.operational_status == "disconnected"
     assert status.estop_pressed is None
+    assert status.servo_enabled is None
     assert status.info is arm
 
 
@@ -577,6 +603,8 @@ def test_read_leader_status_reachable_iff_stream_fresh(tmp_path, monkeypatch):
         assert status.sim is True
         assert status.dof == 7
         assert status.gripper == pytest.approx(0.8)
+        assert status.grav_comp_enabled is False
+        assert status.force_gain == 0.0
     finally:
         writer.close()
         writer.unlink()
@@ -594,6 +622,59 @@ def test_read_leader_status_disconnected_when_unconfigured(monkeypatch):
     assert status.reachable is False
     assert status.gripper is None
     _arms.reset()
+
+
+def test_read_leader_status_reports_actual_grav_comp(tmp_path, monkeypatch):
+    import time as _time
+    import numpy as np
+
+    from dual_flexiv_control.dashboard import arms as _arms
+    from dual_flexiv_control.interfaces.factr import factr_stream_name
+    from dual_flexiv_control.streams import StreamRegistry
+    from dual_flexiv_control.streams.spec import StreamSpec
+    from dual_flexiv_control.streams.stream import StreamWriter
+
+    monkeypatch.setenv("DFC_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(_arms, "runtime_is_sim", lambda: False)
+    monkeypatch.setattr(
+        _arms, "read_leader_grav_comp_status",
+        lambda side: {"grav_comp_enabled": side == "left", "force_gain": 1.0},
+    )
+    _arms.reset()
+    side = _arms.configured_leader_sides()[0]
+    registry = StreamRegistry(str(tmp_path), "runY")
+    writer = StreamWriter.create(
+        StreamSpec(name=factr_stream_name(side), dim=8, capacity=64,
+                   dtype="float64", rate_hz=100.0),
+        "runY", registry,
+    )
+    try:
+        writer.write(np.zeros(8), _time.monotonic_ns())
+        status = _arms.read_leader_status(side)
+        assert status.grav_comp_enabled is (side == "left")
+        assert status.force_gain == 1.0
+    finally:
+        writer.close()
+        writer.unlink()
+        _arms.reset()
+
+
+def test_grav_comp_display_uses_live_gain_not_process_health():
+    from dual_flexiv_control.dashboard.arms import grav_comp_display
+
+    assert "enabled" in grav_comp_display({
+        "grav_comp_enabled": True, "force_gain": 1.0, "force_gain_target": 1.0,
+    })[1]
+    assert "enabling" in grav_comp_display({
+        "grav_comp_enabled": False, "force_gain": 0.4, "force_gain_target": 1.0,
+    })[1]
+    assert "disabling" in grav_comp_display({
+        "grav_comp_enabled": False, "force_gain": 0.4, "force_gain_target": 0.0,
+    })[1]
+    assert "disabled (limp)" in grav_comp_display({
+        "grav_comp_enabled": False, "force_gain": 0.0, "force_gain_target": 0.0,
+    })[1]
+    assert "unknown" in grav_comp_display(None)[1]
 
 
 def test_robot_urdf_chain_parses():

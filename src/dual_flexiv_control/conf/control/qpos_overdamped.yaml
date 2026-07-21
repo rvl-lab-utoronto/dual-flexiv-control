@@ -1,0 +1,9 @@
+defaults:
+  - qpos
+  - _self_
+
+# Joint-position setpoints with deliberately heavy joint damping.
+mode: NRT_JOINT_IMPEDANCE
+joint_impedance:
+  K_q_fraction: 0.4
+  Z_q: [0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8]

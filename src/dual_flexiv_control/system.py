@@ -20,7 +20,7 @@ escalates to SIGKILL for anything wedged, then unlinks the run's shm segments.
 
 Configuration is composed by Hydra from ``conf/`` (validated against the
 structured schema in :mod:`dual_flexiv_control.configs`). Override anything from
-the CLI, e.g. ``runtime.sim=true runtime.duration_s=10 control@arms.left.control=force``.
+the CLI, e.g. ``runtime.sim=true runtime.duration_s=10 control@task.control=force``.
 """
 
 from __future__ import annotations

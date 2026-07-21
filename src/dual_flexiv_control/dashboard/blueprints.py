@@ -162,7 +162,7 @@ def proprio_group(signal: str) -> str:
 #: ``grip`` (the trailing scalar) and logs each to its own row.
 FACTR_SERIES: tuple[str, ...] = ("q", "grip")
 FACTR_TITLES = {
-    "q": "Leader joint q (rad)",
+    "q": "Leader joint q — DFC/Rizon convention (rad)",
     "grip": "Leader gripper (rad)",
 }
 

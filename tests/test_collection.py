@@ -17,7 +17,6 @@ from dual_flexiv_control.collection import CollectionLoop
 from dual_flexiv_control.collection import FrameBuilder
 from dual_flexiv_control.collection import keyboard
 from dual_flexiv_control.configs import register_configs
-from dual_flexiv_control.control import convert_factr_to_rizon
 from dual_flexiv_control.streams.ring import Samples
 
 
@@ -97,13 +96,13 @@ def test_stream_names_cover_state_and_cameras():
 # --------------------------------------------------------------------------- #
 
 
-def test_actions_from_leaders_converts_and_extracts_gripper():
+def test_actions_from_leaders_uses_ingestion_converted_pose_and_extracts_gripper():
     cfg = _config()
     b = _builder(cfg)
     conv = cfg.arms["left"].convention
     leader = np.linspace(0.1, 0.8, 8)  # dof+1: 7 joints + trailing gripper
     acts = b.actions_from_leaders({"left": leader}, {"left": conv})
-    np.testing.assert_allclose(acts["q_d"]["left"], convert_factr_to_rizon(leader, conv))
+    np.testing.assert_allclose(acts["q_d"]["left"], leader[:7])
     # uncalibrated convention (gripper_open/closed unset) -> raw radian value
     assert acts["gripper"]["left"] == pytest.approx(leader[-1])
 
@@ -126,6 +125,9 @@ def test_actions_from_leaders_normalizes_gripper_when_calibrated():
 def _full_observation(cfg, b):
     """A complete observation snapshot: q for both arms + every camera frame."""
     obs = {"left/q": _samples(np.zeros(7)), "right/q": _samples(np.ones(7))}
+    for side in b.action_sides:
+        obs[f"factr/{side}"] = _samples(np.zeros(8))
+        obs[f"factr/raw/{side}"] = _samples(np.zeros(8))
     for name, cam in cfg.cameras.items():
         for view in cam.views:
             dim = cam.height * cam.width * (3 if view in ("left", "right") else 1)
@@ -142,6 +144,8 @@ def test_build_frame_shapes_and_task():
     assert frame["observation.state"].shape == (14,)
     assert frame["action"].shape == (8,)  # left only teleop: q_d(7)+gripper(1)
     assert frame["action"][-1] == pytest.approx(0.5)
+    assert frame["observation.factr.left"].shape == (8,)
+    assert frame["observation.factr_raw.left"].shape == (8,)
     assert frame["task"] == cfg.task.language_instruction
     assert frame["observation.images.static_left"].shape == (720, 1280, 3)
 
