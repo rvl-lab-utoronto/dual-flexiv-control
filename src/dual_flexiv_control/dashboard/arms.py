@@ -427,23 +427,42 @@ def read_leader_grav_comp_status(side: str) -> dict | None:
             return None
 
 
-def grav_comp_display(status: dict | None) -> tuple[str, str]:
-    """Return the dashboard icon and label for a leader's actual output gain."""
+def grav_comp_state(status: dict | None) -> str:
+    """Classify a leader's live gain state: enabled/enabling/disabling/disabled/unknown.
+
+    Shared by the status label and the dashboard's F-hotkey action so the two
+    cannot drift apart.
+    """
     if status is None:
-        return "🟡", ":gray[grav comp unknown]"
+        return "unknown"
     try:
         gain = float(status["force_gain"])
         target = float(status["force_gain_target"])
         enabled = status["grav_comp_enabled"] is True
     except (KeyError, TypeError, ValueError):
-        return "🟡", ":gray[grav comp unknown]"
+        return "unknown"
     if enabled:
-        return "🟢", f":green[grav comp enabled] · gain `{gain:.2f}`"
+        return "enabled"
     if target >= 0.99 and gain < 0.99:
-        return "🟡", f":orange[enabling grav comp] · gain `{gain:.2f}`"
+        return "enabling"
     if target <= 0.01 and gain > 0.01:
+        return "disabling"
+    return "disabled"
+
+
+def grav_comp_display(status: dict | None) -> tuple[str, str]:
+    """Return the dashboard icon and label for a leader's actual output gain."""
+    state = grav_comp_state(status)
+    if state == "unknown":
+        return "🟡", ":gray[grav comp unknown]"
+    gain = float(status["force_gain"])
+    if state == "enabled":
+        return "🟢", f":green[grav comp enabled] · gain `{gain:.2f}`"
+    if state == "enabling":
+        return "🟡", f":orange[enabling grav comp] · gain `{gain:.2f}`"
+    if state == "disabling":
         return "🟡", f":orange[disabling grav comp] · gain `{gain:.2f}`"
-    return "⚫", f":gray[grav comp disabled (limp)] · gain `{gain:.2f}`"
+    return "⚫", f"gain `{gain:.2f}`"
 
 
 def _runtime_root(runtime_dir: str | None) -> Path:
