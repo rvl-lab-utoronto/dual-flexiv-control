@@ -530,7 +530,18 @@ def _render_factr_section(registry: _runner.RunRegistry) -> None:
         )
         for status in statuses
     )
-    st.markdown(_grav_comp_button_css(disable_is_action), unsafe_allow_html=True)
+    states = [_arms.grav_comp_state(status) for status in statuses]
+    if any(state in ("enabled", "enabling") for state in states):
+        hotkey_action = "disable"
+    elif any(state in ("disabling", "disabled") for state in states):
+        hotkey_action = "enable"
+    else:
+        hotkey_action = "none"
+    st.markdown(
+        _grav_comp_button_css(disable_is_action)
+        + f'<span data-factr-hotkey="{hotkey_action}" style="display:none"></span>',
+        unsafe_allow_html=True,
+    )
 
     grav_cols = st.columns(2)
     if grav_cols[0].button(
@@ -805,13 +816,13 @@ def _collection_keybinds() -> None:
             } else if (key === 's') {
               button = host.document.querySelector('.st-key-collection_stop button');
             } else if (key === 'f') {
-              const section = host.document.querySelector('.st-key-factr_status_section');
-              const status = (section && section.textContent || '').toLowerCase();
-              if (status.includes('grav comp enabled') ||
-                  status.includes('enabling grav comp')) {
+              // The grav-comp section publishes the authoritative F action as
+              // a hidden marker; "none" (state unknown) keeps F inert.
+              const marker = host.document.querySelector('[data-factr-hotkey]');
+              const action = marker && marker.getAttribute('data-factr-hotkey');
+              if (action === 'disable') {
                 button = host.document.querySelector('.st-key-factr_disable button');
-              } else if (status.includes('grav comp disabled') ||
-                         status.includes('disabling grav comp')) {
+              } else if (action === 'enable') {
                 button = host.document.querySelector('.st-key-factr_enable button');
               }
             }

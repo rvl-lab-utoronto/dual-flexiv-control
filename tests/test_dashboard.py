@@ -671,10 +671,29 @@ def test_grav_comp_display_uses_live_gain_not_process_health():
     assert "disabling" in grav_comp_display({
         "grav_comp_enabled": False, "force_gain": 0.4, "force_gain_target": 0.0,
     })[1]
-    assert "disabled (limp)" in grav_comp_display({
+    assert grav_comp_display({
         "grav_comp_enabled": False, "force_gain": 0.0, "force_gain_target": 0.0,
-    })[1]
+    })[1] == "gain `0.00`"
     assert "unknown" in grav_comp_display(None)[1]
+
+
+def test_grav_comp_state_drives_f_hotkey():
+    from dual_flexiv_control.dashboard.arms import grav_comp_state
+
+    assert grav_comp_state({
+        "grav_comp_enabled": True, "force_gain": 1.0, "force_gain_target": 1.0,
+    }) == "enabled"
+    assert grav_comp_state({
+        "grav_comp_enabled": False, "force_gain": 0.4, "force_gain_target": 1.0,
+    }) == "enabling"
+    assert grav_comp_state({
+        "grav_comp_enabled": False, "force_gain": 0.4, "force_gain_target": 0.0,
+    }) == "disabling"
+    assert grav_comp_state({
+        "grav_comp_enabled": False, "force_gain": 0.0, "force_gain_target": 0.0,
+    }) == "disabled"
+    assert grav_comp_state(None) == "unknown"
+    assert grav_comp_state({"force_gain": "bogus"}) == "unknown"
 
 
 def test_robot_urdf_chain_parses():
