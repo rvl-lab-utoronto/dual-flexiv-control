@@ -547,7 +547,7 @@ def _render_factr_section(registry: _runner.RunRegistry) -> None:
             st.warning("Session daemon not reachable.", icon="⚠️")
         st.rerun(scope="fragment")
     if grav_cols[1].button(
-        "■ Disable grav comp (de-energize) [F]", key="factr_disable",
+        "■ Disable grav comp [F]", key="factr_disable",
         use_container_width=True,
         help=(
             "Ramp every leader's master output gain 1→0 over ~1s — the arms go "
