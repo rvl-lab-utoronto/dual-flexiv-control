@@ -556,6 +556,54 @@ def test_read_arm_status_placeholder_when_no_run(tmp_path):
     assert status.info is arm
 
 
+def test_read_arm_status_live_iff_stream_fresh(tmp_path):
+    # The arm row must show the ACTUAL robot state: a fresh status sample reads
+    # live (with the RDK mode decoded), while the frozen last sample of a dead
+    # producer reads disconnected — never a stale green "Mode: Idle".
+    import time as _time
+
+    import numpy as np
+
+    from dual_flexiv_control.dashboard.arms import ArmInfo
+    from dual_flexiv_control.dashboard.arms import read_arm_status
+    from dual_flexiv_control.streams import StreamRegistry
+    from dual_flexiv_control.streams.spec import StreamSpec
+    from dual_flexiv_control.streams.stream import StreamWriter
+
+    arm = ArmInfo(side="left", name="Lauer", serial="", dof=7)
+    registry = StreamRegistry(str(tmp_path), "runX")
+    writer = StreamWriter.create(
+        StreamSpec(name="left/status", dim=5, capacity=64,
+                   dtype="float64", rate_hz=10.0),
+        "runX",
+        registry,
+    )
+    # READY, E-stop clear, controlling, servo on, mode 6 = NRT_JOINT_POSITION.
+    vec = np.array([1.0, 0.0, 1.0, 1.0, 6.0])
+    try:
+        # Stale sample (dead producer) -> disconnected, mode unknown.
+        writer.write(vec, _time.monotonic_ns() - int(60e9))
+        stale = read_arm_status(arm, runtime_dir=str(tmp_path))
+        assert stale.source == "disconnected"
+        assert stale.mode == "unknown"
+        assert stale.estop_pressed is None
+
+        # Fresh sample -> live, with the actual RDK mode decoded into the label.
+        writer.write(vec, _time.monotonic_ns())
+        fresh = read_arm_status(arm, runtime_dir=str(tmp_path))
+        assert fresh.source == "live"
+        assert fresh.control_active is True
+        assert fresh.estop_pressed is False
+        try:
+            import flexivrdk  # noqa: F401
+
+            assert fresh.mode.lower().replace(" ", "_") == "nrt_joint_position"
+        except ImportError:
+            assert fresh.mode == "mode 6"
+    finally:
+        writer.close()
+
+
 def test_read_leader_status_reachable_iff_stream_fresh(tmp_path, monkeypatch):
     # The leader status probe reads the factr/<side> stream (the same samples
     # control consumes): fresh sample -> reachable (trailing gripper split off);

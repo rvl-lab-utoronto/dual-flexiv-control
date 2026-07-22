@@ -30,6 +30,12 @@ SIDES = ("left", "right")
 #: ``control_active``) are tolerated.
 STATUS_STREAM = "{side}/status"
 
+#: Freshness gate for :data:`STATUS_STREAM`: the newest sample must be at most this
+#: old to count as live. The arm node writes status every telemetry tick (at least
+#: ``arm.rate_hz``), so anything older means the producer is gone — a dead run's
+#: frozen last sample must read as disconnected, not as a live mode/E-stop state.
+STATUS_MAX_AGE_S = 2.0
+
 #: Per-arm measured joint-position stream (published by ``FlexivInterface`` as
 #: ``<side>/q``, link-side joint positions in rad). Read by the 3D robot scene to
 #: pose the solid arms at the real configuration.
@@ -316,8 +322,9 @@ def read_arm_status(arm: ArmInfo, runtime_dir: str | None = None) -> ArmStatus:
     """Live operation mode + E-stop for ``arm``, or **disconnected** if none is published.
 
     "Connected" means a running ``FlexivInterface`` is publishing this arm's
-    ``<side>/status`` stream; until then (or if its run ends) the arm reads as
-    disconnected with unknown E-stop.
+    ``<side>/status`` stream with a FRESH sample (:data:`STATUS_MAX_AGE_S`); until
+    then (or if its run ends / its producer dies) the arm reads as disconnected
+    with unknown E-stop — never as the frozen last state of a dead run.
     """
     live = _read_live_status(arm, runtime_dir)
     if live is not None:
@@ -471,17 +478,19 @@ def _runtime_root(runtime_dir: str | None) -> Path:
 
 
 def _read_live_stream_sample(
-    stream: str, runtime_dir: str | None
+    stream: str, runtime_dir: str | None, max_age_s: float | None = None
 ) -> tuple[np.ndarray, int] | None:
     """Newest ``(vector, t_ns)`` of a shared-memory ``stream`` across the latest runs.
 
     Scans the runtime run dirs newest-first, attaches the stream if present, and
     returns its most recent vector with its producer timestamp (monotonic ns —
-    comparable across processes, for freshness gating). None means the streams
-    stack is unavailable, no run publishes the stream, or its buffer is empty —
-    i.e. nothing is currently producing it. Read-only shared-memory access: never
-    opens a robot connection, so it cannot conflict with the system that owns the
-    arm.
+    comparable across processes, for freshness gating). With ``max_age_s`` set, a
+    candidate whose newest sample is older is skipped like an absent stream (the
+    scan continues into older run dirs), so a dead run's frozen leftover cannot
+    shadow a live producer. None means the streams stack is unavailable, no run
+    publishes the stream (fresh enough), or its buffer is empty — i.e. nothing is
+    currently producing it. Read-only shared-memory access: never opens a robot
+    connection, so it cannot conflict with the system that owns the arm.
     """
     root = _runtime_root(runtime_dir)
     if not root.is_dir():
@@ -506,7 +515,13 @@ def _read_live_stream_sample(
             try:
                 samples = reader.latest()
                 if samples.n > 0:
-                    return np.asarray(samples.newest), int(samples.newest_t_ns)
+                    t_ns = int(samples.newest_t_ns)
+                    if (
+                        max_age_s is not None
+                        and (time.monotonic_ns() - t_ns) > max_age_s * 1e9
+                    ):
+                        continue  # frozen leftover of a dead producer
+                    return np.asarray(samples.newest), t_ns
             finally:
                 reader.close()
         except Exception:  # noqa: BLE001 - dead run / lapped buffer -> try next
@@ -523,7 +538,10 @@ def _read_live_stream_newest(stream: str, runtime_dir: str | None) -> np.ndarray
 def _read_live_status(
     arm: ArmInfo, runtime_dir: str | None
 ) -> tuple[float, float, float | None, float | None, float | None] | None:
-    vec = _read_live_stream_newest(STATUS_STREAM.format(side=arm.side), runtime_dir)
+    sample = _read_live_stream_sample(
+        STATUS_STREAM.format(side=arm.side), runtime_dir, max_age_s=STATUS_MAX_AGE_S
+    )
+    vec = None if sample is None else sample[0]
     if vec is None or len(vec) < 2:
         return None
     control = float(vec[2]) if len(vec) >= 3 else None  # 2-wide: pre-session stream
