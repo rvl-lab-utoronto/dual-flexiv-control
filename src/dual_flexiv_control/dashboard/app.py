@@ -374,8 +374,6 @@ def _render_controls(
 
     _reset_services_button(registry, key="reset_all_services", all_services=True)
 
-    st.caption("Each launch runs a single episode.")
-
     if view.run_active:
         st.caption(
             "A run is active — ⇄ switches straight to a new run (the current "
