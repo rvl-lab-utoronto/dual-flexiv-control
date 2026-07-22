@@ -20,7 +20,7 @@ maps to *with the offsets captured so far* (solid), against the straight/home ta
 its link snaps onto the ghost, so the operator can see the result align. The view is
 its own gRPC recording embedded in the shared web viewer (same approach as replay).
 
-This module *reads* the FACTR HTTP endpoint (honouring ``runtime.sim``) and renders —
+This module reads the FACTR WebSocket cache (honouring ``runtime.sim``) and renders —
 it never opens a robot connection. The only file it touches is the rig YAML, and only
 via the explicit **Sync to file** action (:func:`apply_to_rig`), which merges the
 measured convention in place (preserving comments + gripper endpoints). Mirrors

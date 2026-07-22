@@ -272,8 +272,8 @@ class BrainNode(ProcessNode):
     def process(self, observation: dict[str, Samples]) -> None:
         """FACTR→follower teleoperation: post each control-enabled arm's setpoint.
 
-        Reads the FACTR leaders on request, converts to Rizon joint targets via the
-        per-arm convention, and posts them on the setpoint channel (latest-wins). This
+        Reads the latest converted FACTR leader streams and posts them on the
+        setpoint channel (latest-wins). This
         is pure numpy + the control channel — **no flexivrdk** here. Only joint-position
         (``qpos``) kinds map directly from FACTR joint readings; other kinds expect a
         policy setpoint source (not wired here) and are skipped with a one-time note.
