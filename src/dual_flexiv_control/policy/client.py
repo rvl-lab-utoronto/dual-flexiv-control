@@ -11,7 +11,7 @@ The eval loop sees one interface — :class:`Policy`: ``infer(canonical_obs) ->
   ``openpi_client.WebsocketClientPolicy`` (metadata frame on connect; one
   packed request -> one packed response; a *text* frame is a server-side
   error traceback). Reimplemented here so the robot host needs only
-  core ``websockets`` + ``msgpack`` (the ``[policy]`` extra), not the openpi repo.
+  ``websockets`` + ``msgpack`` (the ``[policy]`` extra), not the openpi repo.
 * :class:`HoldPolicy` is the no-server stand-in: repeat the measured joint
   positions (stand still) — an end-to-end smoke test of the eval path
   (``policy.kind=hold``), also handy with ``runtime.sim=true``.
@@ -79,15 +79,15 @@ def unpack_array(obj):
 
 
 def _import_wire():
-    """The wire deps, or an actionable error for the optional msgpack codec."""
+    """The optional wire deps, or an actionable error (``[policy]`` extra)."""
     try:
         import msgpack  # noqa: PLC0415
         import websockets.exceptions  # noqa: PLC0415
         import websockets.sync.client  # noqa: PLC0415
     except ImportError as exc:
         raise PolicyUnavailable(
-            "policy eval requires the 'msgpack' package. "
-            "Install it with:  pip install 'dual-flexiv-control[policy]'"
+            "policy eval requires the 'websockets' and 'msgpack' packages. "
+            "Install them with:  pip install 'dual-flexiv-control[policy]'"
         ) from exc
     return msgpack, websockets.sync.client, websockets.exceptions
 

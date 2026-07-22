@@ -2,13 +2,14 @@ defaults:
   - base_factr
   - _self_
 
-# Left leader only — the FACTR relay's WebSocket on :5000 (see
-# factr/bimanual.yaml for the full layout). Use when only the left leader is
-# plugged in, so no client is created for the absent right stream. Matches the
-# left entry of factr/bimanual.yaml. The FactrInterface node consumes this stream and
+# Left leader only — the FACTR FastAPI server (one process on :5001, serving a
+# per-side endpoint; see factr/bimanual.yaml for the full layout). Use when only
+# the left leader is plugged in (the right endpoint has no ROS publisher), so the
+# producer's poll isn't dragged down by a dead right endpoint. Matches the left
+# entry of factr/bimanual.yaml. The FactrInterface node polls this endpoint and
 # publishes the factr/left stream that control AND the dashboard read.
 servers:
-  left: { host: localhost, port: 5000, endpoint: ws/left, request_timeout_s: 0.5, dof: 8 }
+  left: { host: localhost, port: 5000, endpoint: get_joint_positions_left, request_timeout_s: 0.5, dof: 8 }
 
 # Daemon-managed FACTR-Server launch (left leader only; see factr/bimanual.yaml).
 launch:

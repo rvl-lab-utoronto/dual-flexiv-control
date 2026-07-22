@@ -2,7 +2,7 @@
 
 The ObservationBuilder, ActionLayout, and wire schemas are pure. The EvalLoop
 is exercised with a fake Brain and a scripted Policy, so no shared memory, no
-policy server is needed, and no ``msgpack`` codec is needed (the
+policy server, and no ``websockets``/``msgpack`` dependency are needed (the
 msgpack round-trip test skips if ``msgpack`` is absent).
 """
 

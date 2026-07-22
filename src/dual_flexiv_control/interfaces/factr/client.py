@@ -1,24 +1,25 @@
-"""Persistent WebSocket clients for the FACTR teleop servers.
+"""On-request HTTP client(s) for the FACTR teleop servers.
 
-FACTR (Force-Attending Curriculum Training, arXiv:2502.17432) runs one relay per
-leader arm. There is **one server per leader, each on its own port** (e.g. left
-on 5000, right on 5001). Each server pushes typed JSON frames on one WebSocket:
+FACTR (Force-Attending Curriculum Training, arXiv:2502.17432) runs a FastAPI
+server per leader arm exposing that leader's current joint positions. There is
+**one server per leader, each on its own port** (e.g. left on 5000, right on
+5001). These are plain clients: call :meth:`get_joint_positions` whenever you
+want the latest positions — no polling loop and no stream.
 
-* ``{"type": "reading", "side": "left", "joint_pos": [...]}``
-* ``{"type": "diagnostics", "side": "left", "available": true, ...}``
+* :class:`FactrServerClient` talks to ONE server and returns ONE leader's joint
+  positions, a ``(dof,)`` vector. A single ``GET http://{host}:{port}/{endpoint}``
+  returns that leader's positions; tolerated response shapes (see ``_parse``):
 
-Each :class:`FactrServerClient` owns a background receiver that continuously
-drains the socket into latest-value caches. Public reads are therefore local and
-never build a backlog when the server publishes faster than the DFC producer.
-The receiver reconnects after an outage; a stale/missing reading raises
-:class:`FactrError`, allowing the shared-memory leader stream to go stale.
+      ``[...]``                              — bare list
+      ``{"q": [...]}`` / ``{"positions": [...]}``  — wrapped
+      ``{"<side>": [...]}`` / ``{"<side>": {"q": [...]}}`` — keyed by this side
 
 * :class:`FactrClient` is the group the brain holds: one
-  :class:`FactrServerClient` per side. :meth:`get_joint_positions` reads every
-  client's latest cache and returns ``{side: joint_positions}``.
+  :class:`FactrServerClient` per side. :meth:`get_joint_positions` queries every
+  server and returns ``{side: joint_positions}``.
 
-Gravity-comp status and enable/disable commands remain HTTP request/response
-operations. ``sim=True`` returns synthetic positions with no network.
+Each keep-alive connection is created lazily on first request and reused.
+``sim=True`` returns synthetic positions with no network (handy offline).
 """
 
 from __future__ import annotations
@@ -27,17 +28,14 @@ import http.client
 import json
 import logging
 import math
-import threading
 import time
 
 import numpy as np
-import websockets.exceptions
-import websockets.sync.client
 
 log = logging.getLogger(__name__)
 
 #: Keys under which a flat joint-position list may be nested in a JSON object.
-#: ``joint_pos`` is the reading key emitted by the real FACTR WebSocket server.
+#: ``joint_pos`` is what the real FACTR FastAPI server returns (see rizon_tests).
 _POSITION_KEYS = ("joint_pos", "positions", "q", "joint_positions", "joints", "data")
 
 
@@ -60,7 +58,7 @@ def _extract_list(obj) -> list:
 
 
 class FactrServerClient:
-    """Receives one FACTR leader's readings and diagnostics over WebSocket."""
+    """Fetches ONE FACTR leader's joint positions from its own server/port."""
 
     def __init__(
         self,
@@ -80,66 +78,43 @@ class FactrServerClient:
         self.dof = dof
         self.timeout_s = timeout_s
         self.sim = sim
-        self._http_conn: http.client.HTTPConnection | None = None
+        self._conn: http.client.HTTPConnection | None = None
         self._t0 = time.monotonic()
-
-        self._condition = threading.Condition()
-        self._stop = threading.Event()
-        self._receiver: threading.Thread | None = None
-        self._ws = None
-        self._latest_joint_pos: np.ndarray | None = None
-        self._latest_joint_pos_at = 0.0
-        self._latest_diagnostics: dict | None = None
-        self._last_stream_error = "stream has not connected"
 
     @property
     def url(self) -> str:
-        return f"ws://{self.host}:{self.port}{self.path}"
+        return f"http://{self.host}:{self.port}{self.path}"
 
-    # -- latest-value API -----------------------------------------------------
+    # -- the on-request API ---------------------------------------------------
 
     def get_joint_positions(self) -> np.ndarray:
         """Return this leader's joint positions ``(dof,)`` right now.
 
-        Raises :class:`FactrError` if no fresh frame arrives within ``timeout_s``.
-        The background receiver reconnects independently after transport failures.
+        Raises :class:`FactrError` if the server is unreachable or the response is
+        malformed. The connection is reset on failure so the next call reconnects.
         """
         if self.sim:
             return self._sim_positions()
-        deadline = time.monotonic() + self.timeout_s
-        with self._condition:
-            self._ensure_receiver_locked()
-            while True:
-                now = time.monotonic()
-                if (
-                    self._latest_joint_pos is not None
-                    and now - self._latest_joint_pos_at <= self.timeout_s
-                ):
-                    return self._latest_joint_pos.copy()
-                remaining = deadline - now
-                if remaining <= 0:
-                    raise FactrError(
-                        f"FACTR reading {self.side} from {self.url} unavailable: "
-                        f"{self._last_stream_error or 'no fresh reading received'}"
-                    )
-                self._condition.wait(remaining)
+        try:
+            payload = self._get_json()
+        except (OSError, http.client.HTTPException, ValueError, json.JSONDecodeError) as exc:
+            self._reset_conn()
+            raise FactrError(f"FACTR request to {self.url} failed: {exc}") from exc
+        return self._parse(payload)
 
     def get_diagnostics(self) -> dict:
         """Return FACTR's read-only startup-calibration snapshot."""
         if self.sim:
             return {}
-        deadline = time.monotonic() + self.timeout_s
-        with self._condition:
-            self._ensure_receiver_locked()
-            while self._latest_diagnostics is None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise FactrError(
-                        f"FACTR diagnostics {self.side} from {self.url} unavailable: "
-                        f"{self._last_stream_error}"
-                    )
-                self._condition.wait(remaining)
-            return dict(self._latest_diagnostics)
+        path = f"/diagnostics_{self.side}"
+        try:
+            payload = self._get_json(path)
+        except (OSError, http.client.HTTPException, ValueError, json.JSONDecodeError) as exc:
+            self._reset_conn()
+            raise FactrError(f"FACTR diagnostics {self.side} failed: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise FactrError(f"FACTR diagnostics {self.side} returned non-object JSON")
+        return payload
 
     def get_status(self) -> dict:
         """Return this leader's live grav-comp state."""
@@ -152,132 +127,35 @@ class FactrServerClient:
             }
         path = f"/status_{self.side}"
         try:
-            payload = self._get_http_json(path)
+            payload = self._get_json(path)
         except (OSError, http.client.HTTPException, ValueError, json.JSONDecodeError) as exc:
-            self._reset_http_conn()
+            self._reset_conn()
             raise FactrError(f"FACTR status {self.side} failed: {exc}") from exc
         if not isinstance(payload, dict):
             raise FactrError(f"FACTR status {self.side} returned non-object JSON")
         return payload
 
-    # -- WebSocket receiver ---------------------------------------------------
+    # -- HTTP -----------------------------------------------------------------
 
-    def _ensure_receiver_locked(self) -> None:
-        """Start the receiver exactly once; caller holds ``_condition``."""
-        if self._stop.is_set():
-            raise FactrError(f"FACTR client for {self.side} is closed")
-        if self._receiver is not None and self._receiver.is_alive():
-            return
-        self._receiver = threading.Thread(
-            target=self._receive_loop,
-            name=f"factr-ws-{self.side}",
-            daemon=True,
-        )
-        self._receiver.start()
+    def _connect(self) -> None:
+        self._conn = http.client.HTTPConnection(self.host, self.port, timeout=self.timeout_s)
 
-    def _receive_loop(self) -> None:
-        """Keep the WebSocket drained and reconnect until :meth:`close` is called."""
-        while not self._stop.is_set():
-            ws = None
+    def _reset_conn(self) -> None:
+        if self._conn is not None:
             try:
-                ws = websockets.sync.client.connect(
-                    self.url,
-                    compression=None,
-                    open_timeout=self.timeout_s,
-                    close_timeout=self.timeout_s,
-                    max_size=None,
-                )
-                with self._condition:
-                    self._ws = ws
-                    self._last_stream_error = "connected; waiting for a frame"
-                    self._condition.notify_all()
-                for message in ws:
-                    if self._stop.is_set():
-                        break
-                    self._handle_stream_frame(message)
-                if not self._stop.is_set():
-                    raise FactrError("connection closed")
-            except (
-                OSError,
-                TimeoutError,
-                TypeError,
-                UnicodeError,
-                ValueError,
-                FactrError,
-                websockets.exceptions.WebSocketException,
-            ) as exc:
-                if not self._stop.is_set():
-                    with self._condition:
-                        self._last_stream_error = str(exc)
-                        self._condition.notify_all()
-            finally:
-                with self._condition:
-                    if self._ws is ws:
-                        self._ws = None
-                if ws is not None:
-                    try:
-                        ws.close()
-                    except Exception:  # noqa: BLE001 - already broken
-                        pass
-            self._stop.wait(min(0.1, self.timeout_s))
-
-    def _handle_stream_frame(self, message) -> None:
-        """Validate one typed JSON frame and atomically refresh its cache."""
-        if isinstance(message, bytes):
-            message = message.decode("utf-8")
-        payload = json.loads(message)
-        if not isinstance(payload, dict):
-            raise FactrError(f"FACTR {self.side} sent a non-object WebSocket frame")
-        frame_side = payload.get("side")
-        if frame_side != self.side:
-            raise FactrError(
-                f"FACTR {self.side} stream received frame for side {frame_side!r}"
-            )
-
-        frame_type = payload.get("type")
-        if frame_type == "reading":
-            joint_pos = self._parse(payload)
-            with self._condition:
-                self._latest_joint_pos = joint_pos
-                self._latest_joint_pos_at = time.monotonic()
-                self._last_stream_error = ""
-                self._condition.notify_all()
-            return
-        if frame_type == "diagnostics":
-            diagnostics = dict(payload)
-            diagnostics.pop("type", None)
-            with self._condition:
-                self._latest_diagnostics = diagnostics
-                self._last_stream_error = ""
-                self._condition.notify_all()
-            return
-        raise FactrError(f"FACTR {self.side} sent unknown frame type {frame_type!r}")
-
-    # -- remaining HTTP status surface ---------------------------------------
-
-    def _connect_http(self) -> None:
-        self._http_conn = http.client.HTTPConnection(
-            self.host, self.port, timeout=self.timeout_s
-        )
-
-    def _reset_http_conn(self) -> None:
-        if self._http_conn is not None:
-            try:
-                self._http_conn.close()
+                self._conn.close()
             except Exception:  # noqa: BLE001
                 pass
-        self._http_conn = None
+        self._conn = None
 
-    def _get_http_json(self, path: str):
-        if self._http_conn is None:
-            self._connect_http()
-        self._http_conn.request("GET", path)
-        resp = self._http_conn.getresponse()
+    def _get_json(self, path: str | None = None):
+        if self._conn is None:
+            self._connect()
+        self._conn.request("GET", self.path if path is None else path)
+        resp = self._conn.getresponse()
         body = resp.read()  # must fully read to reuse the keep-alive connection
         if resp.status != 200:
-            raise http.client.HTTPException(
-                f"HTTP {resp.status} from http://{self.host}:{self.port}{path}"
-            )
+            raise http.client.HTTPException(f"HTTP {resp.status} from {self.url}")
         return json.loads(body)
 
     # -- parsing --------------------------------------------------------------
@@ -303,23 +181,11 @@ class FactrServerClient:
         return 0.3 * np.sin(t + phase + np.arange(self.dof)).astype(np.float64)
 
     def close(self) -> None:
-        self._stop.set()
-        with self._condition:
-            ws = self._ws
-            receiver = self._receiver
-            self._condition.notify_all()
-        if ws is not None:
-            try:
-                ws.close()
-            except Exception:  # noqa: BLE001 - teardown is best-effort
-                pass
-        if receiver is not None and receiver is not threading.current_thread():
-            receiver.join(timeout=max(1.0, self.timeout_s + 0.5))
-        self._reset_http_conn()
+        self._reset_conn()
 
 
 class FactrClient:
-    """Group client: one :class:`FactrServerClient` per leader, sampled together."""
+    """Group client: one :class:`FactrServerClient` per leader, queried together."""
 
     def __init__(self, servers: dict[str, FactrServerClient]) -> None:
         self._servers = dict(servers)
@@ -333,7 +199,7 @@ class FactrClient:
                 side=side,
                 host=s.host,
                 port=s.port,
-                endpoint=str(s.endpoint).format(side=side),
+                endpoint=s.endpoint,
                 dof=s.dof,
                 timeout_s=s.request_timeout_s,
                 sim=sim,
@@ -343,11 +209,11 @@ class FactrClient:
         return cls(servers)
 
     def get_joint_positions(self) -> dict[str, np.ndarray]:
-        """Read every leader's latest frame and return ``{side: joint_positions}``."""
+        """Query every leader's server and return ``{side: joint_positions}``."""
         return {side: client.get_joint_positions() for side, client in self._servers.items()}
 
     def get_joint_positions_for(self, side: str) -> np.ndarray:
-        """One leader's latest joint positions."""
+        """One leader's joint positions (queries only that leader's server)."""
         return self._servers[side].get_joint_positions()
 
     def get_diagnostics_for(self, side: str) -> dict:
@@ -370,7 +236,7 @@ class FactrClient:
             else:
                 if data.get("available") is True:
                     return data
-                last_error = "stream returned available=false"
+                last_error = "endpoint returned available=false"
             time.sleep(0.1)
         raise FactrError(
             f"FACTR diagnostics {side} unavailable after {float(timeout_s):.1f}s: "

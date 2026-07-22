@@ -2,22 +2,21 @@ defaults:
   - base_factr
   - _self_
 
-# The FACTR-Server relay runs as one process (left :5000, right :5001), serving
-# one typed WebSocket stream per leader arm. Each stream carries both readings
-# and diagnostics:
-#   ws://localhost:5000/ws/left   <- ROS /joint_pos_left + /factr_diagnostics_left
-#   ws://localhost:5001/ws/right  <- ROS /joint_pos_right + /factr_diagnostics_right
-# The FactrInterface producer samples each connection's latest frame and publishes
+# The FACTR-Server's factr_api runs as ONE FastAPI process (left :5000, right :5001) serving a
+# per-side endpoint for each leader arm:
+#   /get_joint_positions_left   <- ROS /joint_pos_left
+#   /get_joint_positions_right  <- ROS /joint_pos_right
+# The FactrInterface producer node polls each configured endpoint and publishes
 # it as the factr/<side> shared-memory stream — the single source of leader data
-# for control and the dashboard alike. Each reading frame contains DoF+1 values
+# for control and the dashboard alike. Each endpoint returns DoF+1 values
 # (7 arm joints + a trailing gripper) under the `joint_pos` key, so dof is 8;
 # the per-arm JointConventionCfg drops the trailing gripper before setpoints.
 #
-# A stream whose ROS publisher isn't running serves a zeros placeholder /
+# An endpoint whose ROS publisher isn't running serves a zeros placeholder /
 # goes unreachable; its stream then reads stale and the side shows disconnected.
 servers:
-  left:  { host: localhost, port: 5000, endpoint: ws/left,  request_timeout_s: 0.5, dof: 8 }
-  right: { host: localhost, port: 5001, endpoint: ws/right, request_timeout_s: 0.5, dof: 8 }
+  left:  { host: localhost, port: 5000, endpoint: get_joint_positions_left,  request_timeout_s: 0.5, dof: 8 }
+  right: { host: localhost, port: 5001, endpoint: get_joint_positions_right, request_timeout_s: 0.5, dof: 8 }
 
 # The session daemon launches/supervises the FACTR-Server processes themselves
 # (the grav-comp teleops + the API relay) from the dashboard's Teleop leaders

@@ -15,7 +15,6 @@ dependencies = [
     "dynamixel-sdk>=3.7",
     "hydra-core>=1.3",
     "omegaconf>=2.3",
-    "websockets>=13.0",
 ]
 
 [project.optional-dependencies]
@@ -35,9 +34,10 @@ dashboard = [
 collection = [
     "lerobot>=0.1",
 ]
-# Online policy eval: msgpack-numpy codec for the openpi WebSocket protocol.
-# websockets itself is a core dependency because FACTR uses it too.
+# Online policy eval: websocket client speaking the openpi policy-server
+# protocol (msgpack-numpy frames). Lightweight; install on the robot host.
 policy = [
+    "websockets>=13.0",
     "msgpack>=1.0",
 ]
 # ACME policy eval: HTTP multipart client (torch.save'd image tensors + npz

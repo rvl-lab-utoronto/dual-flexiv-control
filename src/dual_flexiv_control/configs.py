@@ -530,16 +530,15 @@ class CameraCfg:
 
 @dataclass
 class FactrServerCfg:
-    """One FACTR leader-arm WebSocket stream.
+    """One FACTR leader-arm teleop server endpoint (FastAPI).
 
-    ``ws://{host}:{port}/{endpoint}`` pushes typed reading and diagnostics frames
-    for that leader. ``{side}`` in the endpoint is expanded by the client. A
-    reading contains ``dof`` values: arm joints plus the trailing gripper.
+    A single ``GET http://{host}:{port}/{endpoint}`` returns *that* leader's
+    joint positions (``dof`` values: arm joints + the trailing gripper).
     """
 
     host: str = "localhost"
     port: int = MISSING
-    endpoint: str = "ws/{side}"
+    endpoint: str = "get_joint_positions"
     request_timeout_s: float = 0.5
     dof: int = 7
 
@@ -550,8 +549,7 @@ class FactrLaunchCfg:
 
     Replaces the FACTR-Server repo's VS Code "Launch EVERYTHING" task: when
     ``enabled`` (and not ``runtime.sim``), the daemon owns one grav-comp teleop
-    process per leader arm plus the WebSocket/control relay, supervised like the
-    hardware
+    process per leader arm plus the FastAPI relay, supervised like the hardware
     nodes (see :class:`~dual_flexiv_control.interfaces.factr.FactrServerSupervisor`)
     and driven from the dashboard's Teleop leaders panel. Launching is always
     user-initiated — the teleops energize the leader servos and read a
@@ -585,7 +583,7 @@ class FactrLaunchCfg:
     Only sides present both here and in ``factr.servers`` get a process."""
 
     api_module: str = "src.factr_fastapi.factr_fastapi.factr_api"
-    """ROS->WebSocket/control relay for every leader (left :5000, right :5001)."""
+    """The ROS->HTTP relay serving every leader (left :5000, right :5001)."""
 
     api_ports: List[int] = field(default_factory=lambda: [5000, 5001])
     """Ports freed (``fuser -k``) before the relay spawns — a stale/orphaned
@@ -605,11 +603,10 @@ class FactrLaunchCfg:
 
 @dataclass
 class FactrCfg:
-    """FACTR teleop: one WebSocket per leader arm, consumed by ONE producer.
+    """FACTR teleop: one HTTP endpoint per leader arm, streamed by ONE producer.
 
     The :class:`~dual_flexiv_control.interfaces.factr.FactrInterface` node is
-    the single WebSocket consumer: it reads each configured server's latest
-    cached frame at ``rate_hz`` and
+    the single HTTP reader: it polls every configured server at ``rate_hz`` and
     publishes each leader's raw payload as a ``factr/<side>`` shared-memory
     stream. Consumers (the collection loop, the brain, the dashboard) attach
     read-only to those streams — never to the servers — so control and the
@@ -619,8 +616,8 @@ class FactrCfg:
     servers: Dict[str, FactrServerCfg] = field(default_factory=dict)
 
     rate_hz: float = 100.0
-    """The producer's shared-memory publish rate. Far above the collection
-    frequency (15 Hz) and below the FACTR WebSocket's 200 Hz broadcast rate."""
+    """The producer's poll/publish rate. Far above the collection frequency
+    (15 Hz) and comfortably below the FACTR publisher's own ~250 Hz."""
 
     max_age_s: float = 0.5
     """Freshness gate for readers: a ``factr/<side>`` sample older than this is
@@ -628,7 +625,7 @@ class FactrCfg:
     dashboard shows the leader as disconnected)."""
 
     calibration_timeout_s: float = 30.0
-    """Maximum startup wait for each leader's diagnostics frame. Connection refusal
+    """Maximum startup wait for each leader's diagnostics snapshot. Connection refusal
     or ``available=false`` is treated as startup-in-progress until this deadline;
     malformed calibration still fails immediately."""
 

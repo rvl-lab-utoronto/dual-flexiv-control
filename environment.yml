@@ -18,7 +18,7 @@ dependencies:
       - flexivrdk==1.8.0
       - dynamixel-sdk>=3.7
       # Install this package with the dashboard extra (rerun-sdk + streamlit),
-      # the policy extra (msgpack for eval rollouts; websockets is core), and the dev
+      # the policy extra (websockets + msgpack for eval rollouts), and the dev
       # extra (pytest) so the full system + tests run from a fresh env.
       - -e .[dashboard,policy,dev]
 

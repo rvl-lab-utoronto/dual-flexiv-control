@@ -1,9 +1,9 @@
-"""Launch + supervise the external FACTR-Server processes (leader grav-comp + relay).
+"""Launch + supervise the external FACTR-Server processes (leader grav-comp + API).
 
 This replaces the FACTR-Server repo's VS Code "Launch EVERYTHING" task: the
 session daemon owns the three processes — one grav-comp teleop per leader arm
-(``factr_rizon_teleop`` / ``factr_rizon_dual_board``, torque ON) and the
-WebSocket/control relay serving both leaders (:5000 left, :5001 right) — exactly like it owns the
+(``factr_rizon_teleop`` / ``factr_rizon_dual_board``, torque ON) and the FastAPI
+relay serving both leaders (:5000 left, :5001 right) — exactly like it owns the
 arm/camera nodes, so the dashboard is the one place services are launched,
 watched, and stopped.
 
