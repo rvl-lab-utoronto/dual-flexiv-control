@@ -57,7 +57,32 @@ def _integrate_pose(pose: np.ndarray, twist: np.ndarray, dt: float) -> np.ndarra
 #: of ``flexivrdk.OperationalStatus.READY`` in RDK 1.8.0) with the E-stop clear, so
 #: a sim run shows the dashboard "connected · Auto (Remote)" instead of disconnected.
 #: Hard-coded rather than importing flexivrdk to keep this source usable with no wheel.
+#: Index 3 (mode) is the IDLE baseline — ``read_status`` replaces it with the sim
+#: state machine's actual mode code so the dashboard's Mode field tracks reality.
 _SIM_STATUS = np.array([1.0, 0.0, 1.0, 1.0], dtype=np.float64)
+
+#: ``flexivrdk.Mode`` values (RDK 1.8.0) for the modes the sim state machine can
+#: report — the same hard-coded-over-import tradeoff as :data:`_SIM_STATUS`.
+_SIM_MODE_CODES = {
+    "IDLE": 1.0,
+    "NRT_JOINT_IMPEDANCE": 4.0,
+    "NRT_JOINT_POSITION": 6.0,
+    "NRT_CARTESIAN_MOTION_FORCE": 10.0,
+}
+
+
+def _rdk_mode_code(name: str) -> float:
+    """``flexivrdk.Mode`` value for ``name``: SDK when present, else the 1.8.0 table.
+
+    An unknown name maps to 0.0 (``UNKNOWN``) — the dashboard then shows the raw
+    label instead of a fabricated mode.
+    """
+    try:
+        import flexivrdk
+
+        return float(getattr(flexivrdk.Mode, name).value)
+    except Exception:  # noqa: BLE001 - no wheel / unknown future mode name
+        return _SIM_MODE_CODES.get(name, 0.0)
 
 
 class SafetyHalt(RuntimeError):
@@ -473,6 +498,10 @@ class FakeFlexivSource:
         # Control sim state: when controlling, telemetry tracks the last command so
         # the L-inf safety gate passes and the full loop is exercised hardware-free.
         self._ctrl = False
+        #: Actual mode of the sim state machine (a ``flexivrdk.Mode`` value): IDLE
+        #: outside control sessions, the mode ``start_control`` switched into while
+        #: one is active — mirroring what a real Rizon reports via ``robot.mode()``.
+        self._mode_code = _rdk_mode_code("IDLE")
         self._tracked_q = None
         self._tracked_pose = None
         self._control_target = None
@@ -527,8 +556,16 @@ class FakeFlexivSource:
         )
 
     def read_status(self) -> np.ndarray:
-        """Synthetic status: READY, E-stop clear, servo on, actual mode IDLE."""
-        return _SIM_STATUS.copy()
+        """Synthetic status: READY, E-stop clear, servo on, and the ACTUAL sim mode.
+
+        The mode code follows the sim state machine exactly like a real Rizon's
+        ``robot.mode()``: IDLE while idle, the mode ``start_control`` switched
+        into while a control session is active — so the dashboard's Mode field
+        reports reality in hardware-free runs too, not a constant IDLE.
+        """
+        out = _SIM_STATUS.copy()
+        out[3] = self._mode_code
+        return out
 
     # -- control half (no hardware; mirrors FlexivSource's contract) ----------
 
@@ -537,6 +574,7 @@ class FakeFlexivSource:
 
     def stop(self) -> None:
         self._ctrl = False
+        self._mode_code = _rdk_mode_code("IDLE")
 
     def enter_control(self) -> None:
         pass
@@ -553,6 +591,12 @@ class FakeFlexivSource:
             self._control_target = np.asarray(rs.tcp_pose, dtype=np.float64).copy()
             self._tracked_pose = self._control_target.copy()
             self._tracked_q = np.asarray(rs.q, dtype=np.float64).copy()
+        # Mirror the real source's SwitchMode: joint kinds use the configured mode
+        # (NRT_JOINT_POSITION / NRT_JOINT_IMPEDANCE), cartesian kinds all drive
+        # through NRT_CARTESIAN_MOTION_FORCE.
+        self._mode_code = _rdk_mode_code(
+            ctrl_cfg.mode if kind in ("qpos", "qvel") else "NRT_CARTESIAN_MOTION_FORCE"
+        )
         return True
 
     def send_control(

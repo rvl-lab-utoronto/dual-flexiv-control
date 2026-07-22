@@ -227,6 +227,34 @@ def test_gripper_mailbox_round_trip_drives_fake_gripper(tmp_path):
         writer.unlink()
 
 
+def test_fake_source_reports_actual_mode_through_control_lifecycle():
+    """The sim status mode mirrors the state machine like a real ``robot.mode()``:
+    IDLE -> the control mode switched into by start_control -> IDLE on stop."""
+    from types import SimpleNamespace
+
+    from dual_flexiv_control.interfaces.flexiv import FakeFlexivSource
+    from dual_flexiv_control.interfaces.flexiv.source import _rdk_mode_code
+
+    src = FakeFlexivSource("sim", dof=7)
+    src.open()
+    assert src.read_status()[3] == 1.0  # IDLE
+
+    # Joint kind: the configured RDK mode (NRT_JOINT_POSITION for default qpos).
+    ctrl = _ctrl("qpos")
+    rs = SimpleNamespace(q=np.zeros(7), tcp_pose=np.zeros(7))
+    assert src.start_control(ctrl, None, {"q_d": np.zeros(7)}, rs) is True
+    assert src.read_status()[3] == _rdk_mode_code(ctrl.mode) == 6.0
+    src.stop()
+    assert src.read_status()[3] == 1.0  # back to IDLE
+
+    # Cartesian kind: always NRT_CARTESIAN_MOTION_FORCE, like the real source.
+    ctrl = _ctrl("end_effector")
+    assert src.start_control(ctrl, None, {"pose_d": np.zeros(7)}, rs) is True
+    assert src.read_status()[3] == 10.0
+    src.stop()
+    assert src.read_status()[3] == 1.0
+
+
 def test_fake_source_gripper_setup_declines_when_disabled_or_unnamed():
     from dual_flexiv_control.configs import GripperCfg
     from dual_flexiv_control.interfaces.flexiv import FakeFlexivSource
