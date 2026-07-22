@@ -438,8 +438,34 @@ def _arm_status_rows(registry: _runner.RunRegistry) -> None:
                 st.warning("Session daemon not reachable.", icon="⚠️")
 
 
-def _render_leader_row(s: LeaderStatus) -> None:
-    dot = "🟢" if s.reachable else "⚫"
+def _render_leader_row(s: LeaderStatus, poll: dict, service_state: str | None) -> None:
+    """One leader's row: name + status on one line, live detail below.
+
+    A fully-up leader shows its calibration state on the name line (green when
+    the diagnostics poll succeeds, orange when running on a retained
+    calibration). A leader still coming up — FACTR service starting, teleop
+    waiting for its first calibration — reads 🟡 Booting instead of surfacing
+    calibration internals. ``service_state`` is the managed FACTR supervisor
+    state (None when this session does not manage the servers).
+    """
+    status = ""
+    if s.sim:
+        dot = "🟢" if s.reachable else "⚫"
+    elif s.reachable and poll.get("state") == "live":
+        dot = "🟢"
+        attempted = poll.get("attempted_at")
+        age = f" · {max(0, int(time.time() - attempted))}s ago" if attempted else ""
+        status = f" · :green[calibration received]{age}"
+    elif s.reachable and poll.get("state") == "stale":
+        dot = "🟢"
+        status = " · :orange[retaining last valid calibration]"
+    elif service_state in ("countdown", "running") or (
+        service_state is None and poll.get("state") in ("waiting", "reset")
+    ):
+        st.markdown(f"🟡 **{s.name}** · :orange[Booting]")
+        return
+    else:
+        dot = "🟢" if s.reachable else "⚫"
     if s.reachable:
         detail = ":orange[sim]" if s.sim else ":green[live]"
         if not s.sim:
@@ -456,7 +482,7 @@ def _render_leader_row(s: LeaderStatus) -> None:
             detail += f" · grip `{s.gripper:+.2f}`"
     else:
         detail = ":gray[no signal]"
-    st.markdown(f"{dot} **{s.name}**  \n{detail}")
+    st.markdown(f"{dot} **{s.name}**{status}  \n{detail}")
 
 
 @st.fragment(run_every="2s")
@@ -478,14 +504,11 @@ def _leader_status_rows(registry: _runner.RunRegistry) -> None:
     for side in sides:
         cols = st.columns([5, 1], vertical_alignment="center")
         with cols[0]:
-            _render_leader_row(read_leader_status(side))
-            poll = _arms.convention_poll_status(side)
-            icon = {"live": "🟢", "stale": "🟠", "reset": "🔄"}.get(
-                poll.get("state"), "⚪"
+            _render_leader_row(
+                read_leader_status(side),
+                _arms.convention_poll_status(side),
+                info.get("state"),
             )
-            attempted = poll.get("attempted_at")
-            age = f" · {max(0, int(time.time() - attempted))}s ago" if attempted else ""
-            st.caption(f"{icon} calibration: {poll.get('message', 'polling')}{age}")
         with cols[1].popover("Logs", use_container_width=True):
             path = logs.get(f"teleop:{side}")
             tail = _factr_srv.tail_lines(path)[-100:] if path else []
