@@ -1,13 +1,13 @@
-"""FACTR teleoperation: the leader-arm stream producer + its HTTP clients.
+"""FACTR teleoperation: the leader-arm stream producer + its WebSocket clients.
 
-:class:`FactrInterface` is the ONE process that polls the FACTR FastAPI
+:class:`FactrInterface` is the ONE process that consumes the FACTR WebSocket
 server(s) and publishes each leader as converted ``factr/<side>`` and untouched
 ``factr/raw/<side>`` shared-memory streams. Every consumer — the
 collection loop, the brain, the dashboard mirror and status probe — attaches
 read-only to those streams; nothing else talks to the servers directly, so the
 viewer and the control path see identical samples by construction.
 
-:class:`FactrServerClient` / :class:`FactrClient` are the underlying HTTP
+:class:`FactrServerClient` / :class:`FactrClient` are the underlying WebSocket
 clients the producer holds (also used by the interactive calibration tools).
 
 :class:`FactrServerSupervisor` launches and supervises the external

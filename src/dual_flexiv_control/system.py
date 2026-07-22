@@ -10,7 +10,7 @@ Topology for the bimanual setup::
     FactrInterface          --/   (factr/<side> leader streams)
 
 One process per arm (proprio), one per ZED camera (frames), and one FACTR
-producer (the single HTTP reader of the leader servers, publishing
+producer (the single WebSocket consumer for the leader servers, publishing
 ``factr/<side>``), plus one consumer selected by ``runtime.phase``: collection
 (FACTR teleop -> LeRobot recording) or eval (policy-server client -> setpoints).
 

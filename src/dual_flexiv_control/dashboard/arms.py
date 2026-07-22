@@ -169,7 +169,7 @@ def runtime_is_sim() -> bool:
 
 
 def discover_factr() -> object:
-    """Composed FACTR config (``cfg.factr``): one server entry per leader side.
+    """Composed FACTR config (``cfg.factr``): one WebSocket per leader side.
 
     Returned as-is (an OmegaConf node) for :meth:`FactrClient.from_config`; the
     dashboard emitter uses it to stream live leader joint positions.
@@ -178,9 +178,9 @@ def discover_factr() -> object:
 
 
 def discover_conventions() -> dict:
-    """Poll leader conventions without making FACTR a dashboard dependency.
+    """Read leader conventions without making FACTR a dashboard dependency.
 
-    A failed/unavailable endpoint returns the last valid per-side value (or omits the
+    A failed/unavailable stream returns the last valid per-side value (or omits the
     side before the first success). Dashboard reruns call this again and recover
     automatically when FACTR appears.
     """

@@ -1,15 +1,17 @@
-"""Tests for the FACTR HTTP clients, the stream producer (FactrInterface), and
+"""Tests for the FACTR WebSocket clients, the stream producer (FactrInterface), and
 the stream-side helpers (fresh_leader_positions / wait_leaders_fresh)."""
 
 from __future__ import annotations
 
-import http.server
 import json
 import threading
+import time
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from websockets.exceptions import ConnectionClosed
+from websockets.sync.server import serve
 
 from dual_flexiv_control.interfaces.factr import FactrClient
 from dual_flexiv_control.interfaces.factr import FactrError
@@ -18,22 +20,22 @@ from dual_flexiv_control.interfaces.factr import FactrServerClient
 
 def _server_client(side="left", host="localhost", port=5000, sim=False, timeout_s=1.0):
     return FactrServerClient(
-        side=side, host=host, port=port, endpoint="get_joint_positions",
+        side=side, host=host, port=port, endpoint=f"ws/{side}",
         dof=7, timeout_s=timeout_s, sim=sim,
     )
 
 
 def _factr_cfg(left_addr, right_addr):
     """A fake FactrCfg (duck-typed) with one server entry per side."""
-    def srv(addr):
+    def srv(side, addr):
         host, port = addr
         return SimpleNamespace(
-            host=host, port=port, endpoint="get_joint_positions",
+            host=host, port=port, endpoint=f"ws/{side}",
             request_timeout_s=1.0, dof=7,
         )
     return SimpleNamespace(
-        servers={"left": srv(left_addr), "right": srv(right_addr)},
-        rate_hz=100.0, max_age_s=0.5,
+        servers={"left": srv("left", left_addr), "right": srv("right", right_addr)},
+        rate_hz=100.0, max_age_s=0.5, calibration_timeout_s=1.0,
     )
 
 
@@ -64,51 +66,115 @@ def test_parse_wrong_length_raises():
         c._parse(list(range(3)))
 
 
-# -- live HTTP (stdlib server stands in for one leader's FastAPI server) ------
+# -- live WebSocket (sync server stands in for one leader's FACTR relay) ------
 
 
-def _serve(payload):
-    class Handler(http.server.BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"  # enable keep-alive so the conn is reused
+def _diagnostics(side, dof=7):
+    return {
+        "type": "diagnostics",
+        "available": True,
+        "side": side,
+        "dfc_raw_offsets_deg": [0.0] * (dof - 1),
+        "dfc_sign_flip_joints": [],
+        "dfc_wrap_deg": True,
+        "dfc_drop_trailing": 1,
+        "dfc_gripper_open": 0.0,
+        "dfc_gripper_closed": 1.0,
+    }
 
-        def do_GET(self):
-            body = json.dumps(payload).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
 
-        def log_message(self, *args):  # silence
+def _serve(side, payload, diagnostics=None, close_after=None):
+    diagnostics = diagnostics or _diagnostics(side)
+    state = SimpleNamespace(connections=0, received=[])
+
+    def handler(websocket):
+        state.connections += 1
+        try:
+            websocket.send(json.dumps(diagnostics))
+            sent = 0
+            while True:
+                websocket.send(json.dumps({
+                    "type": "reading", "side": side, "joint_pos": payload,
+                }))
+                sent += 1
+                if close_after is not None and sent >= close_after:
+                    return
+                # Drain any client->server frames (force feedback) between pushes.
+                try:
+                    while True:
+                        state.received.append(json.loads(websocket.recv(timeout=0)))
+                except TimeoutError:
+                    pass
+                time.sleep(0.005)
+        except ConnectionClosed:
             pass
 
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = serve(handler, "127.0.0.1", 0)
+    server.test_state = state
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
 
-def test_server_client_get_and_reuse():
-    server = _serve(list(range(7)))
-    host, port = server.server_address
+def _server_address(server):
+    host, port = server.socket.getsockname()[:2]
+    return host, port
+
+
+def test_server_client_get_and_reuse_websocket():
+    server = _serve("left", list(range(7)))
+    host, port = _server_address(server)
     c = _server_client(side="left", host=host, port=port)
     try:
         np.testing.assert_allclose(c.get_joint_positions(), np.arange(7))
-        np.testing.assert_allclose(c.get_joint_positions(), np.arange(7))  # keep-alive reuse
+        np.testing.assert_allclose(c.get_joint_positions(), np.arange(7))
+        assert c._receiver is not None
+        receiver = c._receiver
+        np.testing.assert_allclose(c.get_joint_positions(), np.arange(7))
+        assert c._receiver is receiver  # one persistent connection/receiver
     finally:
         c.close()
         server.shutdown()
-        server.server_close()
+
+
+def test_server_client_receives_diagnostics_on_same_websocket():
+    diagnostics = _diagnostics("left") | {"raw_q_rad": list(range(6))}
+    server = _serve("left", list(range(7)), diagnostics=diagnostics)
+    host, port = _server_address(server)
+    c = _server_client(side="left", host=host, port=port)
+    try:
+        assert c.get_diagnostics() == {key: value for key, value in diagnostics.items()
+                                       if key != "type"}
+        np.testing.assert_allclose(c.get_joint_positions(), np.arange(7))
+    finally:
+        c.close()
+        server.shutdown()
+
+
+def test_server_client_reconnects_after_stream_closes():
+    server = _serve("left", list(range(7)), close_after=1)
+    host, port = _server_address(server)
+    c = _server_client(side="left", host=host, port=port)
+    try:
+        np.testing.assert_allclose(c.get_joint_positions(), np.arange(7))
+        deadline = time.monotonic() + 2.0
+        while server.test_state.connections < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert server.test_state.connections >= 2
+        np.testing.assert_allclose(c.get_joint_positions(), np.arange(7))
+    finally:
+        c.close()
+        server.shutdown()
 
 
 def test_group_queries_two_servers():
     """One server per leader, each on its own port; the group merges them."""
-    left_srv = _serve({"left": list(range(7))})
-    right_srv = _serve({"right": list(range(20, 27))})
+    left_srv = _serve("left", list(range(7)))
+    right_srv = _serve("right", list(range(20, 27)))
     try:
         client = FactrClient.from_config(
-            _factr_cfg(left_srv.server_address, right_srv.server_address)
+            _factr_cfg(_server_address(left_srv), _server_address(right_srv))
         )
-        assert left_srv.server_address[1] != right_srv.server_address[1]  # distinct ports
+        assert _server_address(left_srv)[1] != _server_address(right_srv)[1]
         out = client.get_joint_positions()
         np.testing.assert_allclose(out["left"], np.arange(7))
         np.testing.assert_allclose(out["right"], np.arange(20, 27))
@@ -117,15 +183,87 @@ def test_group_queries_two_servers():
     finally:
         for s in (left_srv, right_srv):
             s.shutdown()
-            s.server_close()
+
+
+def test_send_force_feedback_reaches_server():
+    server = _serve("left", list(range(7)))
+    host, port = _server_address(server)
+    c = _server_client(side="left", host=host, port=port)
+    try:
+        tau = [0.5, -1.0, 0.0, 2.5, 0.0, 0.0, -0.25]
+        c.send_force_feedback(tau)
+        deadline = time.monotonic() + 2.0
+        while not server.test_state.received and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert server.test_state.received, "server never saw the force_feedback frame"
+        assert server.test_state.received[0] == {
+            "type": "force_feedback", "side": "left", "space": "joint", "tau": tau,
+        }
+    finally:
+        c.close()
+        server.shutdown()
+
+
+def test_group_send_force_feedback_routes_by_side():
+    left_srv = _serve("left", list(range(7)))
+    right_srv = _serve("right", list(range(7)))
+    try:
+        client = FactrClient.from_config(
+            _factr_cfg(_server_address(left_srv), _server_address(right_srv))
+        )
+        client.send_force_feedback({
+            "left": np.full(7, 0.5), "right": np.full(7, -0.5),
+        })
+        deadline = time.monotonic() + 2.0
+        while (
+            not (left_srv.test_state.received and right_srv.test_state.received)
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert left_srv.test_state.received[0]["tau"] == [0.5] * 7
+        assert left_srv.test_state.received[0]["side"] == "left"
+        assert right_srv.test_state.received[0]["tau"] == [-0.5] * 7
+        assert right_srv.test_state.received[0]["side"] == "right"
+        client.close()
+    finally:
+        for s in (left_srv, right_srv):
+            s.shutdown()
+
+
+def test_send_force_feedback_without_server_raises():
+    server = _serve("left", [])
+    host, port = _server_address(server)
+    server.shutdown()
+
+    c = _server_client(host=host, port=port, timeout_s=0.3)
+    with pytest.raises(FactrError):
+        c.send_force_feedback(np.zeros(7))
+    c.close()
+
+
+def test_send_force_feedback_rejects_bad_vectors():
+    # Validation happens before any connection is attempted.
+    c = _server_client()
+    with pytest.raises(FactrError):
+        c.send_force_feedback(np.zeros((2, 7)))     # not 1-D
+    with pytest.raises(FactrError):
+        c.send_force_feedback([float("nan")] * 7)   # non-finite
+    with pytest.raises(FactrError):
+        c.send_force_feedback([])                   # empty
+    c.close()
+
+
+def test_sim_send_force_feedback_is_noop():
+    c = _server_client(sim=True)
+    c.send_force_feedback(np.zeros(7))  # no server, no error
+    c.close()
 
 
 def test_unreachable_server_raises():
     # Bind then immediately shut down to get a port nothing is listening on.
-    server = _serve([])
-    host, port = server.server_address
+    server = _serve("left", [])
+    host, port = _server_address(server)
     server.shutdown()
-    server.server_close()
 
     c = _server_client(host=host, port=port, timeout_s=0.3)
     with pytest.raises(FactrError):
@@ -144,30 +282,38 @@ def test_sim_needs_no_server():
     client.close()
 
 
+def test_group_expands_side_placeholder_in_websocket_endpoint():
+    cfg = _factr_cfg(("localhost", 5000), ("localhost", 5001))
+    cfg.servers["left"].endpoint = "ws/{side}"
+    client = FactrClient.from_config(cfg, sim=True)
+    try:
+        assert client.server("left").url == "ws://localhost:5000/ws/left"
+    finally:
+        client.close()
+
+
 def test_preflight_passes_when_all_leaders_reachable():
-    left_srv = _serve({"left": list(range(7))})
-    right_srv = _serve({"right": list(range(7))})
+    left_srv = _serve("left", list(range(7)))
+    right_srv = _serve("right", list(range(7)))
     try:
         client = FactrClient.from_config(
-            _factr_cfg(left_srv.server_address, right_srv.server_address)
+            _factr_cfg(_server_address(left_srv), _server_address(right_srv))
         )
         client.preflight()  # both up -> no raise
         client.close()
     finally:
         for s in (left_srv, right_srv):
             s.shutdown()
-            s.server_close()
 
 
 def test_preflight_raises_and_names_unreachable_leader():
     # Left is served; right is bound-then-closed so nothing listens on its port.
-    left_srv = _serve({"left": list(range(7))})
-    right_srv = _serve([])
-    right_addr = right_srv.server_address
+    left_srv = _serve("left", list(range(7)))
+    right_srv = _serve("right", [])
+    right_addr = _server_address(right_srv)
     right_srv.shutdown()
-    right_srv.server_close()
     try:
-        client = FactrClient.from_config(_factr_cfg(left_srv.server_address, right_addr))
+        client = FactrClient.from_config(_factr_cfg(_server_address(left_srv), right_addr))
         with pytest.raises(FactrError) as exc:
             client.preflight()
         msg = str(exc.value)
@@ -176,7 +322,6 @@ def test_preflight_raises_and_names_unreachable_leader():
         client.close()
     finally:
         left_srv.shutdown()
-        left_srv.server_close()
 
 
 def test_preflight_passes_in_sim_without_servers():
@@ -210,24 +355,39 @@ def test_factr_interface_polls_live_sides_and_tolerates_a_dead_one():
     simply omits an unreachable side (its stream goes stale; nothing raises)."""
     from dual_flexiv_control.interfaces.factr import FactrInterface
     from dual_flexiv_control.interfaces.factr import factr_stream_name
+    from dual_flexiv_control.interfaces.factr import raw_factr_stream_name
+    from dual_flexiv_control.configs import JointConventionCfg
 
     left = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
-    left_srv = _serve({"left": left})
-    dead_srv = _serve([])
-    dead_addr = dead_srv.server_address
+    left_srv = _serve("left", left)
+    dead_srv = _serve("right", [])
+    dead_addr = _server_address(dead_srv)
     dead_srv.shutdown()
-    dead_srv.server_close()
     try:
-        cfg = _factr_cfg(left_srv.server_address, dead_addr)
+        cfg = _factr_cfg(_server_address(left_srv), dead_addr)
         node = FactrInterface(cfg, SimpleNamespace(runtime_dir="/tmp", sim=False), "rid")
-        node.open_source()
+        # Bypass startup calibration here: this test targets a runtime outage,
+        # after both leaders would already have supplied valid diagnostics.
+        node._client = FactrClient.from_config(cfg)
+        node._conventions = {
+            side: JointConventionCfg(
+                offsets_deg=[0.0] * 6,
+                sign_flip_joints=[],
+                drop_trailing=1,
+                wrap_deg=True,
+                gripper_open=0.0,
+                gripper_closed=1.0,
+            )
+            for side in cfg.servers
+        }
         sample = node.poll()
-        assert set(sample) == {factr_stream_name("left")}  # right omitted, no raise
-        np.testing.assert_allclose(sample[factr_stream_name("left")], left)
+        assert set(sample) == {
+            factr_stream_name("left"), raw_factr_stream_name("left")
+        }  # right omitted, no raise
+        np.testing.assert_allclose(sample[raw_factr_stream_name("left")], left)
         node.close_source()
     finally:
         left_srv.shutdown()
-        left_srv.server_close()
 
 
 class _StubSamples:

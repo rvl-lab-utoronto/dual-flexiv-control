@@ -1,13 +1,15 @@
-"""The FACTR interface node: ONE process polling the leader servers, publishing streams.
+"""The FACTR interface node: ONE process consuming leader WebSockets, publishing streams.
 
 FACTR leader data used to be fetched over HTTP independently by every consumer
 (the collection loop, the brain node, the dashboard mirror, the status probe) —
 four keep-alive connections that could disagree about reachability and payload
 (the viewer showing live motion while control read the server's zeros
 placeholder). This node makes FACTR a first-class stream producer like the arms
-and cameras: it is the **only** HTTP reader, and everyone else attaches
+and cameras: it is the **only** network reader, and everyone else attaches
 read-only to the shared-memory streams it publishes — so the
-viewer and the control path see the *same samples* by construction.
+viewer and the control path see the *same samples* by construction. Each per-arm
+client now drains a push WebSocket in the background, so this node samples the
+freshest received frame without creating request traffic or a receive backlog.
 
 Stream contract, each dim ``server.dof`` at :attr:`FactrCfg.rate_hz`:
 
@@ -110,9 +112,9 @@ def wait_leaders_fresh(source, cfg: FactrCfg, timeout_s: float, stop_event=None)
 
 
 class FactrInterface(StreamProducerNode):
-    """Polls every configured FACTR leader server; publishes ``factr/<side>``.
+    """Samples every configured FACTR WebSocket cache; publishes ``factr/<side>``.
 
-    One node covers all leaders (they are HTTP endpoints, not exclusive devices),
+    One node covers all leaders (their streams aren't exclusive devices),
     so a rig spawns exactly one ``factr`` process. ``runtime.sim`` propagates to
     the client, which then fabricates positions without a network.
     """

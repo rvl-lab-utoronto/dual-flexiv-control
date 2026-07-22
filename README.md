@@ -19,15 +19,18 @@ own process at its own rate:
    (`pyzed`)**, one process per camera, publishing image frames as streams: two
    **ZED X Nano** wrist cameras (one per arm) and one static external **ZED 2**
    stereo camera.
-4. **The FACTR interface** (`interfaces/factr/`) — polls each leader over HTTP and
-   publishes both its raw Dynamixel reading and its converted DFC/Rizon pose.
+4. **The FACTR interface** (`interfaces/factr/`) — consumes each leader's WebSocket and
+   publishes both its raw Dynamixel reading and its converted DFC/Rizon pose. The
+   socket is duplex: `FactrClient.send_force_feedback` pushes follower external
+   joint torques back up it (joint-space `force_feedback` frames) for the leader's
+   force-feedback term.
 
 ## Architecture
 
 ```
  FlexivInterface(LEFT/RIGHT)  process ─┐  shared-memory ring buffers  ┌─ BrainNode  process
  ZedInterface(wrist_l/wrist_r/static)  ─┤      (one per signal)        └─  reads last k
-                                        └                              └─ FactrClient.get_joint_positions()  (on request, HTTP)
+ FactrInterface(leader WebSockets)      ─┘
 ```
 
 * **Streams** are single-producer / multi-consumer ring buffers in POSIX shared
@@ -186,7 +189,7 @@ convention internally for leader gravity compensation. Its arm YAML stores the c
 raw-Dynamixel→DFC convention (offsets, sign flips, wrapping, trailing-field handling,
 and gripper endpoints), the distinct DFC-straight and FACTR-model reference coordinates,
 and the explicit DFC→FACTR transform (including FACTR's joint-4 `pi/2`). DFC loads this
-contract from the leader diagnostics endpoint and
+contract from diagnostics frames on that same WebSocket and
 crashes if it is absent or malformed; no leader conversion values live in the follower
 rig YAML and calibration is not pushed between services.
 
@@ -349,9 +352,9 @@ src/dual_flexiv_control/
 
 ## Status / TODO
 
-* FACTR reads **joint positions** from the server's `get_joint_positions`
-  endpoint. Other FACTR signals (e.g. force feedback) can be added as more
-  endpoints/streams when needed (`interfaces/factr/backend.py`).
+* FACTR receives **joint positions and diagnostics** as typed JSON frames on one
+  persistent WebSocket per leader. Other FACTR signals (e.g. force feedback) can
+  be added as additional frame types when needed.
 * **Control is implemented** over the control channel (`control/`). `qpos` FACTR
   teleop is verified end-to-end in sim; `qvel`/`end_effector`/`eef_vel`/`force` send
   paths are wired and verified against the flexivrdk 1.8 docs but **not yet

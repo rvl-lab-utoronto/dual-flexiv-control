@@ -30,7 +30,7 @@ and the ghost tracks the leader command. When the convention is right and the le
 is posed on target, the ghost snaps onto the solid arm. The view is its own gRPC
 recording embedded in the shared web viewer (same approach as replay).
 
-This module *reads* the FACTR HTTP endpoint (honouring ``runtime.sim``) and renders —
+This module reads the FACTR WebSocket cache (honouring ``runtime.sim``) and renders —
 it never opens a robot connection. The only file it touches is the rig YAML, and only
 via the explicit **Sync to file** action (:func:`apply_to_rig`), which merges the
 measured convention in place (preserving comments + gripper endpoints). Mirrors
