@@ -530,7 +530,7 @@ def _ghost_configs(leader_samples: dict) -> dict:
 
     ``factr/<side>`` is already converted from raw Dynamixel coordinates to the
     canonical DFC/Rizon convention by :class:`FactrInterface`. Do not gate these
-    live samples on the dashboard's independently-polled diagnostics cache: the
+    live samples on the dashboard's independently-polled calibration cache: the
     mirror commonly starts before that cache is populated, which left the ghosts
     frozen at their static startup pose for the lifetime of the viewer.
     """

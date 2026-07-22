@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 import threading
 import time
+from http.server import BaseHTTPRequestHandler
+from http.server import HTTPServer
 from types import SimpleNamespace
 
 import numpy as np
@@ -39,6 +41,21 @@ def _factr_cfg(left_addr, right_addr):
     )
 
 
+#: A valid leader-owned calibration contract for the fixtures' dof=7 servers
+#: (drop_trailing=1 -> 6 arm joints). Identity mapping, so converted samples
+#: equal the raw payload (small radians survive the deg wrap untouched) and the
+#: gripper normalizes to itself under the [0, 1] endpoints.
+_CALIBRATION = {
+    "available": True,
+    "dfc_raw_offsets_deg": [0.0] * 6,
+    "dfc_sign_flip_joints": [],
+    "dfc_wrap_deg": True,
+    "dfc_drop_trailing": 1,
+    "dfc_gripper_open": 0.0,
+    "dfc_gripper_closed": 1.0,
+}
+
+
 # -- single-server response parsing (no network) -----------------------------
 
 
@@ -69,28 +86,37 @@ def test_parse_wrong_length_raises():
 # -- live WebSocket (sync server stands in for one leader's FACTR relay) ------
 
 
-def _diagnostics(side, dof=7):
-    return {
-        "type": "diagnostics",
-        "available": True,
-        "side": side,
-        "dfc_raw_offsets_deg": [0.0] * (dof - 1),
-        "dfc_sign_flip_joints": [],
-        "dfc_wrap_deg": True,
-        "dfc_drop_trailing": 1,
-        "dfc_gripper_open": 0.0,
-        "dfc_gripper_closed": 1.0,
-    }
+def _serve_calibration():
+    """HTTP server standing in for the relay's ``GET /calibration_<side>`` route.
+
+    Production serves this from the same FastAPI app as the WebSocket; the test
+    stand-ins are separate servers because the sync websockets helper does not
+    speak plain HTTP.
+    """
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_GET(self):
+            side = self.path.split("_", 1)[1]
+            body = json.dumps(dict(_CALIBRATION, side=side)).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
 
 
-def _serve(side, payload, diagnostics=None, close_after=None):
-    diagnostics = diagnostics or _diagnostics(side)
+def _serve(side, payload, close_after=None):
     state = SimpleNamespace(connections=0, received=[])
 
     def handler(websocket):
         state.connections += 1
         try:
-            websocket.send(json.dumps(diagnostics))
             sent = 0
             while True:
                 websocket.send(json.dumps({
@@ -136,20 +162,6 @@ def test_server_client_get_and_reuse_websocket():
         server.shutdown()
 
 
-def test_server_client_receives_diagnostics_on_same_websocket():
-    diagnostics = _diagnostics("left") | {"raw_q_rad": list(range(6))}
-    server = _serve("left", list(range(7)), diagnostics=diagnostics)
-    host, port = _server_address(server)
-    c = _server_client(side="left", host=host, port=port)
-    try:
-        assert c.get_diagnostics() == {key: value for key, value in diagnostics.items()
-                                       if key != "type"}
-        np.testing.assert_allclose(c.get_joint_positions(), np.arange(7))
-    finally:
-        c.close()
-        server.shutdown()
-
-
 def test_server_client_reconnects_after_stream_closes():
     server = _serve("left", list(range(7)), close_after=1)
     host, port = _server_address(server)
@@ -164,6 +176,22 @@ def test_server_client_reconnects_after_stream_closes():
     finally:
         c.close()
         server.shutdown()
+
+
+def test_server_client_calibration_contract():
+    """get_calibration() returns the leader-owned raw→DFC contract verbatim."""
+    server = _serve_calibration()
+    host, port = server.server_address
+    c = _server_client(side="left", host=host, port=port)
+    try:
+        data = c.get_calibration()
+        assert data["available"] is True and data["side"] == "left"
+        assert data["dfc_raw_offsets_deg"] == [0.0] * 6
+        assert data["dfc_drop_trailing"] == 1
+    finally:
+        c.close()
+        server.shutdown()
+        server.server_close()
 
 
 def test_group_queries_two_servers():
@@ -351,8 +379,12 @@ def test_factr_interface_declares_one_stream_per_side():
 
 
 def test_factr_interface_polls_live_sides_and_tolerates_a_dead_one():
-    """poll() returns each reachable leader's payload under its stream name and
-    simply omits an unreachable side (its stream goes stale; nothing raises)."""
+    """poll() returns each reachable leader's payload under its stream names and
+    simply omits a side that drops out (its stream goes stale; nothing raises).
+
+    Startup is strict — open_source() requires every configured side's
+    calibration contract — so the right leader dies AFTER it, mid-run.
+    """
     from dual_flexiv_control.interfaces.factr import FactrInterface
     from dual_flexiv_control.interfaces.factr import factr_stream_name
     from dual_flexiv_control.interfaces.factr import raw_factr_stream_name
@@ -367,7 +399,7 @@ def test_factr_interface_polls_live_sides_and_tolerates_a_dead_one():
         cfg = _factr_cfg(_server_address(left_srv), dead_addr)
         node = FactrInterface(cfg, SimpleNamespace(runtime_dir="/tmp", sim=False), "rid")
         # Bypass startup calibration here: this test targets a runtime outage,
-        # after both leaders would already have supplied valid diagnostics.
+        # after both leaders would already have supplied a valid contract.
         node._client = FactrClient.from_config(cfg)
         node._conventions = {
             side: JointConventionCfg(
@@ -385,6 +417,9 @@ def test_factr_interface_polls_live_sides_and_tolerates_a_dead_one():
             factr_stream_name("left"), raw_factr_stream_name("left")
         }  # right omitted, no raise
         np.testing.assert_allclose(sample[raw_factr_stream_name("left")], left)
+        # The injected contract is the identity mapping, so the converted stream
+        # carries the same values (and the 0..1 gripper endpoints keep 0.7).
+        np.testing.assert_allclose(sample[factr_stream_name("left")], left)
         node.close_source()
     finally:
         left_srv.shutdown()

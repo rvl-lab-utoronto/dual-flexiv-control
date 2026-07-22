@@ -327,6 +327,15 @@ class FactrServerSupervisor:
             [f"source {shlex.quote(s)}" for s in self.cfg.setup_scripts]
             + [f"exec {shlex.quote(self.cfg.python_exe)} -m {shlex.quote(unit.module)}"]
         )
+        # The API relay publishes FACTR's diagnostics to the dashboard's Rerun
+        # gRPC proxy under its own application id; point it at the same port the
+        # dashboard serves (honouring the DFC_DASHBOARD_GRPC_PORT override).
+        env = dict(os.environ)
+        env.setdefault(
+            "FACTR_RERUN_URL",
+            "rerun+http://127.0.0.1:"
+            f"{os.environ.get('DFC_DASHBOARD_GRPC_PORT', '9876')}/proxy",
+        )
         # One log per launch (truncate), like the task; Popen inherits its own fd.
         with open(unit.log_path, "w") as logf:
             unit.proc = subprocess.Popen(
@@ -334,6 +343,7 @@ class FactrServerSupervisor:
                 cwd=self.workdir,
                 stdout=logf if unit.keep_stdout else subprocess.DEVNULL,
                 stderr=logf,
+                env=env,
                 # Its own session: the daemon's terminal signals must never reach
                 # the servos' processes except through our explicit SIGINT stop.
                 start_new_session=True,

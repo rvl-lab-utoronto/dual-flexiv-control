@@ -188,10 +188,16 @@ DFC/Rizon convention and is what the viewer, brain, and
 convention internally for leader gravity compensation. Its arm YAML stores the complete
 raw-Dynamixel→DFC convention (offsets, sign flips, wrapping, trailing-field handling,
 and gripper endpoints), the distinct DFC-straight and FACTR-model reference coordinates,
-and the explicit DFC→FACTR transform (including FACTR's joint-4 `pi/2`). DFC loads this
-contract from diagnostics frames on that same WebSocket and
+and the explicit DFC→FACTR transform (including FACTR's joint-4 `pi/2`). DFC loads the
+raw→DFC part of this contract from the leader's `GET /calibration_<side>` route and
 crashes if it is absent or malformed; no leader conversion values live in the follower
 rig YAML and calibration is not pushed between services.
+
+FACTR's diagnostics never pass through DFC: its API relay streams the calibration
+snapshot, the post-enable control-tick captures, and the live master gain straight to
+the dashboard's Rerun gRPC proxy under the separate application id `factr-diagnostics`
+(sink URL exported as `FACTR_RERUN_URL` by the session daemon's launcher). Select that
+recording in the embedded viewer to inspect them.
 
 With `arm.control_enabled=true`, the brain posts the already-converted FACTR pose as
 the Rizon qpos setpoint. A hardware-free run:
@@ -352,9 +358,10 @@ src/dual_flexiv_control/
 
 ## Status / TODO
 
-* FACTR receives **joint positions and diagnostics** as typed JSON frames on one
-  persistent WebSocket per leader. Other FACTR signals (e.g. force feedback) can
-  be added as additional frame types when needed.
+* FACTR streams **joint positions** as typed JSON frames on one persistent
+  WebSocket per leader, and accepts `force_feedback` frames back on the same
+  socket. Full FACTR diagnostics go straight from the relay to Rerun; DFC only
+  fetches the calibration contract over HTTP at startup.
 * **Control is implemented** over the control channel (`control/`). `qpos` FACTR
   teleop is verified end-to-end in sim; `qvel`/`end_effector`/`eef_vel`/`force` send
   paths are wired and verified against the flexivrdk 1.8 docs but **not yet

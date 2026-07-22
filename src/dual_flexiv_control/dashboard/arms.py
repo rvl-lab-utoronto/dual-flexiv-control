@@ -204,9 +204,9 @@ def discover_conventions() -> dict:
         for side, server in factr.servers.items():
             attempted_at = time.time()
             try:
-                data = client.get_diagnostics_for(side)
+                data = client.get_calibration_for(side)
                 if data.get("available") is True:
-                    discovered[side] = FactrInterface._convention_from_diagnostics(
+                    discovered[side] = FactrInterface._convention_from_calibration(
                         side, int(server.dof), data
                     )
                     attempts[side] = {
@@ -216,7 +216,7 @@ def discover_conventions() -> dict:
                 else:
                     attempts[side] = {
                         "state": "waiting", "attempted_at": attempted_at,
-                        "message": "FACTR is starting; diagnostics not available yet",
+                        "message": "FACTR is starting; calibration not available yet",
                     }
             except Exception as exc:  # FACTR is optional; poll again next fragment rerun.
                 attempts[side] = {
@@ -238,10 +238,10 @@ def discover_conventions() -> dict:
 
 
 def convention_poll_status(side: str) -> dict:
-    """Latest non-blocking dashboard diagnostics-poll state for one leader."""
+    """Latest non-blocking dashboard calibration-poll state for one leader."""
     with _LEADER_CONVENTION_LOCK:
         return dict(_LEADER_CONVENTION_STATUS.get(side, {
-            "state": "waiting", "message": "waiting for first diagnostics poll",
+            "state": "waiting", "message": "waiting for first calibration poll",
         }))
 
 
