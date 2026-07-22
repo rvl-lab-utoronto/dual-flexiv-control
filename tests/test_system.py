@@ -324,7 +324,7 @@ def test_full_system_sim_clean_shutdown(tmp_path):
         "cameras.static.width=64", "cameras.static.height=48",
     )
     # The brain's default subscription covers both arms' proprio (cameras are
-    # produced but not auto-subscribed; FACTR is on-request, not streamed).
+    # produced but not auto-subscribed; FACTR is published by its own producer).
     assert set(default_stream_names(config.arms)) == {
         f"{side}/{sig}" for side in ("left", "right") for sig in config.arms[side].streams
     }

@@ -55,6 +55,7 @@ def test_left_only_rig_single_real_arm():
     assert set(cfg.arms) == {"left"}
     assert set(cfg.cameras) == {"static"}  # no wrist cam plugged in on this rig
     assert set(cfg.factr.servers) == {"left"}
+    assert cfg.factr.servers["left"].endpoint == "ws/left"
     assert not any(s.dummy for s in cfg.arms["left"].streams.values())  # real arm
     assert cfg.recording.root == "datasets"                              # not quarantined
 

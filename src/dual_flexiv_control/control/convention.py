@@ -1,7 +1,7 @@
 """FACTR leader → Rizon follower joint-space convention (pure math, no SDK).
 
 Captured verbatim from the hardware-validated teleop test (``rizon_tests``): the
-FACTR FastAPI server returns ``DoF+1`` joint values in radians (the arm joints
+The FACTR WebSocket returns ``DoF+1`` joint values in radians (the arm joints
 plus a trailing gripper value). Mapping to Rizon joint targets is: drop the
 gripper, convert to degrees, add per-joint offsets, flip the sign of selected
 joints, wrap to ``[-180, 180]``, convert back to radians.

@@ -1,8 +1,8 @@
 """Hardware/system interfaces.
 
-The Flexiv (arm proprioception) and ZED (camera frames) interfaces are stream
-producers — one process each (per arm / per camera). FACTR is an on-request HTTP
-client (no stream) — the brain holds one and queries it on demand.
+The Flexiv (arm proprioception), ZED (camera frames), and FACTR (leader-arm
+WebSockets) interfaces are stream producers. Each publishes shared-memory data
+that the brain consumes without opening hardware/network connections itself.
 """
 
 from .factr import FactrClient
