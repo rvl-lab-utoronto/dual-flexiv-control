@@ -397,7 +397,7 @@ def _render_arm_row(s: ArmStatus) -> None:
     if s.control_active:
         operation += " · :orange[controlling]"
     if s.estop_pressed:
-        estop = ":red[🛑 **E-STOP PRESSED**]"
+        estop = ":red[🛑 **PRESSED**]"
     elif s.estop_pressed is False:
         estop = ":green[clear]"
     else:
