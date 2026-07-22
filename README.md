@@ -184,8 +184,9 @@ DFC/Rizon convention and is what the viewer, brain, and
 `observation.factr.<side>` use. The FACTR server keeps a separate FACTR-model
 convention internally for leader gravity compensation. Its arm YAML stores the complete
 raw-Dynamixel→DFC convention (offsets, sign flips, wrapping, trailing-field handling,
-and gripper endpoints), the same physical home in DFC coordinates, and the explicit
-DFC→FACTR transform. DFC loads this contract from the leader diagnostics endpoint and
+and gripper endpoints), the distinct DFC-straight and FACTR-model reference coordinates,
+and the explicit DFC→FACTR transform (including FACTR's joint-4 `pi/2`). DFC loads this
+contract from the leader diagnostics endpoint and
 crashes if it is absent or malformed; no leader conversion values live in the follower
 rig YAML and calibration is not pushed between services.
 

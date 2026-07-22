@@ -6,7 +6,9 @@ defaults:
 # Example task. Select with `task=handover`.
 language_instruction: "Pick up the object with the left arm and hand it to the right arm."
 collection:
-  repo_id: dfc/handover
+  # New bimanual schema: 14-D state, 16-D action, plus converted + raw FACTR streams.
+  # Keep the legacy single-arm `dfc/handover` dataset immutable.
+  repo_id: dfc/handover_bimanual_v2
   num_episodes: 100
 eval:
   num_timesteps: 600

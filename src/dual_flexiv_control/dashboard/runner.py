@@ -176,6 +176,8 @@ class RunRegistry:
             _log_event(f"run ended: {outcome.get('outcome')} · {detail}")
             return {
                 "kind": "info" if ok else "error",
+                "phase": outcome.get("phase"),
+                "outcome": outcome.get("outcome"),
                 "run_id": f"{seq}",
                 "detail": detail,
                 "tail": None if ok else self.manager.log_tail(_ERROR_TAIL_LINES),
@@ -523,20 +525,19 @@ def _log_factr_leaders(sides: list[str], errored: set[str]) -> dict:
     return fetched
 
 
-def _ghost_configs(leader_samples: dict, conventions: dict) -> dict:
-    """Map raw leader samples to commanded Rizon joint configs — the teleop ghost.
+def _ghost_configs(leader_samples: dict) -> dict:
+    """Return commanded Rizon joint configs for the teleop ghost.
 
-    ``{side: joint_pos(DoF+1 rad)}`` → ``{side: q_cmd(DoF rad)}`` via
-    :func:`convert_factr_to_rizon` (the exact brain-side leader→follower mapping), so
-    the ghost stands where teleop is *commanding* the follower to go. Sides without a
-    known convention are skipped.
+    ``factr/<side>`` is already converted from raw Dynamixel coordinates to the
+    canonical DFC/Rizon convention by :class:`FactrInterface`. Do not gate these
+    live samples on the dashboard's independently-polled diagnostics cache: the
+    mirror commonly starts before that cache is populated, which left the ghosts
+    frozen at their static startup pose for the lifetime of the viewer.
     """
-    ghost: dict = {}
-    for side, jp in leader_samples.items():
-        conv = conventions.get(side)
-        if conv is not None:
-            ghost[side] = np.asarray(jp, dtype=float)[:7]
-    return ghost
+    return {
+        side: np.asarray(jp, dtype=float)[:7]
+        for side, jp in leader_samples.items()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -649,7 +650,6 @@ class SessionMirror:
             _log_event("live view stopped unexpectedly — the session continues; see dashboard logs")
 
     def _run_inner(self, stop: threading.Event) -> None:
-        from .arms import discover_conventions
         from .arms import read_live_horizon_eef
         from .arms import read_live_horizon_q
         from .arms import read_live_stream
@@ -659,8 +659,6 @@ class SessionMirror:
         _style_policy_comm_series()
         factr_sides = _factr_leader_sides()
         factr_errored: set[str] = set()
-        conventions = discover_conventions()
-        robot_rec = robot_view.robot_recording()
         live_q: dict = {}      # last-known real measured q per side
         live_eef: dict = {}    # last-known measured TCP position [x y z] per side
         horizon_q: dict = {}   # eval horizon-end q target per side (eval runs only)
@@ -721,9 +719,13 @@ class SessionMirror:
             leader_samples = (
                 _log_factr_leaders(factr_sides, factr_errored) if factr_sides else {}
             )
+            # Resolve every tick. The mirror can start just before the viewer binds
+            # its recording; caching that initial None would disable pose updates
+            # for the lifetime of the thread.
+            robot_rec = robot_view.robot_recording()
             if robot_rec is not None:
                 real_q = dict(live_q)
-                ghost_q = _ghost_configs(leader_samples, conventions)
+                ghost_q = _ghost_configs(leader_samples)
                 robot_view.update_poses(robot_rec, real_q, ghost_q, t)
                 if horizon_q or horizon_eef:
                     robot_view.update_horizon_targets(

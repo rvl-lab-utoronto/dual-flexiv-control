@@ -42,7 +42,7 @@ DEFAULT_WEB_PORT = 9090
 #: replayed for *minutes*. 8 MiB holds ~2 min, bounding the backfill without
 #: reordering Rerun's store-initialization messages. Override with
 #: ``DFC_DASHBOARD_MEMORY_LIMIT``.
-DEFAULT_MEMORY_LIMIT = os.environ.get("DFC_DASHBOARD_MEMORY_LIMIT", "8MiB")
+DEFAULT_MEMORY_LIMIT = os.environ.get("DFC_DASHBOARD_MEMORY_LIMIT", "256MiB")
 
 # Process-global singletons, with two deliberately-split lifetimes:
 #

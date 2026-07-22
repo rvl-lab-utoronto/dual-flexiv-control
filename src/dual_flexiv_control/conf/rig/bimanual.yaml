@@ -20,6 +20,9 @@ arms:
     name: "Lauer"
     serial: Rizon4s-062841
     control_enabled: true
+    # Allow the deliberately slow MoveJ bootstrap to align the follower from an
+    # arbitrary starting pose. The target/measured delta is still logged.
+    control_safety_check: false
     gripper:
       enabled: true
       name: "Flexiv-GN01"
@@ -33,6 +36,9 @@ arms:
     name: "Rogers"
     serial: Rizon4s-062837
     control_enabled: true
+    # Allow the deliberately slow MoveJ bootstrap to align the follower from an
+    # arbitrary starting pose. The target/measured delta is still logged.
+    control_safety_check: false
     gripper:
       enabled: true
       name: "Flexiv-GN01"

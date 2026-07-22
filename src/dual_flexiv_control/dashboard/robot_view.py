@@ -637,11 +637,15 @@ def log_scene(rec, joint_angles: dict[str, np.ndarray] | None = None) -> None:
         rec.log("robot/pedestal", rr.Asset3D(path=str(PEDESTAL_GLB)), static=True)
 
     chain = _chain()
+    # Geometry is timeless, but poses must not be static: a static Transform3D
+    # shadows later temporal Transform3D updates on the same entity and freezes
+    # the solid/ghost arms at startup even while live samples are being logged.
+    rec.set_time(_POSE_TIMELINE, duration=0.0)
     for side in ("left", "right"):
         q = None if joint_angles is None else joint_angles.get(side)
         for ghost in (False, True):
             _log_arm_geometry(rec, side, chain, ghost=ghost)
-            _log_arm_pose(rec, side, chain, q, ghost=ghost, static=True)  # idle home pose
+            _log_arm_pose(rec, side, chain, q, ghost=ghost, static=False)  # initial home pose
 
 
 #: Last-known measured-``q`` presence, so the solid arm is recoloured only when its

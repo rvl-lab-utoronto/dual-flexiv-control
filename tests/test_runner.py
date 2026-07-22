@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 
+import numpy as np
 import pytest
 
 pytestmark = pytest.mark.skipif(
@@ -32,6 +33,16 @@ def _rerun_recording():
 
     rr.init("dfc-test", spawn=False)
     yield
+
+
+def test_ghost_configs_uses_converted_stream_without_diagnostics():
+    """A converted FACTR stream animates even before diagnostics polling succeeds."""
+    from dual_flexiv_control.dashboard.runner import _ghost_configs
+
+    sample = np.arange(8, dtype=float)
+    ghosts = _ghost_configs({"right": sample})
+
+    np.testing.assert_array_equal(ghosts["right"], sample[:7])
 
 
 def _task():
@@ -281,6 +292,8 @@ def test_crash_outcome_alerts_with_log_tail():
     })
     alert = registry.take_alert()
     assert alert is not None and alert["kind"] == "error"
+    assert alert["phase"] == "collection"
+    assert alert["outcome"] == "crashed"
     assert "exit code 3" in alert["detail"]
     assert alert["tail"] == mgr.tail
     (run,) = registry.history()

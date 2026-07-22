@@ -19,6 +19,7 @@ import os
 import time
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 # Absolute imports: Streamlit executes this file as a top-level script (no package
 # context), so relative imports would fail here. The package itself is installed,
@@ -83,12 +84,14 @@ _PAGE_CSS = """
     background-color: #1d4ed8 !important;
     border-color: #1d4ed8 !important;
 }
-.st-key-eval_launch button {
+.st-key-eval_launch button,
+.st-key-repeat_launch button {
     background-color: #16a34a !important;
     border-color: #16a34a !important;
     color: white !important;
 }
-.st-key-eval_launch button:hover {
+.st-key-eval_launch button:hover,
+.st-key-repeat_launch button:hover {
     background-color: #15803d !important;
     border-color: #15803d !important;
 }
@@ -301,7 +304,7 @@ def _render_controls(
     switching = view.run_active
 
     if st.button(
-        "⇄ Collection" if switching else "▶ Collection",
+        "⇄ Collection" if switching else "▶ Collection [C]",
         key="collection_launch",
         use_container_width=True, disabled=not (launchable or switching),
         help=(
@@ -311,6 +314,7 @@ def _render_controls(
         ),
     ):
         _launch(registry, task, "collection", rig.name, switch=switching)
+    _collection_keybinds()
 
     # One compact row: labels collapsed (the column is narrow), meaning carried
     # by tooltips + the resolution caption underneath.
@@ -515,8 +519,22 @@ def _render_factr_section(registry: _runner.RunRegistry) -> None:
     elif state == "stopping":
         st.caption(":gray[FACTR service stopping — the leaders are de-energizing…]")
 
-    if st.button(
-        "▶ Enable grav comp", key="factr_enable", use_container_width=True,
+    statuses = [
+        _arms.read_leader_grav_comp_status(side)
+        for side in configured_leader_sides()
+    ]
+    disable_is_action = any(
+        status is not None and (
+            status.get("grav_comp_enabled") is True
+            or float(status.get("force_gain_target") or 0.0) >= 0.99
+        )
+        for status in statuses
+    )
+    st.markdown(_grav_comp_button_css(disable_is_action), unsafe_allow_html=True)
+
+    grav_cols = st.columns(2)
+    if grav_cols[0].button(
+        "▶ Enable grav comp [F]", key="factr_enable", use_container_width=True,
         help=(
             "Ramp every leader's master output gain 0→1 over ~1s — the arms go "
             "from limp to gravity-compensated. The teleop processes stay up "
@@ -528,8 +546,8 @@ def _render_factr_section(registry: _runner.RunRegistry) -> None:
         else:
             st.warning("Session daemon not reachable.", icon="⚠️")
         st.rerun(scope="fragment")
-    if st.button(
-        "■ Disable grav comp (de-energize)", key="factr_disable",
+    if grav_cols[1].button(
+        "■ Disable grav comp (de-energize) [F]", key="factr_disable",
         use_container_width=True,
         help=(
             "Ramp every leader's master output gain 1→0 over ~1s — the arms go "
@@ -544,6 +562,33 @@ def _render_factr_section(registry: _runner.RunRegistry) -> None:
         st.rerun(scope="fragment")
 
 
+def _grav_comp_button_css(disable_is_action: bool) -> str:
+    """Solid orange marks the action opposite the leaders' current gain state."""
+    solid = "factr_disable" if disable_is_action else "factr_enable"
+    hollow = "factr_enable" if disable_is_action else "factr_disable"
+    return f"""
+    <style>
+    .st-key-{solid} button {{
+        background-color: #f97316 !important;
+        border-color: #f97316 !important;
+        color: white !important;
+    }}
+    .st-key-{solid} button:hover {{
+        background-color: #ea580c !important;
+        border-color: #ea580c !important;
+    }}
+    .st-key-{hollow} button {{
+        background-color: transparent !important;
+        border-color: #f97316 !important;
+        color: #f97316 !important;
+    }}
+    .st-key-{hollow} button:hover {{
+        background-color: rgba(249, 115, 22, 0.12) !important;
+        border-color: #ea580c !important;
+        color: #ea580c !important;
+    }}
+    </style>
+    """
 def _render_camera_row(s: CameraStatus) -> None:
     dot = "🟢" if s.detected else "⚫"
     if s.detected:
@@ -636,7 +681,12 @@ def _run_status_panel(registry: _runner.RunRegistry) -> None:
     """
     alert = registry.take_alert()
     if alert is not None:
-        st.session_state["run_alert"] = alert
+        key = (
+            "factr_control_alert"
+            if alert.get("kind") == "error" and alert.get("phase") == "collection"
+            else "run_alert"
+        )
+        st.session_state[key] = alert
         st.rerun(scope="app")
     view = registry.session_view()
     # The launch buttons/rig lock live OUTSIDE this fragment; when the session's
@@ -712,13 +762,71 @@ def _run_status_panel(registry: _runner.RunRegistry) -> None:
                 with st.expander("Recording log (tail)"):
                     st.code(cs.error_tail, language="text")
     if st.button(
-        "💾 Saving episode…" if stopping else "■ Stop",
+        (
+            "💾 Saving episode…" if stopping else
+            ("■ Stop [S]" if active.phase == "collection" else "■ Stop")
+        ),
+        key="collection_stop" if active.phase == "collection" else "run_stop",
         use_container_width=True,
         disabled=stopping,
         help="Stops the run; the in-progress episode is saved (video finalize can take a while).",
     ):
         registry.stop_active()
         st.rerun(scope="app")
+
+
+def _collection_keybinds() -> None:
+    """Bind C=start Collection and S=stop through the existing guarded buttons."""
+    components.html(
+        """
+        <script>
+        (() => {
+          const host = window.parent;
+          if (host.__dfcCollectionKeyHandler) {
+            host.document.removeEventListener('keydown', host.__dfcCollectionKeyHandler);
+          }
+          const handler = (event) => {
+            if (event.defaultPrevented || event.repeat || event.ctrlKey ||
+                event.metaKey || event.altKey) return;
+            const target = event.target;
+            const tag = (target && target.tagName || '').toUpperCase();
+            if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' ||
+                (target && target.isContentEditable)) return;
+
+            const key = event.key.toLowerCase();
+            let button = null;
+            if (key === 'c') {
+              // Start-only: never turn C into an implicit run switch.
+              const stop = host.document.querySelector(
+                '.st-key-collection_stop button, .st-key-run_stop button'
+              );
+              if (stop) return;
+              button = host.document.querySelector('.st-key-collection_launch button');
+            } else if (key === 's') {
+              button = host.document.querySelector('.st-key-collection_stop button');
+            } else if (key === 'f') {
+              const section = host.document.querySelector('.st-key-factr_status_section');
+              const status = (section && section.textContent || '').toLowerCase();
+              if (status.includes('grav comp enabled') ||
+                  status.includes('enabling grav comp')) {
+                button = host.document.querySelector('.st-key-factr_disable button');
+              } else if (status.includes('grav comp disabled') ||
+                         status.includes('disabling grav comp')) {
+                button = host.document.querySelector('.st-key-factr_enable button');
+              }
+            }
+            if (!button || button.disabled) return;
+            event.preventDefault();
+            button.click();
+          };
+          host.__dfcCollectionKeyHandler = handler;
+          host.document.addEventListener('keydown', handler);
+        })();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
 
 
 def _render_status(registry: _runner.RunRegistry) -> None:
@@ -733,15 +841,24 @@ def _render_status(registry: _runner.RunRegistry) -> None:
         if view.message and _service_message_section(view.message) == "arms":
             st.info(view.message)
         _arm_status_rows(registry)
-    with st.container(border=True):
+    with st.container(border=True, key="factr_status_section"):
         with st.container(
             horizontal=True, horizontal_alignment="left",
             vertical_alignment="center", gap="small",
         ):
-            st.markdown("#### Followers (FACTR)", width="content")
+            st.markdown("#### Leaders (FACTR)", width="content")
             _reset_services_button(registry, key="reset_factr_services")
         if view.message and _service_message_section(view.message) == "factr":
             st.info(view.message)
+        alert = st.session_state.get("factr_control_alert")
+        if alert:
+            st.error(f"Collection control error: {alert['detail']}", icon="⚠️")
+            if alert.get("tail"):
+                with st.expander("Control log (tail)"):
+                    st.code(alert["tail"], language="text")
+            if st.button("Dismiss", key="dismiss_factr_control_alert"):
+                st.session_state.pop("factr_control_alert", None)
+                st.rerun()
         _leader_status_rows(registry)
         _render_factr_section(registry)
     with st.container(border=True):
@@ -769,6 +886,8 @@ def _render_status(registry: _runner.RunRegistry) -> None:
 def _service_message_section(message: str) -> str | None:
     """Route hardware-service messages to their owning status card."""
     text = message.lower()
+    if "control error" in text or "dropped out of control" in text:
+        return "factr"
     if "factr" in text or "grav comp" in text or "leader" in text:
         return "factr"
     if "camera" in text:
@@ -954,7 +1073,8 @@ def _render_skill_bar(registry: _runner.RunRegistry) -> None:
     info = by_name[selected]
     launchable = view.state == "viewing"
     if cols[1].button(
-        "▶ Repeat", type="primary", use_container_width=True, disabled=not launchable,
+        "▶ Repeat", key="repeat_launch", type="primary",
+        use_container_width=True, disabled=not launchable,
         help="Retrace this skill on the live arm(s): move to its start pose, then "
              "replay the taught joint trajectory. Stop from the status panel.",
     ):

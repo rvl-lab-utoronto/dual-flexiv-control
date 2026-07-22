@@ -363,8 +363,26 @@ class FlexivInterface(StreamProducerNode):
             if first is None:
                 return
             first_fields = slice_streamed(ctrl, first)
+            rs = self._source.read()
+            if ctrl.kind == "qpos":
+                q_target = np.asarray(first_fields["q_d"], dtype=np.float64)
+                q_measured = np.asarray(rs.q, dtype=np.float64)
+                delta = q_target - q_measured
+                worst = int(np.argmax(np.abs(delta)))
+                log.info(
+                    "[%s] CONTROL PREFLIGHT: target_q_rad=%s measured_q_rad=%s "
+                    "delta_rad=%s worst_joint=%d worst_abs_error_rad=%.6f tolerance_rad=%.6f",
+                    self.name, q_target.tolist(), q_measured.tolist(), delta.tolist(),
+                    worst + 1, abs(float(delta[worst])), self.arm.control_tolerance,
+                )
+                if self.arm.control_safety_check and abs(float(delta[worst])) > self.arm.control_tolerance:
+                    raise RuntimeError(
+                        f"[{self.name}] refusing MoveJ: first target joint {worst + 1} is "
+                        f"{abs(float(delta[worst])):.3f} rad from measured pose "
+                        f"(tolerance {self.arm.control_tolerance:.3f})"
+                    )
             if not self._source.start_control(
-                ctrl, coeffs, first_fields, self._source.read(), abort=abort
+                ctrl, coeffs, first_fields, rs, abort=abort
             ):
                 log.info("[%s] control bootstrap aborted before start", self.name)
                 return
