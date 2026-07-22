@@ -351,17 +351,125 @@ def _wrap180(deg: float) -> float:
     return (deg + 180.0) % 360.0 - 180.0
 
 
+def test_calibration_reference_poses_make_every_sign_observable():
+    # The pose-set solve can only recover a joint's sign flip if the set drives that
+    # joint to nonzero references; both polarities guard against a noisy single pose.
+    from dual_flexiv_control.dashboard.calibration import REFERENCE_POSES
+
+    assert len(REFERENCE_POSES) >= 3
+    for pose in REFERENCE_POSES:
+        assert len(pose.q_deg) == 7
+    for j in range(7):
+        values = [p.q_deg[j] for p in REFERENCE_POSES]
+        assert any(v > 0 for v in values), f"J{j} never positive in the pose set"
+        assert any(v < 0 for v in values), f"J{j} never negative in the pose set"
+
+
+def test_calibration_solve_recovers_full_convention():
+    # Synthesize leader readings from a known convention (l = wrap(s*r - off)) at
+    # every reference pose; the solve must recover offsets AND sign flips exactly,
+    # and the recovered convention must map each sample back onto its reference.
+    import numpy as np
+
+    from dual_flexiv_control.configs import JointConventionCfg
+    from dual_flexiv_control.control.convention import convert_factr_to_rizon
+    from dual_flexiv_control.dashboard.calibration import REFERENCE_POSES
+    from dual_flexiv_control.dashboard.calibration import solve_from_samples
+
+    true_off = [180.0, -90.0, -90.0, 90.0, 90.0, 180.0, -90.0]
+    true_flips = {1, 3, 6}
+    pairs = []
+    for pose in REFERENCE_POSES:
+        leader = [
+            _wrap180((-r if j in true_flips else r) - true_off[j])
+            for j, r in enumerate(pose.q_deg)
+        ]
+        pairs.append((leader, list(pose.q_deg)))
+
+    fit = solve_from_samples(pairs, fallback_flips=())
+    assert set(fit.sign_flip_joints) == true_flips
+    assert fit.ambiguous_joints == []
+    assert fit.n_samples == len(REFERENCE_POSES)
+    for j in range(7):
+        assert _wrap180(fit.offsets_deg[j] - true_off[j]) == pytest.approx(0.0, abs=1e-9)
+        assert fit.residuals_deg[j] == pytest.approx(0.0, abs=1e-9)
+
+    conv = JointConventionCfg(
+        offsets_deg=list(fit.offsets_deg), sign_flip_joints=sorted(fit.sign_flip_joints)
+    )
+    for leader, ref in pairs:
+        q = np.radians(np.asarray(leader + [0.0]))  # + trailing gripper value
+        assert np.degrees(convert_factr_to_rizon(q, conv)) == pytest.approx(ref, abs=1e-9)
+
+
+def test_calibration_solve_home_only_degrades_to_straight_pose():
+    # With only the all-zero pose captured, both signs fit every joint perfectly, so
+    # the sign is ambiguous: the configured flips are kept and the offset is exactly
+    # the straight-pose solve, wrap(-leader).
+    from dual_flexiv_control.dashboard.calibration import solve_from_samples
+
+    leader = [10.0, -170.0, 45.0, 0.0, 90.0, -30.0, 175.0]
+    fit = solve_from_samples([(leader, [0.0] * 7)], fallback_flips=[2, 4])
+    assert set(fit.sign_flip_joints) == {2, 4}
+    assert fit.ambiguous_joints == list(range(7))
+    for j in range(7):
+        assert _wrap180(fit.offsets_deg[j] - _wrap180(-leader[j])) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_calibration_solve_residual_flags_inconsistent_joint():
+    # A mis-struck pose shows up as a nonzero RMS residual on the affected joint
+    # while the others stay clean (and their offsets stay exact).
+    from dual_flexiv_control.dashboard.calibration import REFERENCE_POSES
+    from dual_flexiv_control.dashboard.calibration import solve_from_samples
+
+    pairs = []
+    for k, pose in enumerate(REFERENCE_POSES):
+        leader = [float(r) for r in pose.q_deg]  # identity convention: off=0, no flips
+        if k == 1:
+            leader[2] += 8.0  # joint 2 badly matched in one pose
+        pairs.append((leader, list(pose.q_deg)))
+
+    fit = solve_from_samples(pairs, fallback_flips=())
+    assert fit.residuals_deg[2] > 2.0
+    for j in (0, 1, 3, 4, 5, 6):
+        assert fit.residuals_deg[j] == pytest.approx(0.0, abs=1e-9)
+        assert fit.offsets_deg[j] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_calibration_solve_pose_samples_ignores_stale_entries():
+    # The UI wrapper drops samples whose pose name vanished or whose length no longer
+    # matches the follower DoF, instead of crashing the solve.
+    from dual_flexiv_control.dashboard import calibration
+    from dual_flexiv_control.dashboard.arms import set_active_rig
+
+    set_active_rig("left_only")
+    try:
+        poses = calibration.reference_poses("left")
+        assert all(len(p.q_deg) == 7 for p in poses)
+        samples = {
+            poses[0].name: [0.0] * 7,
+            poses[1].name: [0.0, 0.0, 0.0],  # stale: wrong length
+            "no-such-pose": [0.0] * 7,       # stale: renamed away
+        }
+        fit = calibration.solve_pose_samples("left", samples)
+        assert fit.n_samples == 1
+    finally:
+        set_active_rig(None)
+
+
 def test_calibration_format_yaml_and_overrides():
+    # The convention is leader-owned: format_yaml emits the FACTR arm-YAML
+    # initialization snippet, and follower-side Hydra overrides are refused.
     from dual_flexiv_control.dashboard.calibration import format_overrides
     from dual_flexiv_control.dashboard.calibration import format_yaml
 
     offsets = [180.0, -90.0, -90.0, 90.0, 90.0, 180.0, -90.0]
     y = format_yaml("right", offsets, [1, 2, 3])
-    assert "right:" in y and "offsets_deg: [180.00, -90.00" in y and "sign_flip_joints: [1, 2, 3]" in y
-    assert format_overrides("right", offsets, [1, 2, 3]) == (
-        "arms.right.convention.offsets_deg='[180.00,-90.00,-90.00,90.00,90.00,180.00,-90.00]' "
-        "arms.right.convention.sign_flip_joints='[1,2,3]'"
-    )
+    assert "arm_teleop:" in y
+    assert "dfc_raw_offsets_deg: [180.00, -90.00" in y
+    assert "dfc_sign_flip_joints: [1, 2, 3]" in y
+    with pytest.raises(RuntimeError, match="leader-owned"):
+        format_overrides("right", offsets, [1, 2, 3])
 
 
 def test_splice_convention_inserts_and_preserves_comments():

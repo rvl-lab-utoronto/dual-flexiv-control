@@ -1283,34 +1283,41 @@ def _calib_gripper(side: str):
 
 @st.fragment(run_every="0.3s")
 def _calibration_view_feed(side: str) -> None:
-    """Pose the live view at the leader's commanded config (in-progress convention).
+    """Pose the live ghost at the leader's commanded config (in-progress convention).
 
     Only this fragment reruns on its cadence — it reads the leader and logs one arm
-    frame into the calibration recording (using the working offsets **and** sign
-    flips, so a flip visibly mirrors that link); the embedded viewer picks it up over
-    gRPC. On a read failure it says so rather than fabricating motion.
+    frame into the calibration recording: the **ghost** tracks the leader (under the
+    working offsets **and** sign flips, so a flip visibly mirrors that link — same
+    solid/ghost split as the metrics viewer) while the **solid** arm holds the
+    selected reference pose; the embedded viewer picks it up over gRPC. On a read
+    failure it says so rather than fabricating motion.
     """
     offsets = st.session_state.get(f"calib_offsets::{side}")
     if offsets is None:
         return
     flips = sorted(st.session_state.get(f"calib_flips::{side}", set()))
+    target = st.session_state.get(f"calib_target::{side}")
+    pose_name = st.session_state.get(f"calib_pose::{side}")
     try:
-        _calibration.render(side, offsets, flips)
-        st.caption(f"🟢 live: `{side}` leader → follower (solid) vs straight/home (ghost)")
+        _calibration.render(side, offsets, flips, target)
+        solid = f"`{pose_name}` reference" if target and pose_name else "straight/home"
+        st.caption(f"🟢 live: {solid} (solid) vs `{side}` leader (ghost)")
     except Exception as exc:  # noqa: BLE001 - leader down -> report, hold the last pose
         st.caption(f"⚪ no live `{side}` leader — {exc}")
 
 
 def _render_calibration_tab() -> None:
-    """Measure a leader's joint convention **one joint at a time**, with a live view.
+    """Measure a leader's joint convention from a fixed pose set, with a live view.
 
-    Per joint: straighten the link and **📸 Capture** to solve its ``offsets_deg``
-    (``offset = wrap(-degrees(leader_joint))``), and **↔ Flip** to toggle its sign in
-    ``sign_flip_joints`` — the 3D view mirrors the link live so you can confirm the
-    direction. The view poses a Flexiv arm at the config the current leader maps to
-    under the working convention (solid) against the straight/home target (ghost), so
-    each link visibly snaps into alignment as it is calibrated. **💾 Sync to file**
-    writes the result into the rig YAML; hit **Reset services** to apply it.
+    Primary flow: move the leader into each **reference pose** (shown as the solid
+    arm in the 3D view), **📸 Capture** a sample there, and once a handful are
+    captured **🧮 Solve** fits the whole convention — per-joint offsets *and* sign
+    flips — by circular least squares over the samples, with per-joint residuals to
+    flag a badly matched pose. The ghost arm tracks the live leader under the
+    working convention (same solid/ghost split as the metrics viewer), so after a
+    solve the ghost snaps onto each reference pose as you strike it. A per-joint
+    fine-tune (straighten one link, capture it; ``offset =
+    wrap(-degrees(leader_joint))``) remains available in an expander.
     """
     sides = _calibration.configured_leader_sides()
     if not sides:
@@ -1331,37 +1338,101 @@ def _render_calibration_tab() -> None:
     flips = _calib_flips(side)
     grip_open, grip_closed = _calib_gripper(side)
     done = st.session_state.setdefault(f"calib_done::{side}", {})  # joint -> captured_deg
+    poses = _calibration.reference_poses(side)
+    samples = st.session_state.setdefault(f"calib_samples::{side}", {})  # pose name -> deg
 
     left, right = st.columns([2, 3], gap="large")
     with left:
         st.caption(
-            f"Straighten one link at a time: **Capture** its offset, **Flip** its sign "
-            f"if the view mirrors the wrong way. **{len(done)}/{len(offsets)}** joints captured."
+            "Move the leader into each reference pose (the **solid** arm in the view), "
+            f"**Capture** it, then **Solve** for offsets + sign flips. "
+            f"**{len(samples)}/{len(poses)}** poses captured."
         )
-        for j in range(len(offsets)):
-            c0, c1, c2 = st.columns([3, 1, 1])
-            captured = j in done
-            mark = "✅" if captured else "⬜"
-            flipped = j in flips
-            c0.markdown(
-                f"{mark} **J{j}** · offset `{offsets[j]:+.2f}°`"
-                + (" · ↔" if flipped else "")
-                + (f" · straight@`{done[j]:+.2f}°`" if captured else "")
-            )
-            if c1.button("📸", key=f"calib_cap::{side}::{j}", help=f"Capture J{j} offset",
-                         use_container_width=True):
-                try:
-                    cap = _calibration.capture_joint(side, j)
-                    offsets[j] = cap.offset_deg
-                    done[j] = cap.captured_deg
-                    st.rerun()
-                except Exception as exc:  # noqa: BLE001 - surface, don't crash the page
-                    st.error(f"Could not read the {side} leader: {exc}", icon="🛑")
-            if c2.button("↔", key=f"calib_flip::{side}::{j}",
-                         type="primary" if flipped else "secondary",
-                         help=f"Toggle sign flip for J{j}", use_container_width=True):
-                flips.discard(j) if flipped else flips.add(j)
+        names = [p.name for p in poses]
+        sel = st.radio(
+            "Reference pose", names, key=f"calib_pose::{side}",
+            format_func=lambda n: ("✅ " if n in samples else "⬜ ") + n,
+            label_visibility="collapsed",
+        )
+        pose = poses[names.index(sel)]
+        # Feed target for the live-view fragment: the solid arm holds this pose.
+        st.session_state[f"calib_target::{side}"] = list(pose.q_deg)
+        st.caption(pose.hint)
+        st.caption("targets: " + " · ".join(f"J{i}`{v:+.0f}°`" for i, v in enumerate(pose.q_deg)))
+        b0, b1, b2 = st.columns([1, 1, 1])
+        if b0.button("📸 Capture", key=f"calib_pcap::{side}", use_container_width=True,
+                     help=f"Record the leader while it holds “{pose.name}”."):
+            try:
+                samples[pose.name] = _calibration.read_leader_arm_deg(side)
                 st.rerun()
+            except Exception as exc:  # noqa: BLE001 - surface, don't crash the page
+                st.error(f"Could not read the {side} leader: {exc}", icon="🛑")
+        if b1.button("🧮 Solve", key=f"calib_solve::{side}", use_container_width=True,
+                     disabled=len(samples) < 2,
+                     help="Fit offsets AND sign flips to the captured samples (needs 2+ "
+                     "poses; capturing all of them gives every joint sign coverage)."):
+            try:
+                fit = _calibration.solve_pose_samples(side, samples)
+                st.session_state[f"calib_offsets::{side}"] = [round(v, 2) for v in fit.offsets_deg]
+                st.session_state[f"calib_flips::{side}"] = set(fit.sign_flip_joints)
+                st.session_state[f"calib_fit::{side}"] = fit
+                st.rerun()
+            except Exception as exc:  # noqa: BLE001 - surface, don't crash the page
+                st.error(f"Solve failed: {exc}", icon="🛑")
+        if b2.button("🗑 Clear", key=f"calib_pclear::{side}", use_container_width=True,
+                     help="Drop the captured pose samples (keeps the current offsets/flips)."):
+            st.session_state[f"calib_samples::{side}"] = {}
+            st.session_state.pop(f"calib_fit::{side}", None)
+            st.rerun()
+
+        fit = st.session_state.get(f"calib_fit::{side}")
+        if fit is not None:
+            rows = [f"Solved from **{fit.n_samples}** poses:", ""]
+            for j, (off, res) in enumerate(zip(fit.offsets_deg, fit.residuals_deg)):
+                warn = res > _calibration.RESIDUAL_WARN_DEG
+                rows.append(
+                    ("⚠️" if warn else "✅") + f" **J{j}** offset `{off:+.2f}°`"
+                    + (" · ↔" if j in fit.sign_flip_joints else "")
+                    + f" · rms `{res:.2f}°`"
+                    + (" · sign kept from config" if j in fit.ambiguous_joints else "")
+                )
+            st.markdown("  \n".join(rows))
+            if any(r > _calibration.RESIDUAL_WARN_DEG for r in fit.residuals_deg):
+                st.warning(
+                    "High residual on a flagged joint — one of its poses was likely "
+                    "mis-struck. Re-capture that pose and solve again.",
+                    icon="⚠️",
+                )
+
+        with st.expander("Per-joint fine-tune (straighten one link at a time)"):
+            st.caption(
+                f"Straighten one link at a time: **Capture** its offset, **Flip** its sign "
+                f"if the view mirrors the wrong way. **{len(done)}/{len(offsets)}** joints captured."
+            )
+            for j in range(len(offsets)):
+                c0, c1, c2 = st.columns([3, 1, 1])
+                captured = j in done
+                mark = "✅" if captured else "⬜"
+                flipped = j in flips
+                c0.markdown(
+                    f"{mark} **J{j}** · offset `{offsets[j]:+.2f}°`"
+                    + (" · ↔" if flipped else "")
+                    + (f" · straight@`{done[j]:+.2f}°`" if captured else "")
+                )
+                if c1.button("📸", key=f"calib_cap::{side}::{j}", help=f"Capture J{j} offset",
+                             use_container_width=True):
+                    try:
+                        cap = _calibration.capture_joint(side, j)
+                        offsets[j] = cap.offset_deg
+                        done[j] = cap.captured_deg
+                        st.rerun()
+                    except Exception as exc:  # noqa: BLE001 - surface, don't crash the page
+                        st.error(f"Could not read the {side} leader: {exc}", icon="🛑")
+                if c2.button("↔", key=f"calib_flip::{side}::{j}",
+                             type="primary" if flipped else "secondary",
+                             help=f"Toggle sign flip for J{j}", use_container_width=True):
+                    flips.discard(j) if flipped else flips.add(j)
+                    st.rerun()
 
         st.divider()
         st.markdown("**Gripper** — record the raw trigger reading at each extreme:")
@@ -1397,6 +1468,8 @@ def _render_calibration_tab() -> None:
             st.session_state[f"calib_grip_open::{side}"] = conv.gripper_open
             st.session_state[f"calib_grip_closed::{side}"] = conv.gripper_closed
             st.session_state[f"calib_done::{side}"] = {}
+            st.session_state[f"calib_samples::{side}"] = {}
+            st.session_state.pop(f"calib_fit::{side}", None)
             st.rerun()
 
         flips_sorted = sorted(flips)
@@ -1415,8 +1488,9 @@ def _render_calibration_tab() -> None:
             "🔴 Live 3D view",
             value=False,
             key=f"calib_live::{side}",
-            help="Pose a Flexiv arm at the leader's commanded config, refreshing ~3 Hz. "
-            "Off by default so it doesn't poll the leader while you're not calibrating.",
+            help="Show the selected reference pose (solid) with a ghost tracking the "
+            "leader's commanded config, refreshing ~3 Hz. Off by default so it "
+            "doesn't poll the leader while you're not calibrating.",
         )
         if live:
             viewer = _calibration_viewer()
@@ -1424,9 +1498,10 @@ def _render_calibration_tab() -> None:
             _calibration_view_feed(side)
         else:
             st.info(
-                "Enable **Live 3D view** to pose the arm at the leader's commanded "
-                "config and watch each link snap onto the straight/home ghost as you "
-                "calibrate. Capture/Flip/Sync work without it."
+                "Enable **Live 3D view** to see the selected reference pose (solid "
+                "arm) and a live ghost tracking the leader — after a solve the ghost "
+                "snaps onto each reference pose as you strike it. Capture/Solve/Sync "
+                "work without it."
             )
 
 
