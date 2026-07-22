@@ -85,7 +85,7 @@ def _diagnostics(side, dof=7):
 
 def _serve(side, payload, diagnostics=None, close_after=None):
     diagnostics = diagnostics or _diagnostics(side)
-    state = SimpleNamespace(connections=0)
+    state = SimpleNamespace(connections=0, received=[])
 
     def handler(websocket):
         state.connections += 1
@@ -99,6 +99,12 @@ def _serve(side, payload, diagnostics=None, close_after=None):
                 sent += 1
                 if close_after is not None and sent >= close_after:
                     return
+                # Drain any client->server frames (force feedback) between pushes.
+                try:
+                    while True:
+                        state.received.append(json.loads(websocket.recv(timeout=0)))
+                except TimeoutError:
+                    pass
                 time.sleep(0.005)
         except ConnectionClosed:
             pass
@@ -177,6 +183,80 @@ def test_group_queries_two_servers():
     finally:
         for s in (left_srv, right_srv):
             s.shutdown()
+
+
+def test_send_force_feedback_reaches_server():
+    server = _serve("left", list(range(7)))
+    host, port = _server_address(server)
+    c = _server_client(side="left", host=host, port=port)
+    try:
+        tau = [0.5, -1.0, 0.0, 2.5, 0.0, 0.0, -0.25]
+        c.send_force_feedback(tau)
+        deadline = time.monotonic() + 2.0
+        while not server.test_state.received and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert server.test_state.received, "server never saw the force_feedback frame"
+        assert server.test_state.received[0] == {
+            "type": "force_feedback", "side": "left", "space": "joint", "tau": tau,
+        }
+    finally:
+        c.close()
+        server.shutdown()
+
+
+def test_group_send_force_feedback_routes_by_side():
+    left_srv = _serve("left", list(range(7)))
+    right_srv = _serve("right", list(range(7)))
+    try:
+        client = FactrClient.from_config(
+            _factr_cfg(_server_address(left_srv), _server_address(right_srv))
+        )
+        client.send_force_feedback({
+            "left": np.full(7, 0.5), "right": np.full(7, -0.5),
+        })
+        deadline = time.monotonic() + 2.0
+        while (
+            not (left_srv.test_state.received and right_srv.test_state.received)
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert left_srv.test_state.received[0]["tau"] == [0.5] * 7
+        assert left_srv.test_state.received[0]["side"] == "left"
+        assert right_srv.test_state.received[0]["tau"] == [-0.5] * 7
+        assert right_srv.test_state.received[0]["side"] == "right"
+        client.close()
+    finally:
+        for s in (left_srv, right_srv):
+            s.shutdown()
+
+
+def test_send_force_feedback_without_server_raises():
+    server = _serve("left", [])
+    host, port = _server_address(server)
+    server.shutdown()
+
+    c = _server_client(host=host, port=port, timeout_s=0.3)
+    with pytest.raises(FactrError):
+        c.send_force_feedback(np.zeros(7))
+    c.close()
+
+
+def test_send_force_feedback_rejects_bad_vectors():
+    # Validation happens before any connection is attempted.
+    c = _server_client()
+    with pytest.raises(FactrError):
+        c.send_force_feedback(np.zeros((2, 7)))     # not 1-D
+    with pytest.raises(FactrError):
+        c.send_force_feedback([float("nan")] * 7)   # non-finite
+    with pytest.raises(FactrError):
+        c.send_force_feedback([])                   # empty
+    c.close()
+
+
+def test_sim_send_force_feedback_is_noop():
+    c = _server_client(sim=True)
+    c.send_force_feedback(np.zeros(7))  # no server, no error
+    c.close()
 
 
 def test_unreachable_server_raises():

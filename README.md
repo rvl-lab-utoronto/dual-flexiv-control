@@ -20,7 +20,10 @@ own process at its own rate:
    **ZED X Nano** wrist cameras (one per arm) and one static external **ZED 2**
    stereo camera.
 4. **The FACTR interface** (`interfaces/factr/`) — consumes each leader's WebSocket and
-   publishes both its raw Dynamixel reading and its converted DFC/Rizon pose.
+   publishes both its raw Dynamixel reading and its converted DFC/Rizon pose. The
+   socket is duplex: `FactrClient.send_force_feedback` pushes follower external
+   joint torques back up it (joint-space `force_feedback` frames) for the leader's
+   force-feedback term.
 
 ## Architecture
 

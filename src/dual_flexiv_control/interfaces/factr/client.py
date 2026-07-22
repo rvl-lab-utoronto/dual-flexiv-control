@@ -17,6 +17,13 @@ The receiver reconnects after an outage; a stale/missing reading raises
   :class:`FactrServerClient` per side. :meth:`get_joint_positions` reads every
   client's latest cache and returns ``{side: joint_positions}``.
 
+The socket is duplex: :meth:`send_force_feedback` pushes the follower's external
+joint torques back up the same connection as ``force_feedback`` frames, which the
+relay republishes to the leader's teleop (its force-feedback term). Joint-space
+today (``"space": "joint"``, one torque per arm joint); a task-space variant
+would swap the payload to a 6-D TCP wrench under ``"space": "tcp"`` without
+changing the transport.
+
 Gravity-comp status and enable/disable commands remain HTTP request/response
 operations. ``sim=True`` returns synthetic positions with no network.
 """
@@ -159,6 +166,54 @@ class FactrServerClient:
         if not isinstance(payload, dict):
             raise FactrError(f"FACTR status {self.side} returned non-object JSON")
         return payload
+
+    def send_force_feedback(self, tau) -> None:
+        """Push follower external joint torques ``(num_arm_joints,)`` to this leader.
+
+        Fire-and-forget up the same WebSocket the receiver holds (``websockets``'
+        sync connection allows one sender and one receiver thread concurrently).
+        Joint-space today; the teleop applies each sample within its staleness
+        window and decays to zero torque when the feed stops, so senders just skip
+        failed sends. Raises :class:`FactrError` when the stream is not connected —
+        the receiver reconnects on its own and feedback resumes with it.
+        """
+        if self.sim:
+            return
+        tau = np.asarray(tau, dtype=np.float64)
+        if tau.ndim != 1 or tau.size == 0 or not np.all(np.isfinite(tau)):
+            raise FactrError(
+                f"FACTR force feedback {self.side}: tau must be a non-empty finite "
+                f"1-D vector, got shape {tau.shape}"
+            )
+        frame = json.dumps({
+            "type": "force_feedback",
+            "side": self.side,
+            "space": "joint",
+            "tau": tau.tolist(),
+        })
+        deadline = time.monotonic() + self.timeout_s
+        with self._condition:
+            self._ensure_receiver_locked()
+            while self._ws is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise FactrError(
+                        f"FACTR force feedback {self.side}: stream not connected: "
+                        f"{self._last_stream_error}"
+                    )
+                self._condition.wait(remaining)
+            ws = self._ws
+        try:
+            ws.send(frame)
+        except (
+            OSError,
+            TimeoutError,
+            ValueError,
+            websockets.exceptions.WebSocketException,
+        ) as exc:
+            raise FactrError(
+                f"FACTR force feedback {self.side} send failed: {exc}"
+            ) from exc
 
     # -- WebSocket receiver ---------------------------------------------------
 
@@ -380,6 +435,25 @@ class FactrClient:
     def get_status_for(self, side: str) -> dict:
         """One leader's live grav-comp state."""
         return self._servers[side].get_status()
+
+    def send_force_feedback_for(self, side: str, tau) -> None:
+        """Push one follower's external joint torques to its leader (joint-space)."""
+        self._servers[side].send_force_feedback(tau)
+
+    def send_force_feedback(self, taus: dict) -> None:
+        """Push ``{side: external joint torques}`` to every listed leader.
+
+        All sides are attempted; per-side failures are aggregated into one
+        :class:`FactrError` so one dead leader cannot starve the other of feedback.
+        """
+        failures: list[str] = []
+        for side, tau in taus.items():
+            try:
+                self._servers[side].send_force_feedback(tau)
+            except FactrError as exc:
+                failures.append(str(exc))
+        if failures:
+            raise FactrError("; ".join(failures))
 
     def preflight(self) -> None:
         """Probe every configured leader once; raise if any is unreachable.
