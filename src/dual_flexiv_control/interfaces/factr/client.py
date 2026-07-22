@@ -102,18 +102,23 @@ class FactrServerClient:
             raise FactrError(f"FACTR request to {self.url} failed: {exc}") from exc
         return self._parse(payload)
 
-    def get_diagnostics(self) -> dict:
-        """Return FACTR's read-only startup-calibration snapshot."""
+    def get_calibration(self) -> dict:
+        """Return the leader-owned raw→DFC conversion contract (from the arm YAML).
+
+        The only calibration data DFC reads from a leader; FACTR's full
+        diagnostics go straight from its relay to the Rerun viewer (its own
+        ``factr-diagnostics`` application), never through DFC.
+        """
         if self.sim:
             return {}
-        path = f"/diagnostics_{self.side}"
+        path = f"/calibration_{self.side}"
         try:
             payload = self._get_json(path)
         except (OSError, http.client.HTTPException, ValueError, json.JSONDecodeError) as exc:
             self._reset_conn()
-            raise FactrError(f"FACTR diagnostics {self.side} failed: {exc}") from exc
+            raise FactrError(f"FACTR calibration {self.side} failed: {exc}") from exc
         if not isinstance(payload, dict):
-            raise FactrError(f"FACTR diagnostics {self.side} returned non-object JSON")
+            raise FactrError(f"FACTR calibration {self.side} returned non-object JSON")
         return payload
 
     def get_status(self) -> dict:
@@ -216,21 +221,21 @@ class FactrClient:
         """One leader's joint positions (queries only that leader's server)."""
         return self._servers[side].get_joint_positions()
 
-    def get_diagnostics_for(self, side: str) -> dict:
-        return self._servers[side].get_diagnostics()
+    def get_calibration_for(self, side: str) -> dict:
+        return self._servers[side].get_calibration()
 
-    def wait_diagnostics_for(self, side: str, timeout_s: float = 30.0) -> dict:
-        """Wait for FACTR startup to produce a diagnostics snapshot.
+    def wait_calibration_for(self, side: str, timeout_s: float = 30.0) -> dict:
+        """Wait for FACTR startup to serve its leader-owned calibration contract.
 
         Transport failure and ``available=false`` mean the API/teleop is still starting.
-        The deadline remains strict: no snapshot raises :class:`FactrError` with the last
+        The deadline remains strict: no contract raises :class:`FactrError` with the last
         observed condition.
         """
         deadline = time.monotonic() + float(timeout_s)
-        last_error = "diagnostics not yet available"
+        last_error = "calibration not yet available"
         while time.monotonic() < deadline:
             try:
-                data = self.get_diagnostics_for(side)
+                data = self.get_calibration_for(side)
             except FactrError as exc:
                 last_error = str(exc)
             else:
@@ -239,7 +244,7 @@ class FactrClient:
                 last_error = "endpoint returned available=false"
             time.sleep(0.1)
         raise FactrError(
-            f"FACTR diagnostics {side} unavailable after {float(timeout_s):.1f}s: "
+            f"FACTR calibration {side} unavailable after {float(timeout_s):.1f}s: "
             f"{last_error}"
         )
 
@@ -271,7 +276,7 @@ class FactrClient:
             )
 
     def server(self, side: str) -> FactrServerClient:
-        """The underlying per-leader client (e.g. for diagnostics/tests)."""
+        """The underlying per-leader client (e.g. for calibration/tests)."""
         return self._servers[side]
 
     def close(self) -> None:

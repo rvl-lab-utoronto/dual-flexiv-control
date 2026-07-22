@@ -33,8 +33,23 @@ def _factr_cfg(left_addr, right_addr):
         )
     return SimpleNamespace(
         servers={"left": srv(left_addr), "right": srv(right_addr)},
-        rate_hz=100.0, max_age_s=0.5,
+        rate_hz=100.0, max_age_s=0.5, calibration_timeout_s=2.0,
     )
+
+
+#: A valid leader-owned calibration contract for the fixtures' dof=7 servers
+#: (drop_trailing=1 -> 6 arm joints). Identity mapping, so converted samples
+#: equal the raw payload (small radians survive the deg wrap untouched) and the
+#: gripper normalizes to itself under the [0, 1] endpoints.
+_CALIBRATION = {
+    "available": True,
+    "dfc_raw_offsets_deg": [0.0] * 6,
+    "dfc_sign_flip_joints": [],
+    "dfc_wrap_deg": True,
+    "dfc_drop_trailing": 1,
+    "dfc_gripper_open": 0.0,
+    "dfc_gripper_closed": 1.0,
+}
 
 
 # -- single-server response parsing (no network) -----------------------------
@@ -72,7 +87,13 @@ def _serve(payload):
         protocol_version = "HTTP/1.1"  # enable keep-alive so the conn is reused
 
         def do_GET(self):
-            body = json.dumps(payload).encode()
+            # The per-side calibration route serves the leader-owned contract;
+            # every other path serves the joint-position payload.
+            if self.path.startswith("/calibration_"):
+                side = self.path.split("_", 1)[1]
+                body = json.dumps(dict(_CALIBRATION, side=side)).encode()
+            else:
+                body = json.dumps(payload).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -94,6 +115,22 @@ def test_server_client_get_and_reuse():
     try:
         np.testing.assert_allclose(c.get_joint_positions(), np.arange(7))
         np.testing.assert_allclose(c.get_joint_positions(), np.arange(7))  # keep-alive reuse
+    finally:
+        c.close()
+        server.shutdown()
+        server.server_close()
+
+
+def test_server_client_calibration_contract():
+    """get_calibration() returns the leader-owned raw→DFC contract verbatim."""
+    server = _serve(list(range(7)))
+    host, port = server.server_address
+    c = _server_client(side="left", host=host, port=port)
+    try:
+        data = c.get_calibration()
+        assert data["available"] is True and data["side"] == "left"
+        assert data["dfc_raw_offsets_deg"] == [0.0] * 6
+        assert data["dfc_drop_trailing"] == 1
     finally:
         c.close()
         server.shutdown()
@@ -206,23 +243,35 @@ def test_factr_interface_declares_one_stream_per_side():
 
 
 def test_factr_interface_polls_live_sides_and_tolerates_a_dead_one():
-    """poll() returns each reachable leader's payload under its stream name and
-    simply omits an unreachable side (its stream goes stale; nothing raises)."""
+    """poll() returns each reachable leader's payload under its stream names and
+    simply omits a side that drops out (its stream goes stale; nothing raises).
+
+    Startup is strict — open_source() requires every configured side's
+    calibration contract — so the right leader dies AFTER it, mid-run.
+    """
     from dual_flexiv_control.interfaces.factr import FactrInterface
     from dual_flexiv_control.interfaces.factr import factr_stream_name
+    from dual_flexiv_control.interfaces.factr import raw_factr_stream_name
 
     left = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
     left_srv = _serve({"left": left})
-    dead_srv = _serve([])
-    dead_addr = dead_srv.server_address
-    dead_srv.shutdown()
-    dead_srv.server_close()
+    right_srv = _serve({"right": left})
     try:
-        cfg = _factr_cfg(left_srv.server_address, dead_addr)
+        cfg = _factr_cfg(left_srv.server_address, right_srv.server_address)
         node = FactrInterface(cfg, SimpleNamespace(runtime_dir="/tmp", sim=False), "rid")
         node.open_source()
+        right_srv.shutdown()
+        right_srv.server_close()
+        # shutdown() only stops NEW connections; drop the pooled keep-alive
+        # conn (still served by its handler thread) so the dropout is real.
+        node._client.server("right").close()
         sample = node.poll()
-        assert set(sample) == {factr_stream_name("left")}  # right omitted, no raise
+        assert set(sample) == {  # right omitted, no raise
+            factr_stream_name("left"), raw_factr_stream_name("left")
+        }
+        np.testing.assert_allclose(sample[raw_factr_stream_name("left")], left)
+        # The fixture contract is the identity mapping, so the converted stream
+        # carries the same values (and the 0..1 gripper endpoints keep 0.7).
         np.testing.assert_allclose(sample[factr_stream_name("left")], left)
         node.close_source()
     finally:

@@ -158,16 +158,16 @@ class FactrInterface(StreamProducerNode):
                     gripper_closed=1.0,
                 )
                 continue
-            diagnostics = self._client.wait_diagnostics_for(
+            calibration = self._client.wait_calibration_for(
                 side, timeout_s=self.cfg.calibration_timeout_s
             )
-            self._conventions[side] = self._convention_from_diagnostics(side, server.dof, diagnostics)
+            self._conventions[side] = self._convention_from_calibration(side, server.dof, calibration)
 
     @staticmethod
-    def _convention_from_diagnostics(side: str, dof: int, data: dict) -> JointConventionCfg:
-        """Build the raw-leader conversion exclusively from the leader's YAML snapshot."""
+    def _convention_from_calibration(side: str, dof: int, data: dict) -> JointConventionCfg:
+        """Build the raw-leader conversion exclusively from the leader's YAML contract."""
         if data.get("available") is not True:
-            raise RuntimeError(f"FACTR {side} diagnostics/calibration is unavailable")
+            raise RuntimeError(f"FACTR {side} calibration is unavailable")
         required = (
             "dfc_raw_offsets_deg", "dfc_sign_flip_joints", "dfc_wrap_deg",
             "dfc_drop_trailing", "dfc_gripper_open", "dfc_gripper_closed",
@@ -198,7 +198,7 @@ class FactrInterface(StreamProducerNode):
             gripper_open=opened,
             gripper_closed=closed,
         )
-        log.info("[factr] %s convention loaded from leader diagnostics: %s", side, conv)
+        log.info("[factr] %s convention loaded from leader calibration: %s", side, conv)
         return conv
 
     def poll(self) -> dict[str, np.ndarray] | None:

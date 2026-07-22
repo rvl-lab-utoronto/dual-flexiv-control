@@ -376,7 +376,7 @@ class TaskCfg:
 
 @dataclass
 class JointConventionCfg:
-    """Leader-owned FACTR → Rizon mapping loaded from FACTR diagnostics.
+    """Leader-owned FACTR → Rizon mapping loaded from the leader's calibration contract.
 
     This is a runtime value object, not an ``ArmCfg``/follower setting. ``offsets_deg`` is added
     per-joint after converting the leader's radians to degrees; ``sign_flip_joints``
@@ -625,7 +625,7 @@ class FactrCfg:
     dashboard shows the leader as disconnected)."""
 
     calibration_timeout_s: float = 30.0
-    """Maximum startup wait for each leader's diagnostics snapshot. Connection refusal
+    """Maximum startup wait for each leader's calibration contract. Connection refusal
     or ``available=false`` is treated as startup-in-progress until this deadline;
     malformed calibration still fails immediately."""
 

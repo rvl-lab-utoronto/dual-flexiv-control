@@ -185,10 +185,16 @@ DFC/Rizon convention and is what the viewer, brain, and
 convention internally for leader gravity compensation. Its arm YAML stores the complete
 raw-Dynamixel→DFC convention (offsets, sign flips, wrapping, trailing-field handling,
 and gripper endpoints), the distinct DFC-straight and FACTR-model reference coordinates,
-and the explicit DFC→FACTR transform (including FACTR's joint-4 `pi/2`). DFC loads this
-contract from the leader diagnostics endpoint and
+and the explicit DFC→FACTR transform (including FACTR's joint-4 `pi/2`). DFC loads the
+raw→DFC part of this contract from the leader's `GET /calibration_<side>` route and
 crashes if it is absent or malformed; no leader conversion values live in the follower
 rig YAML and calibration is not pushed between services.
+
+FACTR's diagnostics never pass through DFC: its API relay streams the calibration
+snapshot, the post-enable control-tick captures, and the live master gain straight to
+the dashboard's Rerun gRPC proxy under the separate application id `factr-diagnostics`
+(sink URL exported as `FACTR_RERUN_URL` by the session daemon's launcher). Select that
+recording in the embedded viewer to inspect them.
 
 With `arm.control_enabled=true`, the brain posts the already-converted FACTR pose as
 the Rizon qpos setpoint. A hardware-free run:
