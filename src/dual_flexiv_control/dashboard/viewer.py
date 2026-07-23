@@ -211,8 +211,9 @@ def teardown() -> None:
     running (it cannot be stopped in-process and is stateless), so a subsequent
     :func:`start_servers` reuses it.
 
-    This only releases the servers. The replay viewer
-    (:func:`~.replay.reset`) must be reset alongside, and the metrics servers
+    This only releases the servers. Callers that cached the now-dead recording — the
+    robot scene (:func:`~.robot_view.reset`) and the replay viewer
+    (:func:`~.replay.reset`) — must be reset alongside, and the metrics servers
     re-started, before logging resumes. The dashboard's *Reset services* action does
     exactly this.
     """

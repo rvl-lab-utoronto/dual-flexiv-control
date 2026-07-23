@@ -2,15 +2,21 @@
 
 A run (collection or eval) is **one episode** and its placeholder metrics are
 **proprioception** — the same per-arm signals the Flexiv interfaces stream
-(`q`, `dq`, `tau`, `tau_ext`, `wrench`, `eef`, `eef_vel`). The end-effector
-position is readable over time as an x/y/z time series (`eef_pos`, the position
-slice of `eef`). The time series are laid out as **two per-arm columns
+(`q`, `dq`, `tau`, `tau_ext`, `wrench`, `eef`, `eef_vel`). The **3D panel is the robot scene**
+(both arms on the Vention pedestal, from :mod:`~.robot_view`): solid arms at the
+measured joint state, a translucent ghost at the commanded teleop config, and —
+during eval — the policy horizon target in purple. It replaces the old end-effector
+trace, so this single viewer shows the arms beside the metrics. The end-effector
+position is still readable over time as an x/y/z time series (`eef_pos`, the
+position slice of `eef`). The time series are laid out as **two per-arm columns
 (left | right)** rather than overlaying both arms in each panel. The emitter in
-:mod:`~.runner` logs to exactly these paths, so the layout never drifts from
-what's produced.
+:mod:`~.runner` (and, later, the real run) logs to exactly these paths, so the
+layout never drifts from what's produced.
 
 Entity-path scheme (kept in one place):
 
+* ``robot/*``                    — the 3D robot scene (arms + pedestal), owned by
+                                   :mod:`~.robot_view`, logged into this recording.
 * ``proprio/{signal}/{side}``    — one time-series entity per **follower** signal, per arm.
 * ``factr/{signal}/{side}``      — one time-series entity per **FACTR leader** signal, per arm.
 * ``events``                     — text-log of run lifecycle events.
@@ -77,13 +83,22 @@ def _live_time_panel() -> rrb.TimePanel:
 
 # -- entity paths (the contract with the emitter) ---------------------------
 
+#: The merged 3D panel: the robot scene (arms on the pedestal) that replaced the
+#: old end-effector trace. Its entities (``/robot/*``) are logged into the metrics
+#: recording by :mod:`~.robot_view` (attached at startup) and animated live by the
+#: emitter, so this one viewer shows the arms beside the time series.
+ROBOT_ORIGIN = "/robot"
+ROBOT_VIEW_NAME = (
+    "Robot — measured (solid) · teleop cmd (ghost) · target (purple)"
+)
 PROPRIO_ROOT = "proprio"
 FACTR_ROOT = "factr"
 EVENTS = "events"
 README = "readme"
 
-#: Time-series signals. The full ``eef`` pose includes a quaternion; its position
-#: (``eef_pos`` = ``eef[:3]``) is plotted separately as the first metric.
+#: Time-series signals. The full ``eef`` *pose* (with quaternion) drives the 3D
+#: robot scene rather than a series, but its position (``eef_pos`` = ``eef[:3]``) is
+#: plotted here — first, so the requested TCP-position metric is the top-left panel.
 PROPRIO_SERIES: tuple[str, ...] = (
     "eef_pos", "q", "dq", "tau", "tau_ext", "wrench", "eef_vel",
 )
@@ -127,6 +142,14 @@ def policy_comm_path(series: str) -> str:
     """Entity for one comm counter, e.g. ``policy/comm/sent``."""
     return f"{POLICY_COMM_ROOT}/{series}"
 
+
+def robot_view(name: str = ROBOT_VIEW_NAME) -> rrb.Spatial3DView:
+    """The robot 3D scene view (shared by the run + welcome layouts).
+
+    Points at ``/robot`` — the arms-on-the-pedestal scene :mod:`~.robot_view` logs
+    into this recording — so every layout renders it from one place.
+    """
+    return rrb.Spatial3DView(origin=ROBOT_ORIGIN, name=name)
 
 
 def proprio_path(signal: str, side: str) -> str:
@@ -248,12 +271,16 @@ def _policy_comm_row() -> rrb.Horizontal:
 
 
 def _proprio_blueprint(phase: str, task_name: str | None) -> rrb.Blueprint:
-    """Per-arm metrics: FACTR leaders over followers (left | right).
+    """Robot 3D scene beside per-arm columns: FACTR leaders over followers (left | right).
 
     Eval adds a policy-server comms row (packet activity + round-trip latency)
-    below the arm metrics.
+    below the robot metrics.
     """
+    title = ROBOT_VIEW_NAME
+    if task_name:
+        title = f"{title} — {task_name} · {phase}"
     rows = [
+        # FACTR leaders (teleop input) on top, follower proprio below.
         rrb.Horizontal(
             _factr_column("left"), _factr_column("right"), name="FACTR leaders"
         ),
@@ -269,29 +296,40 @@ def _proprio_blueprint(phase: str, task_name: str | None) -> rrb.Blueprint:
     rows.append(rrb.TextLogView(origin=f"/{EVENTS}", name="Events"))
     row_shares.append(1)
     return rrb.Blueprint(
-        rrb.Vertical(*rows, row_shares=row_shares),
+        rrb.Horizontal(
+            # 3D shows both arms on the pedestal (measured/ghost); time series split per arm.
+            robot_view(title),
+            rrb.Vertical(*rows, row_shares=row_shares),
+            column_shares=[4, 1],
+        ),
         _live_time_panel(),
         collapse_panels=True,
     )
 
 
 def eval_probe_blueprint(task_name: str | None = None) -> rrb.Blueprint:
-    """Eval no-motion probe view: per-arm TCP position + ``dq``.
+    """Eval no-motion probe view: robot 3D scene beside per-arm TCP position + ``dq``.
 
     The eval launch runs a read-only hardware probe (see :mod:`~.runner`) that logs
-    ``proprio/eef_pos/{side}`` and ``proprio/dq/{side}`` with no motion. Separate
-    per-arm columns make it immediately obvious whether live telemetry is arriving
-    from each robot rather than overlaying both arms.
+    ``proprio/eef_pos/{side}`` and ``proprio/dq/{side}`` with no motion, and drives
+    the robot 3D scene (solid arms at the measured ``q``, plus the policy horizon
+    target in purple when a real eval system is running). The 3D scene sits beside
+    per-arm columns (TCP position over dq) so it is immediately obvious whether live
+    telemetry is arriving from *each* robot, rather than overlaying both arms.
     """
     signals = ("eef_pos", "dq")
     name = "Eval no-motion probe" + (f" — {task_name}" if task_name else "")
     return rrb.Blueprint(
-        rrb.Vertical(
-            rrb.Horizontal(
-                _arm_column("left", signals), _arm_column("right", signals), name=name
+        rrb.Horizontal(
+            robot_view(),
+            rrb.Vertical(
+                rrb.Horizontal(
+                    _arm_column("left", signals), _arm_column("right", signals), name=name
+                ),
+                rrb.TextLogView(origin=f"/{EVENTS}", name="Events"),
+                row_shares=[6, 1],
             ),
-            rrb.TextLogView(origin=f"/{EVENTS}", name="Events"),
-            row_shares=[6, 1],
+            column_shares=[4, 1],
         ),
         _live_time_panel(),
         collapse_panels=True,
@@ -299,9 +337,13 @@ def eval_probe_blueprint(task_name: str | None = None) -> rrb.Blueprint:
 
 
 def welcome_blueprint() -> rrb.Blueprint:
-    """Idle layout shown before any run is launched."""
+    """Idle layout shown before any run is launched: the robot scene beside the README."""
     return rrb.Blueprint(
-        rrb.TextDocumentView(origin=f"/{README}", name="Dashboard"),
+        rrb.Horizontal(
+            robot_view(),
+            rrb.TextDocumentView(origin=f"/{README}", name="Dashboard"),
+            column_shares=[4, 1],
+        ),
         _live_time_panel(),
         collapse_panels=True,
     )

@@ -32,6 +32,7 @@ from dual_flexiv_control.dashboard import cameras as _cameras
 from dual_flexiv_control.dashboard import factr_servers as _factr_srv
 from dual_flexiv_control.dashboard import logs as _logs
 from dual_flexiv_control.dashboard import replay as _replay
+from dual_flexiv_control.dashboard import robot_view as _robot
 from dual_flexiv_control.dashboard import runner as _runner
 from dual_flexiv_control.dashboard import skills as _skills
 from dual_flexiv_control.dashboard import storage as _storage
@@ -204,12 +205,14 @@ def _servers() -> RerunServers:
 
     The launcher usually pre-binds these (``dashboard.launch``); ``start_servers``
     is idempotent, so this returns the existing handle. When the app is run
-    directly (``streamlit run app.py``) it starts them here instead.
+    directly (``streamlit run app.py``) it starts them here instead. The robot scene
+    is attached to this same recording so it fills the metrics viewer's 3D panel.
     """
     import rerun as rr
 
     grpc_port, web_port = ports_from_env()
     servers = start_servers(grpc_port=grpc_port, web_port=web_port)
+    _robot.attach()  # log the robot scene into the metrics recording (shared 3D panel)
     rr.send_blueprint(blueprints.welcome_blueprint())
     _runner.log_welcome()
     return servers
@@ -244,8 +247,8 @@ def _reset_services(registry: _runner.RunRegistry) -> bool:
     4. Gracefully tear down the Rerun gRPC data servers (metrics + replay) and
        drop their recordings via :func:`~.viewer.teardown`, then reset dependents
        that cached dead recordings and clear their ``st.cache_resource`` handles.
-    5. Re-serve the metrics gRPC server and send the idle welcome layout; respawn
-       the daemon (fresh robot connections) + the mirror.
+    5. Re-serve the metrics gRPC server, re-attach the robot scene, and send the idle
+       welcome layout; respawn the daemon (fresh robot connections) + the mirror.
        The web-viewer HTTP host is reused throughout (it cannot be rebound
        in-process); the replay server rebinds lazily on the next ▶.
     """
@@ -258,11 +261,12 @@ def _reset_services(registry: _runner.RunRegistry) -> bool:
     _storage.reset()
     _skills.reset()
     _teardown_servers()          # rerun_shutdown: releases metrics + replay gRPC ports
+    _robot.reset()               # forget the dead metrics recording
     _replay.reset()              # forget the (now released) replay server
     _calibration.reset()         # close the cached leader client
     _servers.clear()             # st.cache_resource: re-run start_servers on next call
     _replay_viewer.clear()
-    _servers()                   # re-serve metrics gRPC + welcome
+    _servers()                   # re-serve metrics gRPC + re-attach robot scene + welcome
     _runner.reset_viewer()       # idle welcome blueprint + README + reset event log
     # Fresh daemon on the (possibly re-read) rig/sim; ensure restarts the mirror too.
     registry.ensure_session(_arms.active_rig(), _arms.runtime_is_sim())
@@ -1209,6 +1213,23 @@ def _camera_feed(by_key: dict[str, CameraView]) -> None:
     st.caption(f"`{view.key}` · {view.width}×{view.height} · 🟢 live")
 
 
+@st.fragment(run_every="0.5s")
+def _depth_overlay_feed(camera: str) -> None:
+    """Push the latest RGB-D cloud into the robot scene, whenever one is live.
+
+    Reads the camera's ``left`` + ``depth`` shm streams, back-projects to a
+    coloured point cloud (:func:`~.cameras.depth_point_cloud`), poses it with
+    the camera extrinsics from ``conf/camera`` (:func:`~.robot_view.camera_world_pose`),
+    and logs it into the robot recording. There is no on/off control here —
+    show/hide the cloud via the entity's visibility in the Rerun sidebar.
+    """
+    cloud = _cameras.depth_point_cloud(camera)
+    if cloud is None:
+        return
+    pts_cam, colors = cloud
+    rot, t = _robot.camera_world_pose(_cameras.camera_cfg(camera))
+    _robot.log_depth_points(pts_cam @ rot.T + t, colors)
+
 
 def _render_skill_bar(registry: _runner.RunRegistry) -> None:
     """Teach-and-repeat bar: pick a taught skill and ▶ Repeat it on the live arms.
@@ -1320,15 +1341,19 @@ def _render_skill_bar(registry: _runner.RunRegistry) -> None:
 
 
 @st.fragment(run_every="2s")
-def _joint_data_status() -> None:
-    """Metrics-tab banner: warn about arms with no live measured ``q``."""
+def _robot_data_status() -> None:
+    """Metrics-tab banner: warn about arms with no live measured ``q``.
+
+    Such arms are drawn red and held still in the 3D robot scene (see
+    :func:`~.robot_view.update_poses`); this is the accompanying text message.
+    """
     from dual_flexiv_control.dashboard.arms import read_live_joint_positions
 
     missing = [a.name for a in discover_arms() if read_live_joint_positions(a.side) is None]
     if missing:
         st.warning(
-            "No live joint data for **" + ", ".join(missing)
-            + "** (control boxes off, or the system isn't publishing `<side>/q`).",
+            "No live joint data for **" + ", ".join(missing) + "** — shown in red and "
+            "held still (control boxes off, or the system isn't publishing `<side>/q`).",
             icon="⚠️",
         )
     else:
@@ -1425,6 +1450,7 @@ def _render_calibration_controls() -> None:
     """
     sides = _calibration.configured_leader_sides()
     if not sides:
+        _robot.clear_calibration_targets()
         st.info("No FACTR leader is configured for the active rig — nothing to calibrate.")
         return
     if _arms.runtime_is_sim():
@@ -1459,6 +1485,9 @@ def _render_calibration_controls() -> None:
         pose = poses[names.index(sel)]
         st.caption(pose.hint)
         st.caption("targets: " + " · ".join(f"J{i}`{v:+.0f}°`" for i, v in enumerate(pose.q_deg)))
+        _robot.show_calibration_target(
+            side, [math.radians(v) for v in pose.q_deg]
+        )
         b0, b1, b2 = st.columns([1, 1, 1])
         if b0.button("📸 Capture", key=f"calib_pcap::{side}", use_container_width=True,
                      help=f"Record the leader while it holds “{pose.name}”."):
@@ -1822,16 +1851,29 @@ def _render_control_workspace(
     if mode == "Calibration":
         _render_calibration_controls()
     else:
+        _robot.clear_calibration_targets()
         if changed:
             _runner.activate_metrics_view(registry.session_view())
         _render_controls(tasks, rig, registry)
 
 
 def _render_viewer_workspace(servers: RerunServers, registry: _runner.RunRegistry) -> None:
-    """The shared Rerun metrics viewer and experiment status."""
+    """The shared Rerun viewer and its experiment overlays/status."""
     st.iframe(_browser_url(servers.web_url), height=VIEWER_HEIGHT_PX)
+    # The robot 3D scene shares this viewer's left panel (it replaced the old EEF
+    # trace); its controls + status sit below so the viewer leads.
     _render_skill_bar(registry)
-    _joint_data_status()
+    depth_cams = _cameras.depth_cameras()
+    for name in depth_cams:
+        # Cheap static re-log each rerun: keeps the frustum in sync with conf/camera
+        # pose edits after a "Reset services".
+        _robot.log_camera_frustum(name, _cameras.camera_cfg(name))
+    if depth_cams:
+        # Streams whenever live RGB-D exists; show/hide the cloud from the Rerun
+        # sidebar (entity visibility) rather than a dashboard control.
+        _depth_overlay_feed(depth_cams[0])
+    st.caption("Experiment: solid = measured · translucent ghost = command.")
+    _robot_data_status()
 
 
 def _render_content_workspace(

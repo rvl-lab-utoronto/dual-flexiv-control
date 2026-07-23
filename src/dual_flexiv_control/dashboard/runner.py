@@ -8,8 +8,8 @@ VIEWING ↔ COLLECTION ↔ EVAL state machine. This module is the glue:
 * :class:`RunRegistry` — the UI-facing facade: launch/stop are JSON commands to
   the daemon; run state, outcomes, and alerts come from its ``session.json``.
 * :class:`SessionMirror` — ONE persistent background thread that mirrors the live
-  shared-memory streams (arm proprio and ``factr/<side>`` leaders) into the
-  metrics Rerun recording, in every mode. In
+  shared-memory streams (arm proprio, ``factr/<side>`` leaders, the 3D robot
+  scene, eval horizon ghosts) into the metrics Rerun recording, in every mode. In
   VIEWING the streams are published by the idle (read-only) arms and the FACTR
   producer, so the viewer is live *before* any run starts. It never opens a robot
   or HTTP connection — shared memory only.
@@ -32,6 +32,7 @@ import numpy as np
 import rerun as rr
 
 from . import blueprints
+from . import robot_view
 from .session import RUN_STATES
 from .session import SessionManager
 from .session import SessionView
@@ -353,10 +354,13 @@ def reset_viewer() -> None:
 
 
 _MODE_READMES = {
-    "viewing": "_**Viewing** — arms connected read-only; live proprio and FACTR metrics._",
+    "viewing": (
+        "_**Viewing** — arms connected read-only; live proprio, FACTR leaders, and "
+        "the 3D scene stream with no control of any kind._"
+    ),
     "collection": "_**Collection** — teleop demo recording; live mirror of the run._",
-    "eval": "_**Eval** — policy rollout with live follower and policy-server metrics._",
-    "skill": "_**Skill** — teach-and-repeat replay with live arm metrics._",
+    "eval": "_**Eval** — policy rollout; purple ghost = the policy's horizon target._",
+    "skill": "_**Skill** — teach-and-repeat replay; purple ghost = the skill's end pose._",
     "saving": "_**Saving** — finalizing the episode's video encode…_",
 }
 
@@ -615,11 +619,17 @@ class SessionMirror:
     """One background thread mirroring the live system into the metrics viewer.
 
     All real data, read-only, all from shared memory: arm proprio + status
-    (published by the session's idle or controlling arms) and FACTR leaders from
-    their ``factr/<side>`` streams. A stream nobody publishes leaves its row
-    empty. The mirror also switches the viewer layout + README whenever the
-    session's mode changes, so VIEWING/COLLECTION/EVAL each get their blueprint
-    without any per-run emitter threads.
+    (published by the session's idle or controlling arms), FACTR leaders from
+    their ``factr/<side>`` streams (the SAME samples the control loop converts
+    into setpoints — the ghost always shows exactly what teleop would command),
+    the 3D robot scene (solid = measured ``<side>/q``, translucent =
+    commanded-teleop ghost, purple = eval horizon prediction from
+    ``eval/<side>/q_horizon`` — a posed ghost — or ``eval/<side>/eef_horizon`` —
+    a predicted-EEF trace). A stream nobody publishes leaves its row empty and
+    its arm still — the viewer never shows motion the system isn't making. It
+    also switches the viewer layout + README whenever the session's mode
+    changes, so VIEWING/COLLECTION/EVAL each get their blueprint without any
+    per-run emitter threads.
     """
 
     def __init__(self, manager: SessionManager) -> None:
@@ -660,6 +670,8 @@ class SessionMirror:
             _log_event("live view stopped unexpectedly — the session continues; see dashboard logs")
 
     def _run_inner(self, stop: threading.Event) -> None:
+        from .arms import read_live_horizon_eef
+        from .arms import read_live_horizon_q
         from .arms import read_live_stream
 
         dt = 1.0 / _MIRROR_HZ
@@ -667,20 +679,27 @@ class SessionMirror:
         _style_policy_comm_series()
         factr_sides = _factr_leader_sides()
         factr_errored: set[str] = set()
+        live_q: dict = {}      # last-known real measured q per side
+        live_eef: dict = {}    # last-known measured TCP position [x y z] per side
+        horizon_q: dict = {}   # eval horizon-end q target per side (eval runs only)
+        horizon_eef: dict = {} # eval horizon-end TCP position per side (cartesian kinds)
         # Policy-server comm mirroring (eval runs only): next ring seq to surface
-        # + the cumulative packet counters plotted below the arm metrics.
+        # + the cumulative packet counters plotted below the robot metrics.
         comm_state = {"next_seq": 0, "sent": 0, "received": 0, "errors": 0}
-        plot_every = max(1, round(_MIRROR_HZ / 5.0))
-        state_every = max(1, round(_MIRROR_HZ))
+        plot_every = max(1, round(_MIRROR_HZ / 5.0))   # mirror plots ~5 Hz (each read attaches shm)
+        state_every = max(1, round(_MIRROR_HZ))        # poll session.json ~1 Hz
         layout_key: tuple | None = None
         step = 0
+        # Anchor the viewer timeline to the wall clock (monotonic), NOT step*dt: an
+        # iteration that overruns dt must show up as sparser samples at their true
+        # times, never as the timeline lagging further and further behind reality.
         t0_ns = time.monotonic_ns()
-        slow_warned = 0.0
+        slow_warned = 0.0  # last time (s since t0) a slow-tick warning was logged
         while not stop.is_set():
             t = (time.monotonic_ns() - t0_ns) / 1e9
             rr.set_time("elapsed", duration=t)
 
-            if step % state_every == 0:
+            if step % state_every == 0:  # follow the session's mode (layout + README)
                 view = self._manager.view()
                 key = _layout_key(view)
                 if key != layout_key:
@@ -690,18 +709,55 @@ class SessionMirror:
             if step % plot_every == 0:
                 for side in blueprints.SIDES:
                     for suffix, row, take in _VIEW_STREAMS:
-                        value = read_live_stream(f"{side}/{suffix}")
-                        if value is None:
+                        v = read_live_stream(f"{side}/{suffix}")
+                        if v is None:
+                            if suffix == "q":
+                                live_q.pop(side, None)  # producer gone → freeze this arm
+                            elif suffix == "eef":
+                                live_eef.pop(side, None)
                             continue
-                        vec = np.asarray(value, dtype=float)
+                        vec = np.asarray(v, dtype=float)
                         if take is not None:
                             vec = vec[:take]
+                        if suffix == "q" and len(vec) >= 7:
+                            live_q[side] = vec[:7]
+                        elif suffix == "eef" and len(vec) >= 3:
+                            live_eef[side] = vec[:3]  # base-frame TCP position
                         rr.log(blueprints.proprio_path(row, side), rr.Scalars(vec.tolist()))
+                    h = read_live_horizon_q(side)
+                    if h is not None and len(h) >= 7:
+                        horizon_q[side] = np.asarray(h, dtype=float)[:7]
+                    else:
+                        horizon_q.pop(side, None)
+                    he = read_live_horizon_eef(side)
+                    if he is not None and len(he) >= 3:
+                        horizon_eef[side] = np.asarray(he, dtype=float)[:3]
+                    else:
+                        horizon_eef.pop(side, None)
                 _log_policy_comm(comm_state, t0_ns, t)
 
-            if factr_sides:
-                _log_factr_leaders(factr_sides, factr_errored)
+            leader_samples = (
+                _log_factr_leaders(factr_sides, factr_errored) if factr_sides else {}
+            )
+            # Resolve every tick. The mirror can start just before the viewer binds
+            # its recording; caching that initial None would disable pose updates
+            # for the lifetime of the thread.
+            robot_rec = robot_view.robot_recording()
+            if robot_rec is not None:
+                real_q = dict(live_q)
+                ghost_q = _ghost_configs(leader_samples)
+                robot_view.update_poses(robot_rec, real_q, ghost_q, t)
+                if horizon_q or horizon_eef:
+                    robot_view.update_horizon_targets(
+                        robot_rec, horizon_q, real_q, t,
+                        target_eef=horizon_eef, real_eef=live_eef,
+                    )
+                else:
+                    robot_view.clear_horizon_targets(robot_rec)
             step += 1
+            # Pace to the tick boundary: sleep only the remainder of dt. When an
+            # iteration overruns, surface it (throttled) — a slow mirror otherwise
+            # just looks like "the viewer is slow" with nothing in the logs.
             tick_s = (time.monotonic_ns() - t0_ns) / 1e9 - t
             if tick_s > 4 * dt and t - slow_warned > 30.0:
                 slow_warned = t

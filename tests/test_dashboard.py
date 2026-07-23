@@ -121,8 +121,10 @@ def test_viewer_workspace_always_uses_existing_experiment_viewer(monkeypatch):
 
     iframes = []
     monkeypatch.setattr(app.st, "iframe", lambda url, **kwargs: iframes.append(url))
+    monkeypatch.setattr(app.st, "caption", lambda *args, **kwargs: None)
     monkeypatch.setattr(app, "_render_skill_bar", lambda registry: None)
-    monkeypatch.setattr(app, "_joint_data_status", lambda: None)
+    monkeypatch.setattr(app._cameras, "depth_cameras", lambda: [])
+    monkeypatch.setattr(app, "_robot_data_status", lambda: None)
 
     servers = SimpleNamespace(web_url="http://127.0.0.1:9090/?url=metrics")
     app._render_viewer_workspace(servers, object())
@@ -158,6 +160,11 @@ def test_control_workspace_renders_only_selected_mode(monkeypatch):
         "activate_metrics_view",
         lambda view: calls.append(("activate_metrics", view.state)),
     )
+    monkeypatch.setattr(
+        app._robot,
+        "clear_calibration_targets",
+        lambda: calls.append(("clear_calibration",)),
+    )
     registry = SimpleNamespace(session_view=lambda: SimpleNamespace(state="viewing"))
 
     app._render_control_workspace([], None, registry)
@@ -167,6 +174,7 @@ def test_control_workspace_renders_only_selected_mode(monkeypatch):
     assert calls == [
         ("calibration",),
         ("calibration",),
+        ("clear_calibration",),
         ("activate_metrics", "viewing"),
         ("experiment",),
     ]
@@ -348,9 +356,10 @@ def _view_origins(blueprint) -> list[str]:
 
 @_needs_rerun
 @pytest.mark.parametrize("kind", ["collection", "eval", "welcome"])
-def test_live_layouts_do_not_add_robot_section(kind):
-    # The live metrics viewer must contain neither the expensive /robot Spatial3D
-    # section nor the old /eef trace. TCP position remains a scalar time series.
+def test_layouts_embed_robot_scene_not_eef_trace(kind):
+    # The robot 3D scene replaced the old end-effector trace: every layout's 3D panel is
+    # now the "/robot" scene (logged into the same metrics recording), and nothing
+    # points at the removed "/eef" entities.
     from dual_flexiv_control.dashboard import blueprints
 
     if kind == "welcome":
@@ -361,17 +370,8 @@ def test_live_layouts_do_not_add_robot_section(kind):
         bp = blueprints.for_phase(kind, "handover")
 
     origins = _view_origins(bp)
-    assert not any(o == "/robot" or o.startswith("/robot/") for o in origins)
+    assert "/robot" in origins
     assert not any(o == "/eef" or o.startswith("/eef/") for o in origins)
-
-
-def test_live_metrics_have_no_robot_producer():
-    from dual_flexiv_control.dashboard import app
-    from dual_flexiv_control.dashboard import runner
-
-    assert not hasattr(app, "_robot")
-    assert not hasattr(app, "_depth_overlay_feed")
-    assert not hasattr(runner, "robot_view")
 
 
 def test_read_live_policy_comm_returns_buffered_events(tmp_path):
