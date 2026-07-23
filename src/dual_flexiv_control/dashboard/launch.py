@@ -112,16 +112,12 @@ def _prebind_rerun_servers() -> None:
     import rerun as rr
 
     from dual_flexiv_control.dashboard import blueprints
-    from dual_flexiv_control.dashboard import robot_view
     from dual_flexiv_control.dashboard import runner
     from dual_flexiv_control.dashboard.viewer import ports_from_env
     from dual_flexiv_control.dashboard.viewer import start_servers
 
     grpc_port, web_port = ports_from_env()
     start_servers(grpc_port=grpc_port, web_port=web_port)
-    # Log the robot scene into the metrics recording (it now shares the metrics
-    # viewer's 3D panel), then send the idle blueprint that shows it + the README.
-    robot_view.attach()
     rr.send_blueprint(blueprints.welcome_blueprint())
     runner.log_welcome()
 
