@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -91,6 +92,54 @@ def test_state_file_roundtrip(tmp_path):
     sf.remove()
     assert read_state(tmp_path) is None
     sf.remove()  # idempotent
+
+
+def test_force_feedback_command_fans_out_to_every_factr_leader(monkeypatch):
+    """The dashboard command uses each side's bodyless FACTR control route."""
+    from dual_flexiv_control import session as sess
+
+    requests = []
+
+    class Response:
+        status = 200
+
+        def read(self):
+            return b"{}"
+
+    class Connection:
+        def __init__(self, host, port, timeout):
+            self.address = host, port, timeout
+
+        def request(self, method, route):
+            requests.append((*self.address, method, route))
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("http.client.HTTPConnection", Connection)
+    daemon = sess.SessionDaemon.__new__(sess.SessionDaemon)
+    daemon.config = SimpleNamespace(
+        runtime=SimpleNamespace(sim=False),
+        factr=SimpleNamespace(servers={
+            "left": SimpleNamespace(host="leader-a", port=5000, request_timeout_s=0.5),
+            "right": SimpleNamespace(host="leader-b", port=5001, request_timeout_s=0.7),
+        }),
+    )
+    daemon.state = SimpleNamespace(message=None)
+
+    daemon._handle_force_feedback(enable=True)
+    daemon._handle_force_feedback(enable=False)
+
+    assert requests == [
+        ("leader-a", 5000, 0.5, "POST", "/enable_force_feedback_left"),
+        ("leader-b", 5001, 0.7, "POST", "/enable_force_feedback_right"),
+        ("leader-a", 5000, 0.5, "POST", "/disable_force_feedback_left"),
+        ("leader-b", 5001, 0.7, "POST", "/disable_force_feedback_right"),
+    ]
+    assert daemon.state.message == "force feedback disabled — leader(s) left, right"
 
 
 # ---------------------------------------------------------------------------
@@ -535,6 +584,59 @@ def test_preflight_refusal_blocks_start_before_entercontrol(tmp_path, monkeypatc
     assert daemon.run is None
     assert daemon.state.message == "start refused — test gate"
     assert daemon.session_qs["left"].empty(), "EnterControl must not fire on a refused start"
+
+
+def test_follower_control_blocker_is_fail_safe():
+    """READY/disabled followers may enter control; safety/error states may not."""
+    import numpy as np
+
+    from dual_flexiv_control.session import follower_control_blocker
+
+    assert follower_control_blocker(np.array([1.0, 0.0])) is None   # READY
+    assert follower_control_blocker(np.array([4.0, 0.0])) is None   # NOT_ENABLED
+    assert follower_control_blocker(np.array([1.0, 1.0])) == "E-stop pressed"
+    assert "critical fault" in follower_control_blocker(np.array([7.0, 0.0]))
+    assert follower_control_blocker(None) == "status unavailable"
+
+
+def test_eval_follower_error_forces_dry_run(tmp_path, monkeypatch):
+    """An unsafe follower keeps policy/viz alive but removes every write path."""
+    import numpy as np
+
+    from dual_flexiv_control import session as sess
+
+    # Compose directly instead of using the bimanual E2E fixture: this unit only
+    # needs one control-capable follower and no hardware processes are started.
+    overrides = [
+        "rig=left_only",
+        "runtime.sim=true",
+        f"runtime.runtime_dir={tmp_path}/runtime",
+        "arms.left.control_enabled=true",
+    ]
+    config = sess.compose_config(overrides)
+    daemon = sess.SessionDaemon(config, overrides)
+    built = []
+
+    class _Consumer:
+        name = "eval"
+        drive_sides = None
+
+    def _build(run_config, _run_id):
+        built.append(run_config)
+        return _Consumer()
+
+    monkeypatch.setattr(sess, "build_consumer", _build)
+    monkeypatch.setattr(sess, "preflight_run", lambda _cfg, _phase: "test stop")
+    monkeypatch.setattr(
+        daemon, "_arm_status",
+        lambda _side: np.array([1.0, 1.0, 0.0, 0.0, 0.0]),
+    )
+
+    daemon._handle_start({"cmd": "start", "phase": "eval", "task": "default"})
+
+    assert built and all(not arm.control_enabled for arm in built[0].arms.values())
+    assert daemon.run is None
+    assert daemon.session_qs["left"].empty(), "dry eval must not send EnterControl"
 
 
 # ---------------------------------------------------------------------------

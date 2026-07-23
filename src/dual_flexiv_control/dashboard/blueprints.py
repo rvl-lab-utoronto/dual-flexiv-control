@@ -2,7 +2,7 @@
 
 A run (collection or eval) is **one episode** and its placeholder metrics are
 **proprioception** — the same per-arm signals the Flexiv interfaces stream
-(`q`, `dq`, `tau`, `wrench`, `eef`, `eef_vel`). The **3D panel is the robot scene**
+(`q`, `dq`, `tau`, `tau_ext`, `wrench`, `eef`, `eef_vel`). The **3D panel is the robot scene**
 (both arms on the Vention pedestal, from :mod:`~.robot_view`): solid arms at the
 measured joint state, a translucent ghost at the commanded teleop config, and —
 during eval — the policy horizon target in purple. It replaces the old end-effector
@@ -88,7 +88,9 @@ def _live_time_panel() -> rrb.TimePanel:
 #: recording by :mod:`~.robot_view` (attached at startup) and animated live by the
 #: emitter, so this one viewer shows the arms beside the time series.
 ROBOT_ORIGIN = "/robot"
-ROBOT_VIEW_NAME = "Robot — measured (solid) · teleop cmd (ghost) · policy horizon (purple)"
+ROBOT_VIEW_NAME = (
+    "Robot — measured (solid) · teleop cmd (ghost) · target (purple)"
+)
 PROPRIO_ROOT = "proprio"
 FACTR_ROOT = "factr"
 EVENTS = "events"
@@ -97,7 +99,9 @@ README = "readme"
 #: Time-series signals. The full ``eef`` *pose* (with quaternion) drives the 3D
 #: robot scene rather than a series, but its position (``eef_pos`` = ``eef[:3]``) is
 #: plotted here — first, so the requested TCP-position metric is the top-left panel.
-PROPRIO_SERIES: tuple[str, ...] = ("eef_pos", "q", "dq", "tau", "wrench", "eef_vel")
+PROPRIO_SERIES: tuple[str, ...] = (
+    "eef_pos", "q", "dq", "tau", "tau_ext", "wrench", "eef_vel",
+)
 
 #: Human titles + dimensionality for each time-series signal (matches the RDK mapping;
 #: ``eef_pos`` is the 3-vector position slice of the 7-vector ``eef`` pose).
@@ -105,12 +109,16 @@ PROPRIO_TITLES = {
     "eef_pos": "TCP position (m)",
     "q": "Joint position q (rad)",
     "dq": "Joint velocity dq (rad/s)",
-    "tau": "Joint torque τ (Nm)",
+    "tau": "Measured joint torque τ (Nm)",
+    "tau_ext": "External joint torque τ_ext (Nm)",
     "wrench": "TCP wrench (N, Nm)",
     "eef": "TCP pose",
     "eef_vel": "TCP twist (m/s, rad/s)",
 }
-PROPRIO_DIMS = {"eef_pos": 3, "q": 7, "dq": 7, "tau": 7, "wrench": 6, "eef": 7, "eef_vel": 6}
+PROPRIO_DIMS = {
+    "eef_pos": 3, "q": 7, "dq": 7, "tau": 7, "tau_ext": 7,
+    "wrench": 6, "eef": 7, "eef_vel": 6,
+}
 
 #: ``eef_pos``'s three scalar series are the world X/Y/Z axes; naming + colouring
 #: them (logged statically by the emitter) makes the plot legend read x/y/z in the

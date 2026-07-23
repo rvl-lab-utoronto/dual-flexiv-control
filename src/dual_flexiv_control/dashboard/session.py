@@ -335,12 +335,20 @@ class SessionManager:
         return self.send({"cmd": "stop_factr"})
 
     def enable_grav_comp(self) -> bool:
-        """Ramp every leader's grav-comp master gain up (0→1 over ~1s)."""
+        """Ramp every leader's independent grav-comp gain up (0→1 over ~1s)."""
         return self.send({"cmd": "enable_grav_comp"})
 
     def disable_grav_comp(self) -> bool:
-        """Ramp every leader's grav-comp master gain down (1→0 over ~1s)."""
+        """Ramp every leader's independent grav-comp gain down (1→0 over ~1s)."""
         return self.send({"cmd": "disable_grav_comp"})
+
+    def enable_force_feedback(self) -> bool:
+        """Enable follower-force feedback on every FACTR leader."""
+        return self.send({"cmd": "enable_force_feedback"})
+
+    def disable_force_feedback(self) -> bool:
+        """Disable follower-force feedback on every FACTR leader."""
+        return self.send({"cmd": "disable_force_feedback"})
 
     # -- state -------------------------------------------------------------------
 

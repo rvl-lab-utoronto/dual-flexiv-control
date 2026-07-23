@@ -534,6 +534,43 @@ def test_loop_holds_on_policy_error_then_recovers():
     assert policy.calls == 3  # 2 failures + 1 success
 
 
+def test_loop_surfaces_persistent_policy_error_after_retry_budget():
+    cfg = _config()
+    layout = ActionLayout(cfg.arms, ["left"])
+    brain = _FakeBrain(cfg)
+    policy = _ScriptedPolicy(layout.dim, horizon=4, fail_first=10)
+    loop = _loop(cfg, brain, policy, layout, num_timesteps=4)
+
+    with pytest.raises(PolicyError, match="3 consecutive times") as error:
+        loop.run(_StopAfter(100))
+
+    assert "scripted failure" in str(error.value)
+    assert policy.calls == 3
+    assert brain.commands == []
+
+
+def test_loop_policy_error_budget_resets_after_success():
+    cfg = _config()
+    layout = ActionLayout(cfg.arms, ["left"])
+    brain = _FakeBrain(cfg)
+
+    class AlternatingPolicy(_ScriptedPolicy):
+        def infer(self, obs):
+            self.calls += 1
+            if self.calls % 2:
+                raise PolicyError("intermittent failure")
+            return np.tile(
+                np.arange(self.dim, dtype=np.float64), (self.horizon, 1)
+            )
+
+    policy = AlternatingPolicy(layout.dim, horizon=1)
+    loop = _loop(cfg, brain, policy, layout, num_timesteps=3)
+    loop.run(_StopAfter(100))
+
+    assert loop.timesteps_done == 3
+    assert policy.calls == 6
+
+
 def test_loop_announces_horizon_end_target_per_inference():
     """on_chunk gets the FULL chunk's estimated end state (policy intent), once per
     inference — even when replan_steps executes only a prefix of the chunk."""

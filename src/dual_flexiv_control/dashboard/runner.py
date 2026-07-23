@@ -301,6 +301,20 @@ class RunRegistry:
             _log_event("grav comp disable requested (leaders de-energizing)")
         return ok
 
+    def enable_force_feedback(self) -> bool:
+        """Ask the daemon to enable force feedback on every FACTR leader."""
+        ok = self.manager.enable_force_feedback()
+        if ok:
+            _log_event("force feedback enable requested")
+        return ok
+
+    def disable_force_feedback(self) -> bool:
+        """Ask the daemon to disable force feedback on every FACTR leader."""
+        ok = self.manager.disable_force_feedback()
+        if ok:
+            _log_event("force feedback disable requested")
+        return ok
+
     def reset(self) -> None:
         """Stop any active run and clear the history — a clean slate."""
         view = self.manager.view()
@@ -552,6 +566,7 @@ _VIEW_STREAMS = (
     ("q", "q", None),
     ("dq", "dq", None),
     ("tau", "tau", None),
+    ("tau_ext", "tau_ext", None),
     ("wrench", "wrench", None),
     ("eef_vel", "eef_vel", None),
     ("eef", "eef_pos", 3),  # pose [x y z qw qx qy qz] -> position row
@@ -593,6 +608,11 @@ def _send_layout(view: SessionView) -> None:
     # transient saving/viewing states mid-switch would otherwise caption the
     # new mode's layout with the old mode's text.
     _log_mode_readme(kind if view.pending else view.state, task)
+
+
+def activate_metrics_view(view: SessionView) -> None:
+    """Make the shared Rerun viewer select the live experiment recording again."""
+    _send_layout(view)
 
 
 class SessionMirror:

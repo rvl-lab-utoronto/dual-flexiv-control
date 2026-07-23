@@ -16,7 +16,7 @@ signal target the python process itself, with no shell wrapper in between.
 Lifecycle, mirroring the task's semantics:
 
 * **Start is automatic at daemon boot** (:meth:`start_now`). The leader teleops
-  now boot limp — energized at master output gain 0 — and ramp that gain up only
+  now boot with gravity and feedback activation at 0 and ramp each independently
   when told to over HTTP, so there is no pose to hold and no calibration window
   to honour. The legacy user-initiated path (``request_start()`` arms a
   ``cfg.calib_delay_s`` pose-then-calibrate countdown, spawning when it expires)
@@ -154,16 +154,16 @@ class FactrServerSupervisor:
     def start_now(self) -> tuple[bool, str]:
         """Spawn the processes immediately, skipping the pose-then-calibrate countdown.
 
-        The daemon's boot auto-start: the leader teleops now boot limp (master
-        output gain 0 — energized but applying no torque) and ramp that gain up
-        only on the dashboard's grav-comp signal, so there is nothing to pose for
-        and no calibration window to wait out. Idempotent — a no-op once the
+        The daemon's boot auto-start: the leader teleops now boot with gravity
+        and follower-feedback activation at 0 and ramp each term independently
+        from its dashboard signal, so there is nothing to pose for and no
+        calibration window to wait out. Idempotent — a no-op once the
         servers are counting down, running, or stopping (guards double-start).
         """
         if self.state in (COUNTDOWN, RUNNING, STOPPING):
             return False, "FACTR servers already started"
         self._spawn_all()  # straight to state RUNNING, no countdown
-        return True, "FACTR servers started (grav-comp leaders limp; API relay up)"
+        return True, "FACTR servers started (force terms disabled; API relay up)"
 
     def request_stop(self) -> tuple[bool, str]:
         """SIGINT every live process (the only de-energizing stop); cancel a countdown."""
@@ -327,15 +327,12 @@ class FactrServerSupervisor:
             [f"source {shlex.quote(s)}" for s in self.cfg.setup_scripts]
             + [f"exec {shlex.quote(self.cfg.python_exe)} -m {shlex.quote(unit.module)}"]
         )
-        # The API relay publishes FACTR's diagnostics to the dashboard's Rerun
-        # gRPC proxy under its own application id; point it at the same port the
-        # dashboard serves (honouring the DFC_DASHBOARD_GRPC_PORT override).
+        # FACTR diagnostics stay on the existing WebSocket control/status channel.
+        # Never let the external relay create a second Rerun recording on the
+        # dashboard endpoint: the web viewer eagerly reloads background recordings
+        # after memory GC, which can turn this source into a relaunch loop.
         env = dict(os.environ)
-        env.setdefault(
-            "FACTR_RERUN_URL",
-            "rerun+http://127.0.0.1:"
-            f"{os.environ.get('DFC_DASHBOARD_GRPC_PORT', '9876')}/proxy",
-        )
+        env["FACTR_RERUN_URL"] = "disabled"
         # One log per launch (truncate), like the task; Popen inherits its own fd.
         with open(unit.log_path, "w") as logf:
             unit.proc = subprocess.Popen(

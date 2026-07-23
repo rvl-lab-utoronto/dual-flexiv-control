@@ -106,8 +106,11 @@ class LeaderStatus:
     gripper: float | None  # raw trailing gripper reading, when reachable
     sim: bool  # runtime.sim -> the reading is synthetic, not real hardware
     grav_comp_enabled: bool | None = None  # None = status endpoint unavailable
-    force_gain: float | None = None  # live master output multiplier, 0..1
-    force_gain_target: float | None = None
+    grav_comp_gain: float | None = None
+    grav_comp_gain_target: float | None = None
+    force_feedback_enabled: bool | None = None  # None = old/unavailable status endpoint
+    force_feedback_gain: float | None = None
+    force_feedback_gain_target: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -395,31 +398,54 @@ def read_leader_status(side: str) -> LeaderStatus:
     jp = np.asarray(jp, dtype=float).ravel()
     grip = float(jp[-1]) if jp.size else None
     enabled = None
-    gain = None
-    gain_target = None
+    grav_gain = None
+    grav_gain_target = None
+    feedback_enabled = None
+    feedback_gain = None
+    feedback_gain_target = None
     if sim:
         enabled = False
-        gain = 0.0
-        gain_target = 0.0
+        grav_gain = 0.0
+        grav_gain_target = 0.0
+        feedback_enabled = False
+        feedback_gain = 0.0
+        feedback_gain_target = 0.0
     else:
         payload = read_leader_grav_comp_status(side)
         if payload is not None:
             try:
                 enabled = bool(payload["grav_comp_enabled"])
-                gain = float(payload["force_gain"])
-                gain_target = float(payload.get("force_gain_target", gain))
+                grav_gain = float(payload["grav_comp_gain"])
+                grav_gain_target = float(
+                    payload.get("grav_comp_gain_target", grav_gain)
+                )
             except (KeyError, TypeError, ValueError):
                 enabled = None
-                gain = None
-                gain_target = None
+                grav_gain = None
+                grav_gain_target = None
+            if isinstance(payload.get("force_feedback_enabled"), bool):
+                feedback_enabled = payload["force_feedback_enabled"]
+            try:
+                feedback_gain = float(payload["force_feedback_gain"])
+                feedback_gain_target = float(
+                    payload.get("force_feedback_gain_target", feedback_gain)
+                )
+            except (KeyError, TypeError, ValueError):
+                feedback_gain = None
+                feedback_gain_target = None
     return LeaderStatus(
         side, name, reachable=True, dof=max(0, jp.size - 1), gripper=grip, sim=sim,
-        grav_comp_enabled=enabled, force_gain=gain, force_gain_target=gain_target,
+        grav_comp_enabled=enabled,
+        grav_comp_gain=grav_gain,
+        grav_comp_gain_target=grav_gain_target,
+        force_feedback_enabled=feedback_enabled,
+        force_feedback_gain=feedback_gain,
+        force_feedback_gain_target=feedback_gain_target,
     )
 
 
 def read_leader_grav_comp_status(side: str) -> dict | None:
-    """Read the authoritative per-leader gain state without changing it."""
+    """Read the authoritative per-leader FACTR state without changing it."""
     from ..interfaces.factr.client import FactrClient
 
     global _LEADER_STATUS_CLIENT
@@ -437,14 +463,14 @@ def read_leader_grav_comp_status(side: str) -> dict | None:
 def grav_comp_state(status: dict | None) -> str:
     """Classify a leader's live gain state: enabled/enabling/disabling/disabled/unknown.
 
-    Shared by the status label and the dashboard's F-hotkey action so the two
+    Shared by the status label and the dashboard's G-hotkey action so the two
     cannot drift apart.
     """
     if status is None:
         return "unknown"
     try:
-        gain = float(status["force_gain"])
-        target = float(status["force_gain_target"])
+        gain = float(status["grav_comp_gain"])
+        target = float(status["grav_comp_gain_target"])
         enabled = status["grav_comp_enabled"] is True
     except (KeyError, TypeError, ValueError):
         return "unknown"
@@ -462,7 +488,7 @@ def grav_comp_display(status: dict | None) -> tuple[str, str]:
     state = grav_comp_state(status)
     if state == "unknown":
         return "🟡", ":gray[grav comp unknown]"
-    gain = float(status["force_gain"])
+    gain = float(status["grav_comp_gain"])
     if state == "enabled":
         return "🟢", f":green[grav comp enabled] · gain `{gain:.2f}`"
     if state == "enabling":
@@ -470,6 +496,40 @@ def grav_comp_display(status: dict | None) -> tuple[str, str]:
     if state == "disabling":
         return "🟡", f":orange[disabling grav comp] · gain `{gain:.2f}`"
     return "⚫", f"gain `{gain:.2f}`"
+
+
+def force_feedback_state(status: dict | None) -> str:
+    """Classify the independent follower-force activation ramp."""
+    if status is None:
+        return "unknown"
+    try:
+        gain = float(status["force_feedback_gain"])
+        target = float(status["force_feedback_gain_target"])
+        enabled = status["force_feedback_enabled"] is True
+    except (KeyError, TypeError, ValueError):
+        return "unknown"
+    if enabled:
+        return "enabled"
+    if target >= 0.99 and gain < 0.99:
+        return "enabling"
+    if target <= 0.01 and gain > 0.01:
+        return "disabling"
+    return "disabled"
+
+
+def force_feedback_display(status: dict | None) -> str:
+    """Return the follower-force ramp state without conflating it with gravity."""
+    state = force_feedback_state(status)
+    if state == "unknown":
+        return ":gray[force feedback unknown]"
+    gain = float(status["force_feedback_gain"])
+    if state == "enabled":
+        return f":green[force feedback enabled] · gain `{gain:.2f}`"
+    if state == "enabling":
+        return f":orange[enabling force feedback] · gain `{gain:.2f}`"
+    if state == "disabling":
+        return f":orange[disabling force feedback] · gain `{gain:.2f}`"
+    return f":gray[force feedback disabled] · gain `{gain:.2f}`"
 
 
 def _runtime_root(runtime_dir: str | None) -> Path:

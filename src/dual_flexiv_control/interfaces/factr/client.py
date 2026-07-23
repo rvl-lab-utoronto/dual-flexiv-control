@@ -5,10 +5,11 @@ leader arm. There is **one server per leader, each on its own port** (e.g. left
 on 5000, right on 5001). Each server pushes typed JSON frames on one WebSocket:
 
 * ``{"type": "reading", "side": "left", "joint_pos": [...]}``
+* ``{"type": "diagnostics", "side": "left", "available": true, ...}``
 
-The leader-owned raw→DFC calibration contract is a one-shot HTTP
-``GET /calibration_<side>``; FACTR's full diagnostics go straight from the relay
-to Rerun and never transit this client.
+The leader-owned raw→DFC calibration contract is carried by the diagnostics
+frame. The relay sends that frame first on every connection and again whenever
+the teleop publishes a new snapshot.
 
 Each :class:`FactrServerClient` owns a background receiver that continuously
 drains the socket into latest-value caches. Public reads are therefore local and
@@ -70,7 +71,7 @@ def _extract_list(obj) -> list:
 
 
 class FactrServerClient:
-    """Receives one FACTR leader's readings over WebSocket."""
+    """Receives one FACTR leader's readings and diagnostics over WebSocket."""
 
     def __init__(
         self,
@@ -99,6 +100,7 @@ class FactrServerClient:
         self._ws = None
         self._latest_joint_pos: np.ndarray | None = None
         self._latest_joint_pos_at = 0.0
+        self._latest_diagnostics: dict | None = None
         self._last_stream_error = "stream has not connected"
 
     @property
@@ -134,32 +136,33 @@ class FactrServerClient:
                 self._condition.wait(remaining)
 
     def get_calibration(self) -> dict:
-        """Return the leader-owned raw→DFC conversion contract (from the arm YAML).
-
-        The only calibration data DFC reads from a leader; FACTR's full
-        diagnostics go straight from its relay to the Rerun viewer (its own
-        ``factr-diagnostics`` application), never through DFC.
-        """
+        """Return the leader-owned raw→DFC contract from the WebSocket cache."""
         if self.sim:
             return {}
-        path = f"/calibration_{self.side}"
-        try:
-            payload = self._get_http_json(path)
-        except (OSError, http.client.HTTPException, ValueError, json.JSONDecodeError) as exc:
-            self._reset_http_conn()
-            raise FactrError(f"FACTR calibration {self.side} failed: {exc}") from exc
-        if not isinstance(payload, dict):
-            raise FactrError(f"FACTR calibration {self.side} returned non-object JSON")
-        return payload
+        deadline = time.monotonic() + self.timeout_s
+        with self._condition:
+            self._ensure_receiver_locked()
+            while self._latest_diagnostics is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise FactrError(
+                        f"FACTR calibration {self.side} from {self.url} unavailable: "
+                        f"{self._last_stream_error}"
+                    )
+                self._condition.wait(remaining)
+            return dict(self._latest_diagnostics)
 
     def get_status(self) -> dict:
-        """Return this leader's live grav-comp state."""
+        """Return this leader's live grav-comp and force-feedback state."""
         if self.sim:
             return {
                 "side": self.side,
-                "force_gain": 0.0,
-                "force_gain_target": 0.0,
+                "grav_comp_gain": 0.0,
+                "grav_comp_gain_target": 0.0,
+                "force_feedback_gain": 0.0,
+                "force_feedback_gain_target": 0.0,
                 "grav_comp_enabled": False,
+                "force_feedback_enabled": False,
             }
         path = f"/status_{self.side}"
         try:
@@ -302,6 +305,14 @@ class FactrServerClient:
                 self._last_stream_error = ""
                 self._condition.notify_all()
             return
+        if frame_type == "diagnostics":
+            diagnostics = dict(payload)
+            diagnostics.pop("type", None)
+            with self._condition:
+                self._latest_diagnostics = diagnostics
+                self._last_stream_error = ""
+                self._condition.notify_all()
+            return
         raise FactrError(f"FACTR {self.side} sent unknown frame type {frame_type!r}")
 
     # -- remaining HTTP status surface ---------------------------------------
@@ -405,9 +416,9 @@ class FactrClient:
         return self._servers[side].get_calibration()
 
     def wait_calibration_for(self, side: str, timeout_s: float = 30.0) -> dict:
-        """Wait for FACTR startup to serve its leader-owned calibration contract.
+        """Wait for FACTR startup to stream its leader-owned calibration contract.
 
-        Transport failure and ``available=false`` mean the API/teleop is still starting.
+        Transport failure and ``available=false`` mean the relay/teleop is still starting.
         The deadline remains strict: no contract raises :class:`FactrError` with the last
         observed condition.
         """

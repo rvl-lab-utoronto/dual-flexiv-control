@@ -12,7 +12,8 @@ FK posing and logs everything on that module's ``"elapsed"`` timeline so the 3D
 scene, the images, and the plots scrub together.
 
 **Each replay is its own Rerun recording** (fresh ``recording_id``, timeline from
-0), streamed to a persistent gRPC data server. A fresh recording — rather than
+0), served on a stable gRPC port whose in-memory store is replaced per episode.
+A fresh recording — rather than
 clearing and re-logging a reused one — is what actually isolates episodes: a
 time-scoped ``rr.Clear`` cannot retroactively purge a previous (longer) episode's
 per-frame rows, so replaying a shorter episode after a longer one would otherwise
@@ -51,16 +52,20 @@ log = logging.getLogger(__name__)
 
 REPLAY_APP_ID = "dual-flexiv-replay"
 DEFAULT_REPLAY_GRPC_PORT = 9880
+#: Bound the one active episode below the web viewer's practical Wasm ceiling.
+#: Override for unusually long/high-resolution episodes.
+DEFAULT_REPLAY_MEMORY_LIMIT = os.environ.get("DFC_REPLAY_MEMORY_LIMIT", "256MiB")
 
 #: Canonical camera-image key prefix in a LeRobot frame.
 _IMAGE_PREFIX = "observation.images."
 
 _LOCK = threading.Lock()
 _VIEWER: "ReplayViewer | None" = None
-#: The persistent server host recording + its proxy URI (fresh per-episode recordings
-#: connect to this). Kept module-scoped so the server outlives every call.
+#: The recording that currently owns the replay gRPC server. It starts as an
+#: empty placeholder and is replaced by the selected episode.
 _HOST = None
 _SERVER_URI: str | None = None
+_SERVER_PORT: int | None = None
 #: Hold the most recent episode recording so it isn't GC'd before its data drains.
 _LAST_REC = None
 #: Monotonic per-replay counter → a unique recording_id each replay (so re-replaying
@@ -185,19 +190,39 @@ def log_episode(ds_info, episode_index: int) -> int:
     A fresh ``recording_id`` per call means each episode has an isolated timeline
     (from 0) — no leftover frames from a previously-replayed (longer) episode.
     """
-    global _LAST_REC, _GEN
+    global _HOST, _SERVER_URI, _LAST_REC, _GEN
     frames, cam_names = read_episode(ds_info, episode_index)
 
     with _LOCK:
-        if _SERVER_URI is None:
+        if _SERVER_URI is None or _SERVER_PORT is None or _HOST is None or _VIEWER is None:
             raise RuntimeError("replay viewer not started; call start_replay_viewer() first")
+        # A gRPC endpoint streams every recording retained by its store. Merely
+        # connecting a fresh recording here therefore made old episodes permanent
+        # "background recordings" in the browser. Stop the old per-replay server
+        # and rebind the same port with this episode as the sole recording.
+        old_host = _HOST
+        old_host.disconnect()
         _GEN += 1
-        rec = rr.RecordingStream(REPLAY_APP_ID, recording_id=f"ep-{ds_info.repo_id}-{episode_index}-{_GEN}")
-        rec.connect_grpc(_SERVER_URI)
-        _LAST_REC = rec  # keep alive until the next replay so its data fully drains
+        recording_id = f"ep-{ds_info.repo_id}-{episode_index}-{_GEN}"
+        rec = rr.RecordingStream(REPLAY_APP_ID, recording_id=recording_id)
+        gp = _SERVER_PORT
+        _SERVER_URI = serve_grpc_checked(
+            lambda: rec.serve_grpc(
+                grpc_port=gp,
+                default_blueprint=replay_blueprint(cam_names),
+                server_memory_limit=DEFAULT_REPLAY_MEMORY_LIMIT,
+                cors_allow_origin=["*"],
+            ),
+            gp,
+            what="replay",
+        )
+        _HOST = rec
+        _LAST_REC = rec
 
-    _log_frames(rec, frames, cam_names)
-    rec.flush()
+        # Keep the server replacement and upload atomic. A second dashboard
+        # session must not disconnect this recording halfway through its frames.
+        _log_frames(rec, frames, cam_names)
+        rec.flush()
     return len(frames)
 
 
@@ -291,19 +316,22 @@ def start_replay_viewer(web_port: int, grpc_port: int | None = None) -> ReplayVi
     server here, so episodes stay isolated on their own recordings without a second
     ``serve_web_viewer``. Idempotent while up; after :func:`reset` (paired with
     :func:`~.viewer.teardown`) the next call re-serves a fresh gRPC server. A host
-    recording owns the server; each :func:`log_episode` streams a fresh per-episode
-    recording to it via ``connect_grpc``.
+    placeholder recording initially owns the server. Each :func:`log_episode`
+    replaces that server/store on the same port, so the endpoint exposes exactly
+    one episode and cannot accumulate background recordings.
     """
-    global _VIEWER, _HOST, _SERVER_URI
+    global _VIEWER, _HOST, _SERVER_URI, _SERVER_PORT
     with _LOCK:
         if _VIEWER is not None:
             return _VIEWER
         gp = grpc_port or grpc_port_from_env()
+        _SERVER_PORT = gp
         _HOST = rr.RecordingStream(REPLAY_APP_ID, recording_id="replay-host")
         _SERVER_URI = serve_grpc_checked(
             lambda: _HOST.serve_grpc(
                 grpc_port=gp,
                 default_blueprint=replay_blueprint([]),
+                server_memory_limit=DEFAULT_REPLAY_MEMORY_LIMIT,
                 cors_allow_origin=["*"],
             ),
             gp,
@@ -320,9 +348,10 @@ def reset() -> None:
     this gRPC port too, so after a *Reset services* the next ▶ rebinds a fresh replay
     server (reusing the same shared web viewer).
     """
-    global _VIEWER, _HOST, _SERVER_URI, _LAST_REC
+    global _VIEWER, _HOST, _SERVER_URI, _SERVER_PORT, _LAST_REC
     with _LOCK:
         _VIEWER = None
         _HOST = None
         _SERVER_URI = None
+        _SERVER_PORT = None
         _LAST_REC = None

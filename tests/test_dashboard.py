@@ -31,6 +31,7 @@ def test_viewer_server_bounds_refresh_history(monkeypatch):
         lambda **kwargs: grpc_calls.append(kwargs) or "rerun+http://127.0.0.1:19876/proxy",
     )
     monkeypatch.setattr(viewer.rr, "serve_web_viewer", lambda **kwargs: None)
+    monkeypatch.setattr(viewer, "_await_port", lambda *args, **kwargs: True)
     monkeypatch.setattr(viewer, "_SERVERS", None)
     monkeypatch.setattr(viewer, "_WEB_VIEWER_PORT", None)
 
@@ -41,6 +42,142 @@ def test_viewer_server_bounds_refresh_history(monkeypatch):
         "server_memory_limit": viewer.DEFAULT_MEMORY_LIMIT,
         "cors_allow_origin": ["*"],
     }]
+
+
+@_needs_rerun
+def test_replay_replaces_server_store_for_each_episode(monkeypatch):
+    from types import SimpleNamespace
+
+    import rerun as rr
+
+    from dual_flexiv_control.dashboard import replay
+
+    events = []
+
+    class FakeRecording:
+        def __init__(self, app_id, recording_id):
+            self.recording_id = recording_id
+            events.append(("create", recording_id))
+
+        def serve_grpc(self, **kwargs):
+            events.append(("serve", self.recording_id, kwargs))
+            return "rerun+http://127.0.0.1:19880/proxy"
+
+        def disconnect(self):
+            events.append(("disconnect", self.recording_id))
+
+        def flush(self):
+            events.append(("flush", self.recording_id))
+
+    replay.reset()
+    monkeypatch.setattr(rr, "RecordingStream", FakeRecording)
+    monkeypatch.setattr(replay, "serve_grpc_checked", lambda serve, port, what: serve())
+    monkeypatch.setattr(replay, "read_episode", lambda ds, index: ([{"index": index}], []))
+    monkeypatch.setattr(
+        replay,
+        "_log_frames",
+        lambda rec, frames, cams: events.append(("log", rec.recording_id, frames[0]["index"])),
+    )
+
+    try:
+        replay.start_replay_viewer(web_port=19090, grpc_port=19880)
+        replay.log_episode(SimpleNamespace(repo_id="dfc/test"), 1)
+        replay.log_episode(SimpleNamespace(repo_id="dfc/test"), 2)
+    finally:
+        replay.reset()
+
+    served_ids = [event[1] for event in events if event[0] == "serve"]
+    assert served_ids[0] == "replay-host"
+    assert served_ids[1].startswith("ep-dfc/test-1-")
+    assert served_ids[2].startswith("ep-dfc/test-2-")
+    assert ("disconnect", "replay-host") in events
+    assert ("disconnect", served_ids[1]) in events
+    for event in (e for e in events if e[0] == "serve"):
+        assert event[2]["server_memory_limit"] == replay.DEFAULT_REPLAY_MEMORY_LIMIT
+
+
+def test_dashboard_separates_control_modes_from_content_views():
+    from dual_flexiv_control.dashboard import app
+
+    assert app.CONTROL_MODES == ("Experiment", "Calibration")
+    assert app.CONTENT_VIEWS == ("Viewer", "Cameras", "Storage", "Logs")
+    assert not set(app.CONTROL_MODES) & set(app.CONTENT_VIEWS)
+
+
+def test_calibration_has_no_viewer_or_rerun_feed():
+    from dual_flexiv_control.dashboard import app
+    from dual_flexiv_control.dashboard import calibration
+
+    assert not hasattr(app, "_calibration_viewer")
+    assert not hasattr(app, "_calibration_view_feed")
+    assert not hasattr(calibration, "start_calib_viewer")
+    assert not hasattr(calibration, "render")
+
+
+def test_viewer_workspace_always_uses_existing_experiment_viewer(monkeypatch):
+    from types import SimpleNamespace
+
+    from dual_flexiv_control.dashboard import app
+
+    iframes = []
+    monkeypatch.setattr(app.st, "iframe", lambda url, **kwargs: iframes.append(url))
+    monkeypatch.setattr(app.st, "caption", lambda *args, **kwargs: None)
+    monkeypatch.setattr(app, "_render_skill_bar", lambda registry: None)
+    monkeypatch.setattr(app._cameras, "depth_cameras", lambda: [])
+    monkeypatch.setattr(app, "_robot_data_status", lambda: None)
+
+    servers = SimpleNamespace(web_url="http://127.0.0.1:9090/?url=metrics")
+    app._render_viewer_workspace(servers, object())
+
+    assert iframes == [servers.web_url]
+
+
+def test_control_workspace_renders_only_selected_mode(monkeypatch):
+    from types import SimpleNamespace
+
+    from dual_flexiv_control.dashboard import app
+
+    selected = ["Calibration", "Calibration", "Experiment"]
+    calls = []
+    monkeypatch.setattr(
+        app.st,
+        "segmented_control",
+        lambda *_args, **_kwargs: selected.pop(0),
+    )
+    monkeypatch.setattr(app.st, "session_state", {})
+    monkeypatch.setattr(
+        app,
+        "_render_calibration_controls",
+        lambda: calls.append(("calibration",)),
+    )
+    monkeypatch.setattr(
+        app,
+        "_render_controls",
+        lambda tasks, rig, registry: calls.append(("experiment",)),
+    )
+    monkeypatch.setattr(
+        app._runner,
+        "activate_metrics_view",
+        lambda view: calls.append(("activate_metrics", view.state)),
+    )
+    monkeypatch.setattr(
+        app._robot,
+        "clear_calibration_targets",
+        lambda: calls.append(("clear_calibration",)),
+    )
+    registry = SimpleNamespace(session_view=lambda: SimpleNamespace(state="viewing"))
+
+    app._render_control_workspace([], None, registry)
+    app._render_control_workspace([], None, registry)
+    app._render_control_workspace([], None, registry)
+
+    assert calls == [
+        ("calibration",),
+        ("calibration",),
+        ("clear_calibration",),
+        ("activate_metrics", "viewing"),
+        ("experiment",),
+    ]
 
 
 def test_discover_tasks_finds_shipped_tasks():
@@ -75,6 +212,82 @@ def test_discover_rigs_finds_shipped_rigs_with_descriptions():
     assert all(r.description for r in rigs.values())
     assert "@package" not in rigs["bench"].description
     assert "dummy" in rigs["bench"].description.lower()
+
+
+def test_policy_server_info_reports_protocol_and_checkpoint(tmp_path, monkeypatch):
+    from dual_flexiv_control.dashboard import policy_servers
+
+    (tmp_path / "custom.yaml").write_text(
+        "schema: acme\ntransport: http\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        policy_servers,
+        "_probe_http",
+        lambda endpoint, timeout: {
+            "server": {"name": "ACME"},
+            "conventions": {"checkpoint_dir": "/models/moose/checkpoint_12000"},
+        },
+    )
+
+    info = policy_servers.inspect_policy_server(
+        "custom", "gpu-box", 53805, policy_dir=tmp_path,
+    )
+
+    assert info.reachable
+    assert info.schema == "acme"
+    assert info.transport == "http"
+    assert info.endpoint == "http://gpu-box:53805"
+    assert info.checkpoint == "/models/moose/checkpoint_12000"
+    help_text = policy_servers.policy_server_help(info)
+    assert "Policy server details" in help_text
+    assert "checkpoint_12000" in help_text
+    assert '"conventions"' in help_text
+
+
+def test_policy_server_info_keeps_failed_probe_informational(tmp_path, monkeypatch):
+    from dual_flexiv_control.dashboard import policy_servers
+
+    (tmp_path / "openpiish.yaml").write_text(
+        "schema: openpi\n",
+        encoding="utf-8",
+    )
+
+    def fail(*_args):
+        raise TimeoutError("metadata handshake timed out")
+
+    monkeypatch.setattr(policy_servers, "_probe_websocket", fail)
+    info = policy_servers.inspect_policy_server(
+        "openpiish", "gpu-box", 8000, policy_dir=tmp_path,
+    )
+
+    assert not info.reachable
+    assert info.transport == "websocket"
+    assert "timed out" in policy_servers.policy_server_help(info)
+
+
+def test_eval_launchability_does_not_depend_on_factr_leaders():
+    """Eval is policy-driven: unavailable FACTR leaders only gate Collection."""
+    from dataclasses import replace
+
+    from dual_flexiv_control.dashboard import app
+    from dual_flexiv_control.dashboard.session import SessionView
+
+    ready = SessionView(
+        state="viewing",
+        factr_servers={
+            "state": "running",
+            "down": ["teleop:left", "teleop:right"],
+        },
+    )
+    assert app._eval_launchable(ready)
+
+    # Eval still needs live policy observations. Connected followers with an
+    # E-stop/fault are handled daemon-side as a dry run, but a down arm has no
+    # state stream from which to construct an observation.
+    assert not app._eval_launchable(replace(ready, cameras_down=("zed:static",)))
+    assert not app._eval_launchable(replace(ready, arms_down=("left",)))
+    assert not app._eval_launchable(replace(ready, state="collection"))
 
 
 @_needs_rerun
@@ -223,6 +436,16 @@ def test_eef_position_is_a_time_series_metric():
     assert len(blueprints.EEF_POS_COMPONENTS) == len(blueprints.EEF_POS_COLORS) == 3
 
 
+def test_external_joint_torque_is_a_dashboard_metric():
+    from dual_flexiv_control.dashboard import blueprints
+    from dual_flexiv_control.dashboard import runner
+
+    assert "tau_ext" in blueprints.PROPRIO_SERIES
+    assert blueprints.PROPRIO_DIMS["tau_ext"] == 7
+    assert "External joint torque" in blueprints.PROPRIO_TITLES["tau_ext"]
+    assert ("tau_ext", "tau_ext", None) in runner._VIEW_STREAMS
+
+
 def test_open_in_vscode_reports_missing_file(tmp_path):
     # Returns before shelling out to `code`, so it never touches a real editor.
     from dual_flexiv_control.dashboard.editor import OpenResult
@@ -359,6 +582,7 @@ def test_calibration_reference_poses_make_every_sign_observable():
     assert len(REFERENCE_POSES) >= 3
     for pose in REFERENCE_POSES:
         assert len(pose.q_deg) == 7
+        assert all(v % 90 == 0 for v in pose.q_deg)
     for j in range(7):
         values = [p.q_deg[j] for p in REFERENCE_POSES]
         assert any(v > 0 for v in values), f"J{j} never positive in the pose set"
@@ -606,31 +830,6 @@ class _FakeConv:
         self.drop_trailing = 1
 
 
-def test_calibration_render_smoke(monkeypatch):
-    # The live-view path (render -> commanded_follower_q -> robot_view.update_poses)
-    # must run end-to-end without throwing; drive it against a buffered recording (no
-    # gRPC server) and the synthetic FACTR source.
-    import rerun as rr
-
-    from dual_flexiv_control.dashboard import arms as _arms
-    from dual_flexiv_control.dashboard import calibration
-
-    _arms.set_active_rig("left_only")
-    monkeypatch.setattr(_arms, "runtime_is_sim", lambda: True)
-    calibration.reset()
-    rec = rr.RecordingStream("dfc-test-calib", recording_id="t")
-    from dual_flexiv_control.dashboard import robot_view
-    robot_view.log_scene(rec)
-    monkeypatch.setattr(calibration, "_REC", rec)
-    try:
-        q = calibration.render("left", calibration.initial_offsets("left"), [1, 2, 3])
-        assert q.shape == (7,)
-    finally:
-        monkeypatch.setattr(calibration, "_REC", None)
-        calibration.reset()
-        _arms.set_active_rig(None)
-
-
 def test_calibration_reset_closes_client(monkeypatch):
     from dual_flexiv_control.dashboard import arms as _arms
     from dual_flexiv_control.dashboard import calibration
@@ -760,7 +959,9 @@ def test_read_leader_status_reachable_iff_stream_fresh(tmp_path, monkeypatch):
         assert status.dof == 7
         assert status.gripper == pytest.approx(0.8)
         assert status.grav_comp_enabled is False
-        assert status.force_gain == 0.0
+        assert status.grav_comp_gain == 0.0
+        assert status.force_feedback_enabled is False
+        assert status.force_feedback_gain == 0.0
     finally:
         writer.close()
         writer.unlink()
@@ -794,7 +995,14 @@ def test_read_leader_status_reports_actual_grav_comp(tmp_path, monkeypatch):
     monkeypatch.setattr(_arms, "runtime_is_sim", lambda: False)
     monkeypatch.setattr(
         _arms, "read_leader_grav_comp_status",
-        lambda side: {"grav_comp_enabled": side == "left", "force_gain": 1.0},
+        lambda side: {
+            "grav_comp_enabled": side == "left",
+            "grav_comp_gain": 1.0,
+            "grav_comp_gain_target": 1.0,
+            "force_feedback_gain": 1.0 if side == "left" else 0.0,
+            "force_feedback_gain_target": 1.0 if side == "left" else 0.0,
+            "force_feedback_enabled": side == "left",
+        },
     )
     _arms.reset()
     side = _arms.configured_leader_sides()[0]
@@ -808,48 +1016,117 @@ def test_read_leader_status_reports_actual_grav_comp(tmp_path, monkeypatch):
         writer.write(np.zeros(8), _time.monotonic_ns())
         status = _arms.read_leader_status(side)
         assert status.grav_comp_enabled is (side == "left")
-        assert status.force_gain == 1.0
+        assert status.grav_comp_gain == 1.0
+        assert status.force_feedback_enabled is (side == "left")
+        assert status.force_feedback_gain == (1.0 if side == "left" else 0.0)
     finally:
         writer.close()
         writer.unlink()
         _arms.reset()
 
 
+def test_running_factr_service_does_not_mask_unreachable_leader_as_booting(monkeypatch):
+    """A started relay with no usable stream is disconnected, not forever booting."""
+    from dual_flexiv_control.dashboard import app
+    from dual_flexiv_control.dashboard.arms import LeaderStatus
+
+    rendered = []
+    monkeypatch.setattr(app.st, "markdown", rendered.append)
+    status = LeaderStatus(
+        "left", "Left", reachable=False, dof=0, gripper=None, sim=False,
+    )
+
+    app._render_leader_row(status, {"state": "unreachable"}, "running")
+
+    assert rendered and "no signal" in rendered[-1]
+    assert "Booting" not in rendered[-1]
+
+
 def test_grav_comp_display_uses_live_gain_not_process_health():
     from dual_flexiv_control.dashboard.arms import grav_comp_display
 
     assert "enabled" in grav_comp_display({
-        "grav_comp_enabled": True, "force_gain": 1.0, "force_gain_target": 1.0,
+        "grav_comp_enabled": True,
+        "grav_comp_gain": 1.0,
+        "grav_comp_gain_target": 1.0,
     })[1]
     assert "enabling" in grav_comp_display({
-        "grav_comp_enabled": False, "force_gain": 0.4, "force_gain_target": 1.0,
+        "grav_comp_enabled": False,
+        "grav_comp_gain": 0.4,
+        "grav_comp_gain_target": 1.0,
     })[1]
     assert "disabling" in grav_comp_display({
-        "grav_comp_enabled": False, "force_gain": 0.4, "force_gain_target": 0.0,
+        "grav_comp_enabled": False,
+        "grav_comp_gain": 0.4,
+        "grav_comp_gain_target": 0.0,
     })[1]
     assert grav_comp_display({
-        "grav_comp_enabled": False, "force_gain": 0.0, "force_gain_target": 0.0,
+        "grav_comp_enabled": False,
+        "grav_comp_gain": 0.0,
+        "grav_comp_gain_target": 0.0,
     })[1] == "gain `0.00`"
     assert "unknown" in grav_comp_display(None)[1]
 
 
-def test_grav_comp_state_drives_f_hotkey():
+def test_grav_comp_state_drives_g_hotkey():
     from dual_flexiv_control.dashboard.arms import grav_comp_state
 
     assert grav_comp_state({
-        "grav_comp_enabled": True, "force_gain": 1.0, "force_gain_target": 1.0,
+        "grav_comp_enabled": True,
+        "grav_comp_gain": 1.0,
+        "grav_comp_gain_target": 1.0,
     }) == "enabled"
     assert grav_comp_state({
-        "grav_comp_enabled": False, "force_gain": 0.4, "force_gain_target": 1.0,
+        "grav_comp_enabled": False,
+        "grav_comp_gain": 0.4,
+        "grav_comp_gain_target": 1.0,
     }) == "enabling"
     assert grav_comp_state({
-        "grav_comp_enabled": False, "force_gain": 0.4, "force_gain_target": 0.0,
+        "grav_comp_enabled": False,
+        "grav_comp_gain": 0.4,
+        "grav_comp_gain_target": 0.0,
     }) == "disabling"
     assert grav_comp_state({
-        "grav_comp_enabled": False, "force_gain": 0.0, "force_gain_target": 0.0,
+        "grav_comp_enabled": False,
+        "grav_comp_gain": 0.0,
+        "grav_comp_gain_target": 0.0,
     }) == "disabled"
     assert grav_comp_state(None) == "unknown"
-    assert grav_comp_state({"force_gain": "bogus"}) == "unknown"
+    assert grav_comp_state({"grav_comp_gain": "bogus"}) == "unknown"
+
+
+def test_factr_single_toggle_chooses_action_from_aggregate_state():
+    from dual_flexiv_control.dashboard.app import _factr_toggle_action
+
+    assert _factr_toggle_action(["disabled", "disabled"]) == "enable"
+    assert _factr_toggle_action(["disabling", "disabled"]) == "enable"
+    assert _factr_toggle_action(["enabled", "disabled"]) == "disable"
+    assert _factr_toggle_action(["enabling", "unknown"]) == "disable"
+    assert _factr_toggle_action(["unknown", "unknown"]) is None
+    assert _factr_toggle_action([]) is None
+
+
+def test_force_feedback_display_handles_live_and_legacy_status():
+    from dual_flexiv_control.dashboard.arms import force_feedback_display
+    from dual_flexiv_control.dashboard.arms import force_feedback_state
+
+    enabled = {
+        "force_feedback_enabled": True,
+        "force_feedback_gain": 1.0,
+        "force_feedback_gain_target": 1.0,
+    }
+    disabled = {
+        "force_feedback_enabled": False,
+        "force_feedback_gain": 0.0,
+        "force_feedback_gain_target": 0.0,
+    }
+    assert "enabled" in force_feedback_display(enabled)
+    assert "disabled" in force_feedback_display(disabled)
+    assert "unknown" in force_feedback_display(None)
+    assert force_feedback_state(enabled) == "enabled"
+    assert force_feedback_state({
+        **disabled, "force_feedback_gain_target": 1.0,
+    }) == "enabling"
 
 
 def test_robot_urdf_chain_parses():
@@ -964,6 +1241,35 @@ def test_horizon_target_update_and_clear_smoke():
     robot_view.clear_horizon_targets(rec)
     assert not robot_view._shown_targets
     assert not robot_view._shown_traces
+
+
+@_needs_rerun
+def test_calibration_target_update_and_clear_smoke(monkeypatch):
+    # Calibration uses a distinct purple target subtree in the existing viewer;
+    # switching reference poses re-poses it and leaving the tab removes it.
+    import numpy as np
+    import rerun as rr
+
+    from dual_flexiv_control.dashboard import robot_view
+
+    rec = rr.RecordingStream("dfc-test-calibration-target")
+    monkeypatch.setattr(robot_view, "_REC", rec)
+    robot_view.clear_calibration_targets()
+    robot_view.show_calibration_target("left", np.zeros(7))
+    assert robot_view._shown_calibration_targets == {"left"}
+    assert robot_view._calibration_target_q["left"] == (0.0,) * 7
+
+    robot_view.show_calibration_target("right", np.full(7, np.pi / 2))
+    assert robot_view._shown_calibration_targets == {"right"}
+    assert robot_view._calibration_target_q["right"] == (np.pi / 2,) * 7
+
+    robot_view.clear_calibration_targets()
+    assert not robot_view._shown_calibration_targets
+    assert not robot_view._calibration_target_q
+
+    robot_view.show_calibration_target("left", np.zeros(7))
+    assert robot_view._shown_calibration_targets == {"left"}
+    robot_view.clear_calibration_targets()
 
 
 @_needs_rerun
@@ -1140,6 +1446,23 @@ def test_live_daemon_log_none_when_path_missing(tmp_path):
     from dual_flexiv_control.dashboard import logs
 
     assert logs.live_daemon_log(str(tmp_path / "gone.log")) is None
+
+
+def test_factr_gain_display_keeps_separate_arm_values():
+    from dual_flexiv_control.dashboard.app import _format_factr_gain
+
+    assert _format_factr_gain(
+        ["left"], [{"grav_comp_gain": 0.375}], "grav_comp_gain"
+    ) == "0.38"
+    assert _format_factr_gain(
+        ["left", "right"],
+        [{"force_feedback_gain": 0.25}, {"force_feedback_gain": 0.875}],
+        "force_feedback_gain",
+    ) == "L 0.25 · R 0.88"
+    assert _format_factr_gain(
+        ["left", "right"], [{"force_feedback_gain": 0.25}, None],
+        "force_feedback_gain",
+    ) == "L 0.25 · R —"
 
 
 # ---------------------------------------------------------------------------

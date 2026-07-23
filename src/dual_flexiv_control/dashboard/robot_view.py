@@ -78,6 +78,9 @@ _GHOST_COLOR = {"left": [130, 190, 255, 51], "right": [255, 190, 140, 51]}
 #: alpha in 0.33, so the trace is solid on purpose). Same purple for both sides —
 #: the target reads as "policy intent", not as belonging to an arm's colour.
 _TARGET_COLOR = [168, 110, 255, 85]
+#: Calibration uses the same target language, but its entity subtree is separate
+#: from the eval horizon so entering/leaving Calibration cannot disturb policy state.
+_CALIBRATION_TARGET_COLOR = [168, 110, 255, 105]
 _TRACE_COLOR = [190, 130, 255]
 _BONE_RADIUS = 0.028
 _JOINT_RADIUS = 0.045
@@ -839,6 +842,90 @@ def clear_horizon_targets(rec) -> None:
 
 
 # ---------------------------------------------------------------------------
+# calibration target: selected reference pose as a purple ghost
+# ---------------------------------------------------------------------------
+
+
+def _calibration_target_root(side: str) -> str:
+    """Entity subtree for the selected calibration reference-pose ghost."""
+    return f"robot/{side}_calibration_target"
+
+
+#: Calibration targets are timeless because the operator may pause/scrub the live
+#: timeline while matching a pose. The app clears them explicitly on leaving the
+#: Calibration controls, so they never leak into Experiment mode.
+_shown_calibration_targets: set[str] = set()
+_calibration_target_q: dict[str, tuple[float, ...]] = {}
+
+
+def show_calibration_target(side: str, q) -> None:
+    """Show ``side`` at calibration reference configuration ``q`` in purple.
+
+    Uses the existing metrics recording and robot scene—there is no calibration
+    viewer or recording. Only the currently selected leader side remains visible.
+    Geometry is installed lazily and the FK transforms are updated only when the
+    selected reference pose changes.
+    """
+    rec = _REC
+    if rec is None:
+        return
+    if side not in _MOUNTS:
+        raise ValueError(f"unknown calibration target side {side!r}")
+    q_tuple = tuple(float(v) for v in np.asarray(q, dtype=float).ravel())
+
+    for stale_side in _shown_calibration_targets - {side}:
+        rec.log(
+            _calibration_target_root(stale_side),
+            rr.Clear(recursive=True),
+            static=True,
+        )
+        _shown_calibration_targets.discard(stale_side)
+        _calibration_target_q.pop(stale_side, None)
+
+    root = _calibration_target_root(side)
+    chain = _chain()
+    if side not in _shown_calibration_targets:
+        mount = _MOUNTS[side]
+        rec.log(
+            root,
+            rr.Transform3D(
+                translation=mount["translation"],
+                quaternion=rr.Quaternion(xyzw=mount["quat_xyzw"]),
+            ),
+            static=True,
+        )
+        _log_ghost_geometry(
+            rec, root, chain, _CALIBRATION_TARGET_COLOR, static=True
+        )
+        _shown_calibration_targets.add(side)
+    if _calibration_target_q.get(side) != q_tuple:
+        _log_arm_pose(
+            rec,
+            side,
+            chain,
+            np.asarray(q_tuple),
+            ghost=False,
+            static=True,
+            root=root,
+        )
+        _calibration_target_q[side] = q_tuple
+
+
+def clear_calibration_targets() -> None:
+    """Hide every calibration ghost from the shared experiment viewer."""
+    rec = _REC
+    if rec is not None:
+        for side in list(_shown_calibration_targets):
+            rec.log(
+                _calibration_target_root(side),
+                rr.Clear(recursive=True),
+                static=True,
+            )
+    _shown_calibration_targets.clear()
+    _calibration_target_q.clear()
+
+
+# ---------------------------------------------------------------------------
 # RGB-D overlay (Robot-tab depth checkbox)
 # ---------------------------------------------------------------------------
 
@@ -994,3 +1081,5 @@ def reset() -> None:
     global _REC
     with _LOCK:
         _REC = None
+        _shown_calibration_targets.clear()
+        _calibration_target_q.clear()

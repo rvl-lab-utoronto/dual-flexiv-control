@@ -521,6 +521,7 @@ class FakeFlexivSource:
             q = np.asarray(self._tracked_q, dtype=np.float64) + 1e-4 * np.sin(t + self._phase)
             dq = np.zeros(dof)
             tau = np.zeros(dof)
+            tau_ext = np.zeros(dof)
             tcp_pose = (
                 np.asarray(self._tracked_pose, dtype=np.float64)
                 if self._tracked_pose is not None
@@ -529,12 +530,14 @@ class FakeFlexivSource:
             tcp_vel = np.zeros(6)
             wrench = np.zeros(6)
             return SimpleNamespace(
-                q=q, dq=dq, tau=tau, tcp_pose=tcp_pose, tcp_vel=tcp_vel,
+                q=q, dq=dq, tau=tau, tau_ext=tau_ext,
+                tcp_pose=tcp_pose, tcp_vel=tcp_vel,
                 ext_wrench_in_tcp=wrench, ext_wrench_in_world=wrench,
             )
         q = 0.5 * np.sin(t + self._phase)
         dq = 0.5 * np.cos(t + self._phase)
         tau = 2.0 * np.sin(0.5 * t + self._phase)
+        tau_ext = 0.75 * np.sin(0.8 * t + self._phase)
         # TCP pose: small circular motion + identity-ish quaternion.
         pos = np.array([0.5 + 0.05 * math.sin(t), 0.05 * math.cos(t), 0.4])
         quat = np.array([1.0, 0.0, 0.0, 0.0])
@@ -549,6 +552,7 @@ class FakeFlexivSource:
             q=q,
             dq=dq,
             tau=tau,
+            tau_ext=tau_ext,
             tcp_pose=tcp_pose,
             tcp_vel=tcp_vel,
             ext_wrench_in_tcp=wrench,

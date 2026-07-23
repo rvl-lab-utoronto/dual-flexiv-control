@@ -29,8 +29,11 @@ session drops back to VIEWING with the hardware untouched.
   external FACTR-Server processes — grav-comp leaders + API relay — when
   ``factr.launch.enabled``; start arms a pose-then-calibrate countdown — legacy,
   the services now auto-start with the daemon), ``{"cmd": "enable_grav_comp"}`` /
-  ``{"cmd": "disable_grav_comp"}`` (POST every leader relay to ramp its master
-  gain up / down over ~1s — energize / de-energize the always-running leaders),
+  ``{"cmd": "disable_grav_comp"}`` (POST every leader relay to ramp only its
+  gravity-compensation gain up / down over ~1s),
+  ``{"cmd": "enable_force_feedback"}`` /
+  ``{"cmd": "disable_force_feedback"}`` (ramp follower-force feedback on every
+  leader independently of gravity compensation),
   ``{"cmd": "shutdown"}``. stdin EOF == shutdown, so a dead dashboard can
   never leave an orphaned daemon holding robots.
 * state — ``<runtime_dir>/session.json``, atomically replaced (same pattern as the
@@ -375,6 +378,41 @@ def preflight_run(run_config: Config, phase: str) -> str | None:
     return None  # SKILL: no external dependency
 
 
+def follower_control_blocker(status: np.ndarray | None) -> str | None:
+    """Why a follower must not be commanded, or ``None`` when control may start.
+
+    ``NOT_ENABLED`` is intentionally commandable: the arm process performs the
+    explicit Enable/brake-release transition when it receives ``EnterControl``.
+    Every other non-READY state (manual/reduced/recovery/fault/booting/unknown)
+    is treated conservatively as observation-only.  The E-stop bit is checked
+    independently because it is the clearest operator-facing reason and remains
+    authoritative even if an SDK version reports a surprising status code.
+    """
+    if status is None:
+        return "status unavailable"
+    try:
+        vec = np.asarray(status, dtype=float).ravel()
+    except (TypeError, ValueError):
+        return "invalid status telemetry"
+    if vec.size < 2:
+        return "status unavailable"
+    if not np.all(np.isfinite(vec[:2])):
+        return "invalid status telemetry"
+    if float(vec[1]) >= 0.5:
+        return "E-stop pressed"
+
+    code = int(vec[0])
+    try:
+        import flexivrdk
+
+        name = flexivrdk.OperationalStatus(code).name
+    except Exception:  # noqa: BLE001 - unknown/future SDK status is fail-safe
+        return f"unrecognized operational status {code}"
+    if name in ("READY", "NOT_ENABLED"):
+        return None
+    return name.replace("_", " ").lower()
+
+
 # ---------------------------------------------------------------------------
 # The daemon
 # ---------------------------------------------------------------------------
@@ -601,8 +639,8 @@ class SessionDaemon:
         self.start_hardware()
         if self.factr_servers is not None:
             # Auto-start the FACTR-Server processes with the daemon: the leaders
-            # boot limp (master gain 0) and energize only on the dashboard's
-            # grav-comp ramp, so there is no pose-then-calibrate countdown to wait
+            # boot with gravity and feedback activation at 0; the dashboard
+            # enables each independently, so there is no calibration countdown to wait
             # out. Safe at fresh boot — self.run is None, no arms in control.
             # Never let a spawn failure take the whole daemon down before it comes
             # up: the arms/cameras must still serve even if the FACTR leaders don't.
@@ -731,6 +769,10 @@ class SessionDaemon:
                 self._handle_grav_comp(enable=True)
             elif kind == "disable_grav_comp":
                 self._handle_grav_comp(enable=False)
+            elif kind == "enable_force_feedback":
+                self._handle_force_feedback(enable=True)
+            elif kind == "disable_force_feedback":
+                self._handle_force_feedback(enable=False)
             else:
                 self.state.message = f"unknown command {kind!r}"
                 log.warning("unknown command: %r", cmd)
@@ -856,8 +898,33 @@ class SessionDaemon:
             extra.append(f"policy.port={port}")
         if phase == SKILL:
             extra.append(f"skill.name={skill_name}")
+        dry_run_note = None
         try:
             run_config = compose_config(run_overrides(self.overrides, task, phase, extra))
+            if phase == EVAL:
+                blockers = {}
+                for side, arm in run_config.arms.items():
+                    if not arm.control_enabled:
+                        continue
+                    reason = follower_control_blocker(self._arm_status(side))
+                    if reason is not None:
+                        blockers[side] = reason
+                if blockers:
+                    # One unsafe follower makes the entire rollout observation-only;
+                    # never partially execute a bimanual policy.  This config belongs
+                    # only to the consumer being built below.  Persistent hardware
+                    # keeps publishing telemetry from the session's original config.
+                    for arm in run_config.arms.values():
+                        arm.control_enabled = False
+                    detail = ", ".join(
+                        f"{side}: {reason}" for side, reason in sorted(blockers.items())
+                    )
+                    dry_run_note = (
+                        f"Eval dry run — follower control inhibited ({detail}). "
+                        "Policy requests and prediction visualization remain active; "
+                        "no arm will receive setpoints."
+                    )
+                    log.warning("%s", dry_run_note)
             coeffs = active_coeffs(run_config)
             # For a skill run this also loads the skill file, so a missing/corrupt
             # skill surfaces here as a refused start, not a crashed run.
@@ -945,7 +1012,7 @@ class SessionDaemon:
         self.state.phase = phase
         self.state.run_seq += 1
         self.state.run_started_ts = time.time()
-        self.state.message = None
+        self.state.message = dry_run_note
         self._clear_pending()  # a queued start firing later would just be refused
         log.info("run %d: %s task=%s%s (consumer pid %s; commanding %s)",
                  self.state.run_seq, phase, task,
@@ -1160,7 +1227,7 @@ class SessionDaemon:
     def _handle_grav_comp(self, enable: bool) -> None:
         """Trigger the leaders' own grav-comp gain ramp over HTTP (energize/de-energize).
 
-        The teleops boot limp and ramp their master output gain themselves —
+        The teleops ramp only their gravity-compensation gain themselves —
         0→1 on enable, 1→0 on disable — over ~1s when signalled; the daemon just
         fans a bodyless POST out to every configured server's per-side route
         (``/{enable,disable}_grav_comp_{side}``). Best-effort: a per-server
@@ -1202,10 +1269,10 @@ class SessionDaemon:
             ok.append(side)
             log.info("grav comp %s: signalled %s leader (%s:%s)",
                      verb, side, srv.host, srv.port)
-        # The calibration snapshot and the post-enable control-tick captures are
-        # FACTR's to surface: its relay streams them to the Rerun viewer under
-        # the "factr-diagnostics" application — nothing to fetch or log here.
-        # On disable the leader gain ramps to 0 → it goes limp and SAGS while
+        # FACTR carries its calibration/status diagnostics on the existing
+        # WebSocket stream; nothing extra is fetched or logged to Rerun here.
+        # On disable the gravity gain ramps to 0 → the leader loses gravity
+        # support and can SAG while
         # still streaming its (sagging) joint positions. A live collection run's
         # consumer would keep feeding that sag to the followers as fresh
         # setpoints → uncommanded real-robot motion. The daemon never commands
@@ -1230,9 +1297,67 @@ class SessionDaemon:
                 f"{', '.join(failed)} unreachable{halt_note}"
             )
         else:
-            gerund = "energizing" if enable else "de-energizing"
+            gerund = "adding gravity support" if enable else "removing gravity support"
             self.state.message = (
                 f"grav comp {verb}d — leader(s) {gerund} ({', '.join(ok)}){halt_note}"
+            )
+
+    def _handle_force_feedback(self, enable: bool) -> None:
+        """Ramp the follower-force term on every configured FACTR leader.
+
+        The FACTR relay owns the independent gain target and reports it from ``GET
+        /status_<side>``. This daemon only fans out bodyless POST triggers so the
+        dashboard never needs a second control connection to the hardware.
+        """
+        import http.client
+
+        verb = "enable" if enable else "disable"
+        if self.config.runtime.sim:
+            self.state.message = (
+                f"force feedback {verb}: sim runtime — no FACTR servers to signal"
+            )
+            log.info("force feedback %s requested but runtime is sim — no-op", verb)
+            return
+        servers = self.config.factr.servers
+        if not servers:
+            self.state.message = f"force feedback {verb}: no FACTR servers configured"
+            return
+        ok: list[str] = []
+        failed: list[str] = []
+        for side, srv in servers.items():
+            route = f"/{verb}_force_feedback_{side}"
+            try:
+                conn = http.client.HTTPConnection(
+                    srv.host, srv.port, timeout=srv.request_timeout_s
+                )
+                try:
+                    conn.request("POST", route)
+                    resp = conn.getresponse()
+                    resp.read()
+                    if resp.status != 200:
+                        raise http.client.HTTPException(f"HTTP {resp.status}")
+                finally:
+                    conn.close()
+            except (OSError, http.client.HTTPException) as exc:
+                failed.append(side)
+                log.error(
+                    "force feedback %s: POST http://%s:%s%s failed: %s",
+                    verb, srv.host, srv.port, route, exc,
+                )
+                continue
+            ok.append(side)
+            log.info(
+                "force feedback %s: signalled %s leader (%s:%s)",
+                verb, side, srv.host, srv.port,
+            )
+        if failed:
+            self.state.message = (
+                f"force feedback {verb}: {', '.join(ok) or 'none'} ok; "
+                f"{', '.join(failed)} unreachable"
+            )
+        else:
+            self.state.message = (
+                f"force feedback {verb}d — leader(s) {', '.join(ok)}"
             )
 
     def _tend_factr_servers(self) -> bool:
@@ -1639,7 +1764,7 @@ class SessionDaemon:
         streams (:meth:`_factr_stale_sides`) prove only that the producer is
         publishing, not that the leaders hold torque. Each server's
         ``GET /status_<side>`` must report ``grav_comp_enabled`` true: the leader
-        actually holding full grav comp (``force_gain ≥ 0.99``), not limp or
+        actually holding full grav comp (``grav_comp_gain ≥ 0.99``), not limp or
         mid-ramp. A side is returned when its server is unreachable, errors, or
         reports the leader not fully energized — fail safe, never start a
         recording against an un-energized or unknown leader. Empty under

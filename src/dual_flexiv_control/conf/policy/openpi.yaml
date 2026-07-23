@@ -17,3 +17,6 @@ kind: remote
 schema: openpi
 host: localhost
 port: 8000
+# Ride through brief transport resets, but surface persistent server tracebacks
+# (for example a policy/data schema mismatch) instead of holding forever.
+max_consecutive_errors: 3

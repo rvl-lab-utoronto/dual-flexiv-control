@@ -11,11 +11,13 @@ rate_hz: 1000.0
 # `control` is selected by the task and interpolated onto each arm by the rig.
 
 # One stream per proprio signal -> published as "<side>/<signal>".
-# Dims align with Flexiv RDK 1.8 RobotStates: q/dq/tau=DoF, wrench=6, eef(pose)=7, eef_vel(vel)=6.
+# Dims align with Flexiv RDK 1.8 RobotStates: q/dq/tau/tau_ext=DoF,
+# wrench=6, eef(pose)=7, eef_vel(vel)=6.
 streams:
   q:       { dim: 7, dtype: float64, capacity: 4096, rate_hz: 1000.0 }
   dq:      { dim: 7, dtype: float64, capacity: 4096, rate_hz: 1000.0 }
   tau:     { dim: 7, dtype: float64, capacity: 4096, rate_hz: 1000.0 }
+  tau_ext: { dim: 7, dtype: float64, capacity: 4096, rate_hz: 1000.0 }
   wrench:  { dim: 6, dtype: float64, capacity: 4096, rate_hz: 1000.0 }
   eef:     { dim: 7, dtype: float64, capacity: 4096, rate_hz: 1000.0 }
   eef_vel: { dim: 6, dtype: float64, capacity: 4096, rate_hz: 1000.0 }

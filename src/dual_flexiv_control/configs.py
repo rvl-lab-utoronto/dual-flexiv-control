@@ -7,7 +7,7 @@ so every node receives plain, picklable dataclasses across the spawn boundary.
 
 The hierarchy mirrors the stream paths discussed for the system:
 
-    arms.left.streams.{q,dq,tau,wrench,eef,eef_vel}   -> streams "left/<sig>"
+    arms.left.streams.{q,dq,tau,tau_ext,wrench,eef,eef_vel} -> "left/<sig>"
     arms.right.streams.{...}                           -> streams "right/<sig>"
     factr.servers.{left,right}                         -> streams "factr/<side>"
     arms.{left,right}.control                          -> per-arm ControlCfg
@@ -669,6 +669,14 @@ class PolicyCfg:
 
     infer_timeout_s: float = 10.0
     """Per-inference response timeout; a slow/hung server holds the arms instead."""
+
+    max_consecutive_errors: int = 3
+    """Abort an eval after this many consecutive inference failures.
+
+    A small retry budget rides through a transient connection reset or policy
+    server restart without hiding a persistent schema/checkpoint error forever.
+    Any successful inference resets the counter.
+    """
 
     replan_steps: int = 0
     """Actions executed from each returned chunk before re-inferring (receding

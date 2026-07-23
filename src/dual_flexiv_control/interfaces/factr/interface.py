@@ -37,7 +37,9 @@ from ...configs import RuntimeCfg
 from ...control.convention import convert_factr_to_rizon
 from ...control.convention import normalize_gripper
 from ...process import StreamProducerNode
+from ...streams.registry import StreamRegistry
 from ...streams.spec import StreamSpec
+from ...streams.stream import StreamReader
 from .client import FactrClient
 from .client import FactrError
 
@@ -130,6 +132,14 @@ class FactrInterface(StreamProducerNode):
         self.sim = runtime.sim
         self._client: FactrClient | None = None
         self._conventions: dict[str, JointConventionCfg] = {}
+        #: Read-only views of each follower's estimated external joint torque.
+        #: They are discovered lazily because the arm and FACTR processes start
+        #: concurrently. This process owns the duplex leader sockets, so it is the
+        #: one place that can carry follower torque back over those same sockets.
+        self._feedback_registry: StreamRegistry | None = None
+        self._feedback_readers: dict[str, StreamReader] = {}
+        self._feedback_last_seq: dict[str, int] = {}
+        self._feedback_errored: set[str] = set()
         #: sides currently failing, so outages log once (and once on recovery).
         self._errored: set[str] = set()
 
@@ -149,6 +159,7 @@ class FactrInterface(StreamProducerNode):
 
     def open_source(self) -> None:
         self._client = FactrClient.from_config(self.cfg, sim=self.sim)
+        self._feedback_registry = StreamRegistry(self.runtime_dir, self.run_id)
         for side, server in self.cfg.servers.items():
             if self.sim:
                 self._conventions[side] = JointConventionCfg(
@@ -224,9 +235,75 @@ class FactrInterface(StreamProducerNode):
             converted = np.append(q_dfc, normalize_gripper(jp[-1], conv))
             sample[raw_factr_stream_name(side)] = jp
             sample[factr_stream_name(side)] = converted
+            self._forward_force_feedback(side)
         return sample or None
 
+    def _forward_force_feedback(self, side: str) -> None:
+        """Send one fresh follower ``tau_ext`` sample to its matching leader.
+
+        ``RobotStates.tau_ext`` is the RDK estimate of torque exerted *on the
+        follower* by external contact. FACTR's original ``torque_feedback()`` law
+        expects the opposite convention (follower-on-environment) and negates its
+        input, so this transport negates RDK ``tau_ext`` once at the convention
+        boundary. The two negatives cancel: a positive external follower torque
+        produces a positive leader feedback torque. Measured actuator torque
+        (``tau``) includes the robot's own dynamics and is deliberately not used.
+
+        Samples are latest-wins and sent once each; if the arm stream disappears
+        or goes stale, sending stops and the leader teleop's short timeout removes
+        the feedback.
+        """
+        if self.sim or self._client is None or self._feedback_registry is None:
+            return
+        stream_name = f"{side}/tau_ext"
+        reader = self._feedback_readers.get(side)
+        if reader is None:
+            entry = self._feedback_registry.get(stream_name)
+            if entry is None:
+                return
+            try:
+                reader = StreamReader.attach(entry)
+            except FileNotFoundError:
+                return  # producer restarted between discovery and attach
+            self._feedback_readers[side] = reader
+        try:
+            samples = reader.latest()
+        except (FileNotFoundError, ValueError):
+            reader.close()
+            self._feedback_readers.pop(side, None)
+            self._feedback_last_seq.pop(side, None)
+            return
+        if samples.n == 0:
+            return
+        # Never keep replaying an old contact after the follower producer stalls.
+        max_age_ns = int(float(self.cfg.max_age_s) * 1e9)
+        if time.monotonic_ns() - samples.newest_t_ns > max_age_ns:
+            return
+        seq = int(samples.seq[-1])
+        if self._feedback_last_seq.get(side) == seq:
+            return
+        try:
+            # RDK: environment-on-follower. FACTR input: follower-on-environment.
+            self._client.send_force_feedback_for(side, -samples.newest)
+        except FactrError as exc:
+            if side not in self._feedback_errored:
+                self._feedback_errored.add(side)
+                log.warning(
+                    "[factr] %s follower external torque could not reach leader: %s",
+                    side, exc,
+                )
+            return
+        self._feedback_last_seq[side] = seq
+        if side in self._feedback_errored:
+            self._feedback_errored.discard(side)
+            log.info("[factr] %s follower external-torque feedback recovered", side)
+
     def close_source(self) -> None:
+        for reader in self._feedback_readers.values():
+            reader.close()
+        self._feedback_readers.clear()
+        self._feedback_last_seq.clear()
+        self._feedback_registry = None
         if self._client is not None:
             self._client.close()
             self._client = None

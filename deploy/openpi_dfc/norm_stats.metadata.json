@@ -1,0 +1,11 @@
+{
+  "dataset": "datasets/dfc/handover_bimanual_v2",
+  "parquet_sha256": "539ef5f964d9bee04ac039adc9b6afa6a81d911401aac573265432573a27545b",
+  "episodes": 8,
+  "frames": 936,
+  "action_horizon": 50,
+  "state_layout": "left.q[7], right.q[7]",
+  "action_layout": "left.q[7], left.gripper, right.q[7], right.gripper",
+  "joint_action_space": "delta from current observation.state",
+  "gripper_action_space": "absolute"
+}

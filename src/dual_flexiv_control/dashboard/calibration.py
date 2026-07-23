@@ -1,4 +1,4 @@
-"""Leader-arm joint-offset calibration for the dashboard's Calibrate tab.
+"""Leader-arm joint-offset calibration for the dashboard's Calibration controls.
 
 The FACTR leader→Rizon follower mapping (:func:`convert_factr_to_rizon`) adds a
 per-joint ``offsets_deg`` before the sign flip and wrap. Those offsets (and the
@@ -23,40 +23,26 @@ straight target the follower joint reads 0, and the sign flip multiplies zero, s
 take the one index). Un-captured joints keep their existing config offset, so a
 partial calibration is well-defined.
 
-A **live Rerun view** shows the current reference/target pose as the *solid* arm and
-the follower config the current leader maps to *under the working convention* as the
-*translucent ghost* — matching the metrics viewer, where solid = the real follower
-and the ghost tracks the leader command. When the convention is right and the leader
-is posed on target, the ghost snaps onto the solid arm. The view is its own gRPC
-recording embedded in the shared web viewer (same approach as replay).
-
-This module reads the FACTR WebSocket cache (honouring ``runtime.sim``) and renders —
-it never opens a robot connection. The only file it touches is the rig YAML, and only
-via the explicit **Sync to file** action (:func:`apply_to_rig`), which merges the
-measured convention in place (preserving comments + gripper endpoints). Mirrors
-``scripts/factr_gripper_calibrate.py`` (the gripper-endpoint sibling), for the arm
-joints and surfaced as a dashboard tab.
+This module reads the FACTR WebSocket cache (honouring ``runtime.sim``); it never
+opens a robot connection or creates a Rerun recording. The only file it touches is
+the rig YAML, and only via the explicit **Sync to file** action
+(:func:`apply_to_rig`), which merges the measured convention in place (preserving
+comments + gripper endpoints). Mirrors ``scripts/factr_gripper_calibrate.py`` (the
+gripper-endpoint sibling), for the arm joints and surfaced in dashboard controls.
 """
 
 from __future__ import annotations
 
-import os
 import threading
 from dataclasses import dataclass
 from dataclasses import replace
-from urllib.parse import quote
-
 import numpy as np
 
 from . import arms as _arms
-from .viewer import serve_grpc_checked
-
-CALIB_APP_ID = "dual-flexiv-calibration"
-DEFAULT_CALIB_GRPC_PORT = 9881  # replay uses 9880; metrics 9876
 
 _LOCK = threading.Lock()
-#: Cached leader client (keep-alive HTTP), rebuilt on demand — avoids reconnect
-#: churn under the tab's live-render fragment. Dropped by :func:`reset`.
+#: Cached leader client (persistent WebSocket), rebuilt on demand — avoids reconnect
+#: churn under the calibration live-render fragment. Dropped by :func:`reset`.
 _CLIENT = None
 
 
@@ -245,9 +231,9 @@ class RefPose:
 
 #: The calibration pose set. Design constraints: every joint takes BOTH a positive
 #: and a negative reference value somewhere in the set (so the per-joint sign flip
-#: is observable — at 0/±180 the two signs are indistinguishable), each pose stays
-#: well inside the Rizon 4s limits (J1 ±135°, J3 −112°..+159°, others ≥±165°), and
-#: the poses are easy to strike by hand (home, elbow bends, and two wrist twists).
+#: is observable — at 0/±180 the two signs are indistinguishable), every angle is a
+#: multiple of 90° so the target is easy to reproduce by eye, and each pose stays
+#: inside the Rizon 4s limits (J1 ±135°, J3 −112°..+159°, others ≥±165°).
 REFERENCE_POSES: tuple[RefPose, ...] = (
     RefPose(
         "Straight up",
@@ -256,24 +242,24 @@ REFERENCE_POSES: tuple[RefPose, ...] = (
     ),
     RefPose(
         "Elbow bend",
-        "Shoulder pitched 45° back, elbow bent 90° the opposite way, wrist bent 45° "
-        "so the last link points straight up again.",
-        (0.0, -45.0, 0.0, 90.0, 0.0, 45.0, 0.0),
+        "Shoulder pitched 90° back, elbow bent 90° the opposite way, and wrist bent "
+        "90° to make a simple square profile.",
+        (0.0, -90.0, 0.0, 90.0, 0.0, 90.0, 0.0),
     ),
     RefPose(
         "Reach forward",
-        "Mirror of Elbow bend: shoulder 45° forward, elbow 90° back, wrist 45° back.",
-        (0.0, 45.0, 0.0, -90.0, 0.0, -45.0, 0.0),
+        "Mirror of Elbow bend: shoulder 90° forward, elbow 90° back, and wrist 90° back.",
+        (0.0, 90.0, 0.0, -90.0, 0.0, -90.0, 0.0),
     ),
     RefPose(
         "Twist right",
-        "Elbow bent 90° with base, upper-arm, forearm and flange each rolled +45°.",
-        (45.0, 0.0, 45.0, 90.0, 45.0, 0.0, 45.0),
+        "Elbow bent 90° with base, upper-arm, forearm, and flange each rolled +90°.",
+        (90.0, 0.0, 90.0, 90.0, 90.0, 0.0, 90.0),
     ),
     RefPose(
         "Twist left",
-        "Mirror of Twist right: elbow bent 90°, every roll joint turned −45°.",
-        (-45.0, 0.0, -45.0, 90.0, -45.0, 0.0, -45.0),
+        "Mirror of Twist right: elbow bent 90°, every roll joint turned −90°.",
+        (-90.0, 0.0, -90.0, 90.0, -90.0, 0.0, -90.0),
     ),
 )
 
@@ -642,135 +628,13 @@ def apply_to_rig(
     return path
 
 
-# ---------------------------------------------------------------------------
-# Live Rerun view (dedicated gRPC recording, embedded in the shared web viewer)
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class CalibViewer:
-    #: The SHARED metrics web-viewer port; calibration has no web host of its own,
-    #: it embeds that viewer pointed at ``grpc_uri`` (same approach as replay).
-    web_port: int
-    grpc_uri: str
-
-    @property
-    def web_url(self) -> str:
-        base = f"http://127.0.0.1:{self.web_port}"
-        return f"{base}/?url={quote(self.grpc_uri, safe='')}&persist=0&renderer=webgl"
-
-
-_VIEWER: "CalibViewer | None" = None
-_REC = None  # the served, live-updated recording (kept alive module-scoped)
-_T = 0.0     # monotonic-ish frame time (incremented per render; Date/time avoided)
-
-
-def grpc_port_from_env() -> int:
-    """Calibration gRPC-server port, honouring ``DFC_CALIB_GRPC_PORT``."""
-    return int(os.environ.get("DFC_CALIB_GRPC_PORT", DEFAULT_CALIB_GRPC_PORT))
-
-
-def _blueprint():
-    import rerun.blueprint as rrb
-
-    return rrb.Blueprint(
-        rrb.Spatial3DView(
-            origin="/robot",
-            name="Calibration — reference pose (solid) vs live leader (ghost)",
-        ),
-        collapse_panels=True,
-    )
-
-
-def start_calib_viewer(web_port: int, grpc_port: int | None = None) -> CalibViewer:
-    """Serve the calibration gRPC recording, embedded in the SHARED web viewer.
-
-    One persistent recording (not fresh-per-frame like replay): the live view is a
-    single arm updated in place, like the metrics scene. The static robot geometry is
-    logged once here; :func:`render` updates the poses. Idempotent while up; after
-    :func:`reset` (paired with :func:`~.viewer.teardown`) the next call re-serves.
-    """
-    import rerun as rr
-
-    from . import robot_view
-
-    global _VIEWER, _REC
-    with _LOCK:
-        if _VIEWER is not None:
-            return _VIEWER
-        gp = grpc_port or grpc_port_from_env()
-        rec = rr.RecordingStream(CALIB_APP_ID, recording_id="calibration")
-        uri = serve_grpc_checked(
-            lambda: rec.serve_grpc(
-                grpc_port=gp, default_blueprint=_blueprint(), cors_allow_origin=["*"]
-            ),
-            gp,
-            what="calibration",
-        )
-        try:
-            robot_view.log_scene(rec)  # static pedestal + arm geometry (home)
-        except Exception:  # noqa: BLE001 - missing URDF must not break the tab
-            pass
-        rec.send_blueprint(_blueprint())
-        _REC = rec
-        _VIEWER = CalibViewer(web_port=web_port, grpc_uri=uri)
-        return _VIEWER
-
-
-def render(
-    side: str,
-    offsets_deg: list[float],
-    sign_flip_joints: list[int],
-    target_q_deg: list[float] | None = None,
-) -> np.ndarray:
-    """Render one live frame; return the leader's commanded follower config (rad).
-
-    Ghost = the follower config the *current leader* maps to under the in-progress
-    ``offsets_deg`` + ``sign_flip_joints`` (the leader's true position, as in the
-    metrics viewer where the ghost tracks the leader command); solid = the reference
-    pose being calibrated against (``target_q_deg``, degrees; straight/home when
-    ``None``). When the convention is right and the leader is on target, the ghost
-    snaps onto the solid arm. Raises if the viewer is not started or the leader
-    cannot be read.
-    """
-    from . import robot_view
-
-    global _T
-    # Capture the recording + timeline tick under the lock: keeps _T atomic across
-    # sessions and avoids a use-after-reset if Reset services nulls _REC mid-render.
-    with _LOCK:
-        rec = _REC
-        if rec is None:
-            raise RuntimeError("calibration viewer not started")
-        _T += 1.0
-        t = _T
-    q = commanded_follower_q(side, offsets_deg, sign_flip_joints)  # HTTP read: outside the lock
-    home = np.zeros_like(q)
-    target = home if target_q_deg is None else np.radians(
-        np.asarray((list(target_q_deg) + [0.0] * len(q))[: len(q)], dtype=np.float64)
-    )
-    # Pose BOTH solid arms so the non-calibrated arm is NOT tinted stale-red ("no live
-    # data"): the calibrated side shows the reference pose, the other rests at home.
-    real = {s: (target if s == side else home) for s in ("left", "right")}
-    robot_view.update_poses(rec, real, {side: q}, t)
-    rec.flush()
-    return q
-
-
 def reset() -> None:
-    """Drop the viewer + client singletons so the next use re-serves/reconnects.
-
-    Paired with :func:`~.viewer.teardown` — that global ``rerun_shutdown`` releases
-    this gRPC port too, so after *Reset services* the next render rebinds a fresh
-    calibration server (reusing the shared web viewer).
-    """
-    global _VIEWER, _REC, _CLIENT
+    """Close and forget the cached leader client."""
+    global _CLIENT
     with _LOCK:
         if _CLIENT is not None:
             try:
                 _CLIENT.close()
             except Exception:  # noqa: BLE001
                 pass
-        _VIEWER = None
-        _REC = None
         _CLIENT = None

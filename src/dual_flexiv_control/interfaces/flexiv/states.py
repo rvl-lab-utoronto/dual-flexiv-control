@@ -10,6 +10,7 @@ targeted (2.x renamed ``tcp_vel``→``tcp_twist`` and split the external wrench 
     q            q                     7    link-side joint positions   [rad]
     dq           dq                    7    link-side joint velocities  [rad/s]
     tau          tau                   7    measured joint torques      [Nm]
+    tau_ext      tau_ext               7    estimated external torques [Nm]
     wrench       ext_wrench_in_tcp     6    ext. TCP wrench, TCP frame  [N,Nm]
                  (or ext_wrench_in_world)   ext. TCP wrench, world frame
     eef          tcp_pose             7    TCP pose [x,y,z,qw,qx,qy,qz][m]
@@ -29,12 +30,13 @@ _WRENCH_FIELD = {"local": "ext_wrench_in_tcp", "world": "ext_wrench_in_world"}
 
 
 def map_states(rs, wrench_frame: str, dtype: str = "float64") -> dict[str, np.ndarray]:
-    """Extract the six proprio vectors from one arm's ``RobotStates``."""
+    """Extract the seven proprio vectors from one arm's ``RobotStates``."""
     wrench_attr = _WRENCH_FIELD[wrench_frame]
     return {
         "q": np.asarray(rs.q, dtype=dtype),
         "dq": np.asarray(rs.dq, dtype=dtype),
         "tau": np.asarray(rs.tau, dtype=dtype),
+        "tau_ext": np.asarray(rs.tau_ext, dtype=dtype),
         "wrench": np.asarray(getattr(rs, wrench_attr), dtype=dtype),
         "eef": np.asarray(rs.tcp_pose, dtype=dtype),
         "eef_vel": np.asarray(rs.tcp_vel, dtype=dtype),

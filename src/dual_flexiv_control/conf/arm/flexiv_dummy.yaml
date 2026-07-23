@@ -11,6 +11,7 @@ streams:
   q:       { dummy: true }
   dq:      { dummy: true }
   tau:     { dummy: true }
+  tau_ext: { dummy: true }
   wrench:  { dummy: true }
   eef:     { dummy: true }
   eef_vel: { dummy: true }

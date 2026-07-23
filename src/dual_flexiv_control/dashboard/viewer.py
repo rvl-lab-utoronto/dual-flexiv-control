@@ -38,10 +38,9 @@ DEFAULT_WEB_PORT = 9090
 #: gRPC proxy, which streams the *entire retained store* from the start before it
 #: catches up to live — so this cap, not the plots' visible-time window (which is
 #: render-only; see :mod:`~.blueprints`), is what sets reload cost. The mirror logs
-#: ~3.4 MB/min (measured), so the old 256 MiB held ~75 min of history and a refresh
-#: replayed for *minutes*. 8 MiB holds ~2 min, bounding the backfill without
-#: reordering Rerun's store-initialization messages. Override with
-#: ``DFC_DASHBOARD_MEMORY_LIMIT``.
+#: ~3.4 MB/min (measured). Keep enough headroom for the complete static robot-scene
+#: initialization: an overly small cap can evict/reorder its geometry chunks before
+#: a freshly-loaded viewer receives them. Override with ``DFC_DASHBOARD_MEMORY_LIMIT``.
 DEFAULT_MEMORY_LIMIT = os.environ.get("DFC_DASHBOARD_MEMORY_LIMIT", "256MiB")
 
 # Process-global singletons, with two deliberately-split lifetimes:
@@ -208,8 +207,9 @@ def teardown() -> None:
     ``rr.rerun_shutdown()`` is global: it stops **all** served gRPC servers (the
     metrics server here *and* the replay server in :mod:`~.replay`) and drops their
     in-memory recordings, freeing those ports for a clean re-serve. The web-viewer
-    HTTP host is intentionally left running (it cannot be stopped in-process and is
-    stateless), so a subsequent :func:`start_servers` reuses it.
+    HTTP host is intentionally left
+    running (it cannot be stopped in-process and is stateless), so a subsequent
+    :func:`start_servers` reuses it.
 
     This only releases the servers. Callers that cached the now-dead recording — the
     robot scene (:func:`~.robot_view.reset`) and the replay viewer

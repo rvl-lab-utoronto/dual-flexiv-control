@@ -1,6 +1,6 @@
 """Canonical proprioception signal definitions for a Flexiv arm.
 
-These are the six per-arm signals the brain observes, mapped one-to-one onto
+These are the seven per-arm signals the brain observes, mapped one-to-one onto
 Flexiv RDK 1.8 ``RobotStates`` fields (see ``interfaces.flexiv.states``). Each
 becomes its own stream, named ``"<side>/<signal>"`` (e.g. ``"right/tau"``).
 
@@ -33,7 +33,9 @@ class Side(str, Enum):
 
 
 #: Stable ordering / canonical set of the proprio signals.
-PROPRIO_SIGNALS: tuple[str, ...] = ("q", "dq", "tau", "wrench", "eef", "eef_vel")
+PROPRIO_SIGNALS: tuple[str, ...] = (
+    "q", "dq", "tau", "tau_ext", "wrench", "eef", "eef_vel",
+)
 
 
 def stream_name(side: "Side | str", signal: str) -> str:

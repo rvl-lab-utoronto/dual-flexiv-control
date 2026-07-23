@@ -23,7 +23,9 @@ own process at its own rate:
    publishes both its raw Dynamixel reading and its converted DFC/Rizon pose. The
    socket is duplex: `FactrClient.send_force_feedback` pushes follower external
    joint torques back up it (joint-space `force_feedback` frames) for the leader's
-   force-feedback term.
+   force-feedback term. At that boundary, RDK's environment-on-follower `tau_ext`
+   is negated into FACTR's follower-on-environment convention; FACTR's original
+   feedback equation negates it again, preserving the reflected torque direction.
 
 ## Architecture
 
@@ -40,7 +42,8 @@ own process at its own rate:
   count + per-slot sequence stamps); readers re-validate each slot so a buffer
   that laps a slow reader degrades to "freshest valid suffix", never corruption.
 * **One stream per signal, per arm.** Each arm publishes `q`, `dq`, `tau`,
-  `wrench`, `eef`, `eef_vel` as separate streams named `left/…` and `right/…`.
+  `tau_ext`, `wrench`, `eef`, `eef_vel` as separate streams named `left/…`
+  and `right/…`.
 * **One stream per camera view.** Each ZED camera publishes one stream per
   *view* — `left`/`right` RGB (`uint8`, `H×W×3`) and optional `depth` (`float32`,
   `H×W`, metres) — named `cam/<camera>/<view>` (e.g. `cam/wrist_left/left`,
@@ -59,6 +62,7 @@ own process at its own rate:
 | `<side>/q`        | 7   | `q` (link-side joint positions)        |
 | `<side>/dq`       | 7   | `dq` (link-side joint velocities)      |
 | `<side>/tau`      | 7   | `tau` (measured joint torques)         |
+| `<side>/tau_ext`  | 7   | `tau_ext` (estimated external joint torques) |
 | `<side>/wrench`   | 6   | `ext_wrench_in_tcp` (TCP frame) — or `ext_wrench_in_world` (world) via `--wrench-frame` |
 | `<side>/eef`      | 7   | `tcp_pose` `[x,y,z,qw,qx,qy,qz]`       |
 | `<side>/eef_vel`  | 6   | `tcp_vel` `[v(3), ω(3)]`               |
@@ -189,15 +193,13 @@ convention internally for leader gravity compensation. Its arm YAML stores the c
 raw-Dynamixel→DFC convention (offsets, sign flips, wrapping, trailing-field handling,
 and gripper endpoints), the distinct DFC-straight and FACTR-model reference coordinates,
 and the explicit DFC→FACTR transform (including FACTR's joint-4 `pi/2`). DFC loads the
-raw→DFC part of this contract from the leader's `GET /calibration_<side>` route and
-crashes if it is absent or malformed; no leader conversion values live in the follower
-rig YAML and calibration is not pushed between services.
+raw→DFC part of this contract from the diagnostics frame sent first on the leader's
+WebSocket and crashes if it is absent or malformed; no leader conversion values live
+in the follower rig YAML and calibration is not pushed between services.
 
-FACTR's diagnostics never pass through DFC: its API relay streams the calibration
-snapshot, the post-enable control-tick captures, and the live master gain straight to
-the dashboard's Rerun gRPC proxy under the separate application id `factr-diagnostics`
-(sink URL exported as `FACTR_RERUN_URL` by the session daemon's launcher). Select that
-recording in the embedded viewer to inspect them.
+FACTR diagnostics remain on the leader's existing WebSocket stream. They are used
+for calibration and dashboard status but are not published as a separate Rerun
+recording.
 
 With `arm.control_enabled=true`, the brain posts the already-converted FACTR pose as
 the Rizon qpos setpoint. A hardware-free run:
@@ -358,10 +360,9 @@ src/dual_flexiv_control/
 
 ## Status / TODO
 
-* FACTR streams **joint positions** as typed JSON frames on one persistent
-  WebSocket per leader, and accepts `force_feedback` frames back on the same
-  socket. Full FACTR diagnostics go straight from the relay to Rerun; DFC only
-  fetches the calibration contract over HTTP at startup.
+* FACTR streams **joint positions** and diagnostics as typed JSON frames on one
+  persistent WebSocket per leader, and accepts `force_feedback` frames back on
+  the same socket. The diagnostics frame carries the calibration contract.
 * **Control is implemented** over the control channel (`control/`). `qpos` FACTR
   teleop is verified end-to-end in sim; `qvel`/`end_effector`/`eef_vel`/`force` send
   paths are wired and verified against the flexivrdk 1.8 docs but **not yet

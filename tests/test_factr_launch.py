@@ -131,7 +131,10 @@ def test_countdown_gates_the_spawn(tmp_path, spawned):
     assert not ok and "stop them first" in detail
 
 
-def test_spawn_commands_and_logs(tmp_path, spawned):
+def test_spawn_commands_and_logs(tmp_path, spawned, monkeypatch):
+    # Even a stale parent-shell setting must not make FACTR create a background
+    # recording on the dashboard's Rerun endpoint.
+    monkeypatch.setenv("FACTR_RERUN_URL", "rerun+http://127.0.0.1:9876/proxy")
     sup = _running_supervisor(tmp_path, spawned)
     by_name = {u.name: u for u in sup.units}
     left = by_name["teleop:left"].proc
@@ -145,6 +148,7 @@ def test_spawn_commands_and_logs(tmp_path, spawned):
     assert script.endswith("exec /usr/bin/python3 -m src.factr_teleop.factr_teleop.factr_rizon_teleop")
     assert left.kwargs["cwd"] == str(tmp_path / "FACTR_Teleop")
     assert left.kwargs["start_new_session"] is True
+    assert all(proc.kwargs["env"]["FACTR_RERUN_URL"] == "disabled" for proc in spawned)
 
     # Teleop stdout (the 500 Hz screen-clear) is discarded; the API's is kept.
     assert left.kwargs["stdout"] is subprocess.DEVNULL

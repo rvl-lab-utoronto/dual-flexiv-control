@@ -6,8 +6,6 @@ from __future__ import annotations
 import json
 import threading
 import time
-from http.server import BaseHTTPRequestHandler
-from http.server import HTTPServer
 from types import SimpleNamespace
 
 import numpy as np
@@ -86,37 +84,16 @@ def test_parse_wrong_length_raises():
 # -- live WebSocket (sync server stands in for one leader's FACTR relay) ------
 
 
-def _serve_calibration():
-    """HTTP server standing in for the relay's ``GET /calibration_<side>`` route.
-
-    Production serves this from the same FastAPI app as the WebSocket; the test
-    stand-ins are separate servers because the sync websockets helper does not
-    speak plain HTTP.
-    """
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *_):
-            pass
-
-        def do_GET(self):
-            side = self.path.split("_", 1)[1]
-            body = json.dumps(dict(_CALIBRATION, side=side)).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-    server = HTTPServer(("127.0.0.1", 0), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    return server
-
-
-def _serve(side, payload, close_after=None):
+def _serve(side, payload, diagnostics=None, close_after=None):
+    diagnostics = diagnostics or {
+        "type": "diagnostics", "side": side, **_CALIBRATION,
+    }
     state = SimpleNamespace(connections=0, received=[])
 
     def handler(websocket):
         state.connections += 1
         try:
+            websocket.send(json.dumps(diagnostics))
             sent = 0
             while True:
                 websocket.send(json.dumps({
@@ -179,19 +156,24 @@ def test_server_client_reconnects_after_stream_closes():
 
 
 def test_server_client_calibration_contract():
-    """get_calibration() returns the leader-owned raw→DFC contract verbatim."""
-    server = _serve_calibration()
-    host, port = server.server_address
+    """Calibration comes from diagnostics on the existing WebSocket, not HTTP."""
+    diagnostics = {
+        "type": "diagnostics", "side": "left", **_CALIBRATION,
+        "raw_q_rad": list(range(6)),
+    }
+    server = _serve("left", list(range(7)), diagnostics=diagnostics)
+    host, port = _server_address(server)
     c = _server_client(side="left", host=host, port=port)
     try:
         data = c.get_calibration()
         assert data["available"] is True and data["side"] == "left"
         assert data["dfc_raw_offsets_deg"] == [0.0] * 6
         assert data["dfc_drop_trailing"] == 1
+        assert data["raw_q_rad"] == list(range(6))
+        assert c._http_conn is None
     finally:
         c.close()
         server.shutdown()
-        server.server_close()
 
 
 def test_group_queries_two_servers():
@@ -423,6 +405,75 @@ def test_factr_interface_polls_live_sides_and_tolerates_a_dead_one():
         node.close_source()
     finally:
         left_srv.shutdown()
+
+
+def test_factr_interface_forwards_each_fresh_external_torque_sample_once(tmp_path):
+    """The FACTR node converts RDK tau_ext into FACTR's opposite sign convention."""
+    from dual_flexiv_control.interfaces.factr import FactrInterface
+    from dual_flexiv_control.streams.registry import StreamRegistry
+    from dual_flexiv_control.streams.spec import StreamSpec
+    from dual_flexiv_control.streams.stream import StreamWriter
+
+    cfg = _factr_cfg(("localhost", 5000), ("localhost", 5001))
+    run_id = "feedback-test"
+    node = FactrInterface(
+        cfg, SimpleNamespace(runtime_dir=str(tmp_path), sim=False), run_id
+    )
+
+    class Client:
+        def __init__(self):
+            self.sent = []
+
+        def send_force_feedback_for(self, side, tau):
+            self.sent.append((side, np.asarray(tau).copy()))
+
+        def close(self):
+            pass
+
+    client = Client()
+    node._client = client
+    registry = StreamRegistry(str(tmp_path), run_id)
+    node._feedback_registry = registry
+    writer = StreamWriter.create(
+        StreamSpec("right/tau_ext", dim=7, capacity=8, dtype="float64"),
+        run_id,
+        registry,
+    )
+    try:
+        tau = np.arange(7, dtype=np.float64) + 0.25
+        writer.write(tau)
+        node._forward_force_feedback("right")
+        assert len(client.sent) == 1
+        assert client.sent[0][0] == "right"
+        # RDK reports environment-on-follower torque. FACTR's original feedback
+        # equation expects follower-on-environment and negates that input itself,
+        # so the transport must invert once for a same-direction net reflection.
+        np.testing.assert_allclose(client.sent[0][1], -tau)
+
+        node._forward_force_feedback("right")
+        assert len(client.sent) == 1  # a sample is never replayed
+
+        writer.write(tau + 1.0, time.monotonic_ns() - int(2e9))
+        node._forward_force_feedback("right")
+        assert len(client.sent) == 1  # stale contact is never forwarded
+    finally:
+        node.close_source()
+        writer.close()
+        writer.unlink()
+
+
+def test_flexiv_state_mapping_exposes_external_joint_torque():
+    from dual_flexiv_control.interfaces.flexiv.states import map_states
+
+    tau_ext = np.linspace(-3.0, 3.0, 7)
+    states = SimpleNamespace(
+        q=np.zeros(7), dq=np.zeros(7), tau=np.ones(7), tau_ext=tau_ext,
+        ext_wrench_in_tcp=np.zeros(6), ext_wrench_in_world=np.zeros(6),
+        tcp_pose=np.zeros(7), tcp_vel=np.zeros(6),
+    )
+    mapped = map_states(states, "local")
+    np.testing.assert_allclose(mapped["tau_ext"], tau_ext)
+    assert not np.shares_memory(mapped["tau_ext"], mapped["tau"])
 
 
 class _StubSamples:

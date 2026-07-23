@@ -119,6 +119,7 @@ class EvalLoop:
         frequency_hz: float = 15.0,
         num_timesteps: int = 1,
         replan_steps: int = 0,
+        max_consecutive_errors: int = 3,
         on_chunk=None,
         horizon_arms: dict[str, ArmCfg] | None = None,
     ) -> None:
@@ -130,6 +131,7 @@ class EvalLoop:
         self.frequency_hz = frequency_hz
         self.num_timesteps = max(1, int(num_timesteps))
         self.replan_steps = int(replan_steps)
+        self.max_consecutive_errors = max(1, int(max_consecutive_errors))
         #: callable ``{side: ("q"|"eef", vector)} -> None``, invoked once per
         #: inference with each arm's estimated chunk-end state (viz hook — EvalNode
         #: publishes them on ``eval/<side>/{q,eef}_horizon``). Never fatal.
@@ -142,6 +144,7 @@ class EvalLoop:
         self._pending: deque[np.ndarray] = deque()
         self._warned_kinds: set[str] = set()
         self._holds = 0  # consecutive held ticks, for ~1 Hz hold diagnostics
+        self._consecutive_policy_errors = 0
         #: streamed absolute fields to hold at the measured value, per side (e.g.
         #: force's pose_d), and the latest measured values captured at inference.
         self._hold = {s: action_hold_fields(a.control) for s, a in control_arms.items()}
@@ -183,8 +186,21 @@ class EvalLoop:
             try:
                 chunk = self.policy.infer(observation)
             except PolicyError as exc:
-                log.warning("policy inference failed; holding this tick: %s", exc)
+                self._consecutive_policy_errors += 1
+                if self._consecutive_policy_errors >= self.max_consecutive_errors:
+                    raise PolicyError(
+                        "policy inference failed "
+                        f"{self._consecutive_policy_errors} consecutive times; "
+                        f"aborting eval. Last error:\n{exc}"
+                    ) from exc
+                log.warning(
+                    "policy inference failed (%d/%d); holding this tick: %s",
+                    self._consecutive_policy_errors,
+                    self.max_consecutive_errors,
+                    exc,
+                )
                 return False
+            self._consecutive_policy_errors = 0
             self.inferences += 1
             chunk = self._validate_chunk(chunk)
             self._announce_horizon(chunk, snapshot)
@@ -423,6 +439,7 @@ class EvalNode(ProcessNode):
                 frequency_hz=self.task.eval.frequency_hz,
                 num_timesteps=self.task.eval.num_timesteps,
                 replan_steps=self.policy_cfg.replan_steps,
+                max_consecutive_errors=self.policy_cfg.max_consecutive_errors,
                 on_chunk=publish_horizon if horizon_writers else None,
                 horizon_arms=horizon_arms,
             )

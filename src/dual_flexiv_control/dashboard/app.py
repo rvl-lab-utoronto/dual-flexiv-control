@@ -1,11 +1,11 @@
-"""Streamlit page: experiment controls on the left, live Rerun viewer on the right.
+"""Streamlit page: swappable controls on the left, selectable content on the right.
 
 Run via the ``dfc-dashboard`` console script (which wraps ``streamlit run`` — see
 :mod:`~.launch`), not ``python app.py``.
 
-Layout matches the spec: a left control column (task dropdown over ``conf/task``,
-Collection / Eval launch buttons, run status) and a right area holding the
-embedded Rerun web viewer where eval/collection metrics stream live.
+The left column switches between Experiment and Calibration controls. The right
+column independently switches between Viewer, Cameras, Storage, and Logs. Both
+control modes keep the same experiment viewer visible.
 
 Streamlit reruns this module top-to-bottom on every interaction, so the Rerun
 servers and the run registry are created once behind ``st.cache_resource`` (one
@@ -15,6 +15,7 @@ embedded viewer updates itself from the gRPC stream independently of these rerun
 
 from __future__ import annotations
 
+import math
 import os
 import time
 
@@ -47,6 +48,9 @@ from dual_flexiv_control.dashboard.cameras import discover_camera_views
 from dual_flexiv_control.dashboard.cameras import get_frame
 from dual_flexiv_control.dashboard.cameras import read_camera_statuses
 from dual_flexiv_control.dashboard.editor import open_in_vscode
+from dual_flexiv_control.dashboard.policy_servers import PolicyServerInfo
+from dual_flexiv_control.dashboard.policy_servers import inspect_policy_server
+from dual_flexiv_control.dashboard.policy_servers import policy_server_help
 from dual_flexiv_control.dashboard.ssh_hosts import discover_ssh_hosts
 from dual_flexiv_control.dashboard.tasks import RigInfo
 from dual_flexiv_control.dashboard.tasks import TaskInfo
@@ -59,22 +63,39 @@ from dual_flexiv_control.dashboard.viewer import start_servers
 from dual_flexiv_control.dashboard.viewer import teardown as _teardown_servers
 
 VIEWER_HEIGHT_PX = 1400
-#: Camera-tab refresh cadence (live shm reads pace themselves; missing → error tile).
+CONTROL_MODES = ("Experiment", "Calibration")
+CONTENT_VIEWS = ("Viewer", "Cameras", "Storage", "Logs")
+#: Camera-view refresh cadence (live shm reads pace themselves; missing → error tile).
 CAMERA_REFRESH = "0.15s"
-#: Logs-tab tail cadence while "Follow" is on (a running system logs a beat every ~2s).
+#: Logs-view tail cadence while "Follow" is on (a running system logs a beat every ~2s).
 LOG_REFRESH = "2s"
 
-#: Trim the default top padding, style the tab bar (its labels use monochrome
-#: Material icons — forced white so the active tab's accent colour never tints
-#: them), and enlarge the
-#: per-episode action icons in the Storage tab (scoped via the
-#: ``st-key-stor_rows`` container class).
+#: Trim the default top padding and enlarge per-episode action icons in Storage
+#: (scoped via the ``st-key-stor_rows`` container class).
 _PAGE_CSS = """
 <style>
 [data-testid="stMainBlockContainer"], .block-container {
     padding-top: 1.5rem !important;
 }
-.stTabs [data-baseweb="tab-list"] button { padding: 1rem 2.2rem; }
+/* Make the two workspace selectors prominent and easy to hit. Streamlit adds
+   each widget key as a stable st-key-* wrapper, so this stays scoped to the
+   control/content navigation rather than enlarging every dashboard button. */
+.st-key-control_workspace button,
+.st-key-content_workspace button {
+    min-height: 3.5rem !important;
+    padding: 0.85rem 1.25rem !important;
+    font-size: 1.35rem !important;
+    font-weight: 650 !important;
+}
+.st-key-control_workspace button div,
+.st-key-content_workspace button div,
+.st-key-control_workspace button p,
+.st-key-content_workspace button p,
+.st-key-control_workspace button span,
+.st-key-content_workspace button span {
+    font-size: inherit !important;
+    font-weight: inherit !important;
+}
 .st-key-collection_launch button {
     background-color: #2563eb !important;
     border-color: #2563eb !important;
@@ -95,17 +116,40 @@ _PAGE_CSS = """
     background-color: #15803d !important;
     border-color: #15803d !important;
 }
-.stTabs [data-baseweb="tab-list"] button [data-testid="stMarkdownContainer"] p {
-    font-size: 1.35rem;
-    font-weight: 600;
-}
-/* The markdown-rendered Material icons in the tab labels (span[role=img]):
-   keep them white even on the active tab (whose text takes the accent color). */
-.stTabs [data-baseweb="tab-list"] button [data-testid="stMarkdownContainer"] span[role="img"] {
-    font-size: 1.5rem;
-    color: #fafafa !important;
-}
 .st-key-stor_rows .stButton button p { font-size: 1.35rem; }
+/* Give the policy-server details a compact circled-i trigger. */
+.st-key-policy_server_details [data-testid="stTooltipIcon"] svg {
+    display: none;
+}
+.st-key-policy_server_details [data-testid="stTooltipIcon"] button::before {
+    content: "i";
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1rem;
+    height: 1rem;
+    border: 1px solid currentColor;
+    border-radius: 50%;
+    font-family: serif;
+    font-size: 0.72rem;
+    font-weight: 700;
+    line-height: 1;
+}
+/* Streamlit mounts help popovers in a document-level portal. :has() ties the
+   portal back to this trigger so other dashboard help remains compact. */
+body:has(.st-key-policy_server_details [data-testid="stTooltipHoverTarget"]:hover)
+    [data-testid="stTooltipContent"],
+body:has(.st-key-policy_server_details [data-testid="stTooltipHoverTarget"]:focus-within)
+    [data-testid="stTooltipContent"],
+body:has(.st-key-policy_server_details [aria-describedby])
+    [data-testid="stTooltipContent"] {
+    box-sizing: border-box;
+    width: min(640px, calc(100vw - 3rem)) !important;
+    max-width: min(640px, calc(100vw - 3rem)) !important;
+    height: min(450px, 70vh) !important;
+    max-height: min(450px, 70vh) !important;
+    padding: 0.75rem 1.5rem !important;
+}
 </style>
 """
 
@@ -185,16 +229,6 @@ def _replay_viewer() -> _replay.ReplayViewer:
 
 
 @st.cache_resource
-def _calibration_viewer() -> _calibration.CalibViewer:
-    """Start (once) the calibration gRPC recording, embedded in the shared web viewer.
-
-    Its own recording (isolated from metrics/replay) so the Calibrate tab can pose an
-    arm at the leader's commanded config without disturbing the live run scene.
-    """
-    return _calibration.start_calib_viewer(web_port=_servers().web_port)
-
-
-@st.cache_resource
 def _registry() -> _runner.RunRegistry:
     return _runner.RunRegistry()
 
@@ -210,10 +244,9 @@ def _reset_services(registry: _runner.RunRegistry) -> bool:
        the metrics mirror, so nothing logs into the recording while it is torn down.
     3. Drop the cached Hydra composes so arms + cameras re-read ``conf`` (and any
        changed ``runtime.sim``) on next use.
-    4. Gracefully tear down the Rerun gRPC data servers (metrics + replay) and drop
-       their recordings via :func:`~.viewer.teardown`, then reset the dependents that
-       cached the now-dead recording (robot scene, replay viewer) and clear the
-       ``st.cache_resource`` handles so they rebind.
+    4. Gracefully tear down the Rerun gRPC data servers (metrics + replay) and
+       drop their recordings via :func:`~.viewer.teardown`, then reset dependents
+       that cached dead recordings and clear their ``st.cache_resource`` handles.
     5. Re-serve the metrics gRPC server, re-attach the robot scene, and send the idle
        welcome layout; respawn the daemon (fresh robot connections) + the mirror.
        The web-viewer HTTP host is reused throughout (it cannot be rebound
@@ -227,18 +260,50 @@ def _reset_services(registry: _runner.RunRegistry) -> bool:
     _cameras.reset()
     _storage.reset()
     _skills.reset()
-    _teardown_servers()          # rerun_shutdown: releases metrics + replay + calib gRPC ports
+    _teardown_servers()          # rerun_shutdown: releases metrics + replay gRPC ports
     _robot.reset()               # forget the dead metrics recording
     _replay.reset()              # forget the (now released) replay server
-    _calibration.reset()         # forget the (now released) calibration server + leader client
+    _calibration.reset()         # close the cached leader client
     _servers.clear()             # st.cache_resource: re-run start_servers on next call
     _replay_viewer.clear()
-    _calibration_viewer.clear()
     _servers()                   # re-serve metrics gRPC + re-attach robot scene + welcome
     _runner.reset_viewer()       # idle welcome blueprint + README + reset event log
     # Fresh daemon on the (possibly re-read) rig/sim; ensure restarts the mirror too.
     registry.ensure_session(_arms.active_rig(), _arms.runtime_is_sim())
     return True
+
+
+def _eval_launchable(view) -> bool:
+    """Whether Eval can start from the dashboard's current session view.
+
+    Eval needs follower observations and task cameras, but it gets actions from
+    the policy server rather than the FACTR leaders.  In particular, leader
+    health must never become a launch gate.  A connected follower reporting an
+    E-stop/fault is still launchable: the daemon forces that eval into a dry run
+    (policy + visualization, no arm commands).  Missing follower telemetry still
+    gates launch because the policy observation cannot be formed.
+    """
+    return view.state == "viewing" and not view.cameras_down and not view.arms_down
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def _inspect_policy_server(policy: str, host: str, port: int) -> PolicyServerInfo:
+    """Briefly inspect one explicit Eval endpoint; cache across dashboard reruns."""
+    return inspect_policy_server(policy, host, port)
+
+
+def _render_policy_server_info(info: PolicyServerInfo) -> None:
+    """Compact server/checkpoint summary with full metadata on hover."""
+    dot = "🟢" if info.reachable else "🔴"
+    transport = "WebSocket" if info.transport == "websocket" else info.transport.upper()
+    checkpoint = f" · checkpoint `{info.checkpoint}`" if info.checkpoint else ""
+    state = "" if info.reachable else " · unavailable"
+    with st.container(key="policy_server_details"):
+        st.caption(
+            f"{dot} **{info.display_type} · {transport}** · `{info.endpoint}`"
+            f"{checkpoint}{state}",
+            help=policy_server_help(info),
+        )
 
 
 def _render_controls(
@@ -293,10 +358,10 @@ def _render_controls(
         result = open_in_vscode(task.path)
         st.toast(result.message, icon="📝") if result.ok else st.warning(result.message)
 
-    # Launchable only from VIEWING with every rig camera streaming and every
-    # arm publishing (the daemon refuses otherwise; disabling here just makes
-    # that visible up front).
-    launchable = (
+    # Collection is launchable only from VIEWING with every rig camera streaming
+    # and every follower arm publishing (the daemon additionally checks its
+    # Collection-only FACTR leader requirements).
+    collection_launchable = (
         view.state == "viewing" and not view.cameras_down and not view.arms_down
     )
     # During a run the same buttons become atomic ⇄ switches: one click stops
@@ -306,7 +371,8 @@ def _render_controls(
     if st.button(
         "⇄ Collection" if switching else "▶ Collection [C]",
         key="collection_launch",
-        use_container_width=True, disabled=not (launchable or switching),
+        use_container_width=True,
+        disabled=not (collection_launchable or switching),
         help=(
             "Teleoperated demonstration gathering (real recording run). While "
             "a run is active this switches to it: the current run stops (its "
@@ -353,11 +419,13 @@ def _render_controls(
         "⇄ Eval" if switching else "▶ Eval",
         key="eval_launch",
         type="primary", use_container_width=True,
-        disabled=not (launchable or switching) or port_error is not None,
+        disabled=not (_eval_launchable(view) or switching) or port_error is not None,
         help=(
-            "Online policy rollout (needs the policy server reachable). While "
-            "a run is active this switches to it: the current run stops (its "
-            "episode saves), then eval starts — no manual retries."
+            "Online policy rollout (needs the policy server reachable; FACTR "
+            "leaders may be offline). If a follower has its E-stop pressed or "
+            "reports another unsafe operational state, Eval automatically runs "
+            "dry: policy predictions are visualized but no arm is commanded. "
+            "While a run is active this switches to it after the current run stops."
         ),
     ):
         _launch(
@@ -366,6 +434,8 @@ def _render_controls(
         )
     if port_error:
         st.caption(f":red[{port_error}]")
+    elif policy is not None and host is not None and port is not None:
+        _render_policy_server_info(_inspect_policy_server(policy, host, port))
     elif policy is not None or host is not None or port is not None:
         st.caption(
             f":gray[policy → {policy or 'config type'} @ "
@@ -459,9 +529,7 @@ def _render_leader_row(s: LeaderStatus, poll: dict, service_state: str | None) -
     elif s.reachable and poll.get("state") == "stale":
         dot = "🟢"
         status = " · :orange[retaining last valid calibration]"
-    elif service_state in ("countdown", "running") or (
-        service_state is None and poll.get("state") in ("waiting", "reset")
-    ):
+    elif service_state == "countdown" or poll.get("state") in ("waiting", "reset"):
         st.markdown(f"🟡 **{s.name}** · :orange[Booting]")
         return
     else:
@@ -472,11 +540,18 @@ def _render_leader_row(s: LeaderStatus, poll: dict, service_state: str | None) -
             _, grav_detail = _arms.grav_comp_display(
                 None if s.grav_comp_enabled is None else {
                     "grav_comp_enabled": s.grav_comp_enabled,
-                    "force_gain": s.force_gain,
-                    "force_gain_target": s.force_gain_target,
+                    "grav_comp_gain": s.grav_comp_gain,
+                    "grav_comp_gain_target": s.grav_comp_gain_target,
                 }
             )
             detail += f" · {grav_detail}"
+            detail += " · " + _arms.force_feedback_display(
+                None if s.force_feedback_enabled is None else {
+                    "force_feedback_enabled": s.force_feedback_enabled,
+                    "force_feedback_gain": s.force_feedback_gain,
+                    "force_feedback_gain_target": s.force_feedback_gain_target,
+                }
+            )
         detail += f" · {s.dof} joints"
         if s.gripper is not None:
             detail += f" · grip `{s.gripper:+.2f}`"
@@ -487,7 +562,7 @@ def _render_leader_row(s: LeaderStatus, poll: dict, service_state: str | None) -
 
 @st.fragment(run_every="2s")
 def _leader_status_rows(registry: _runner.RunRegistry) -> None:
-    """Per-leader live/grav-comp status with that leader's scrollable log."""
+    """Per-leader live/force status with that leader's scrollable log."""
     try:
         sides = configured_leader_sides()
     except Exception as exc:  # noqa: BLE001 - broken factr conf -> compact, visible note
@@ -519,10 +594,52 @@ def _leader_status_rows(registry: _runner.RunRegistry) -> None:
                     st.caption(":gray[No log output available.]")
 
 
+def _format_factr_gain(
+    sides: list[str],
+    statuses: list[dict[str, object] | None],
+    gain_key: str,
+) -> str:
+    """Format one live FACTR gain, retaining per-arm values for bimanual rigs."""
+    values: list[str] = []
+    for index, side in enumerate(sides):
+        status = statuses[index] if index < len(statuses) else None
+        try:
+            gain = float(status[gain_key]) if status is not None else math.nan
+        except (KeyError, TypeError, ValueError):
+            gain = math.nan
+        value = f"{gain:.2f}" if math.isfinite(gain) else "—"
+        values.append(value if len(sides) == 1 else f"{side[:1].upper()} {value}")
+    return " · ".join(values) if values else "—"
+
+
+def _factr_gain_markup(value: str) -> str:
+    """Compact centered readout sized to sit beside one toggle button."""
+    return (
+        '<div style="text-align:center; line-height:1.1; padding-top:0.15rem; '
+        'white-space:nowrap;">'
+        '<span style="font-size:0.7rem; opacity:0.7;">GAIN</span><br>'
+        f'<span style="font-size:1rem; font-weight:650;">{value}</span>'
+        "</div>"
+    )
+
+
+def _factr_toggle_action(states: list[str]) -> str | None:
+    """Choose the safe aggregate action for one shared FACTR toggle.
+
+    If any leader is on or ramping up, one click turns every leader off. If all
+    known leaders are off or ramping down, one click turns every leader on.
+    With no authoritative state the button stays disabled.
+    """
+    if any(state in ("enabled", "enabling") for state in states):
+        return "disable"
+    if any(state in ("disabling", "disabled") for state in states):
+        return "enable"
+    return None
+
+
 @st.fragment(run_every="2s")
 def _render_factr_section(registry: _runner.RunRegistry) -> None:
-    """The shared grav-comp controls; per-leader state is shown above."""
-    st.markdown("##### Grav comp")
+    """Shared FACTR controls; each leader's live state is shown above."""
     view = registry.session_view()
     info = view.factr_servers
     if info is None:
@@ -540,87 +657,131 @@ def _render_factr_section(registry: _runner.RunRegistry) -> None:
     elif state == "stopping":
         st.caption(":gray[FACTR service stopping — the leaders are de-energizing…]")
 
-    statuses = [
-        _arms.read_leader_grav_comp_status(side)
-        for side in configured_leader_sides()
-    ]
-    disable_is_action = any(
-        status is not None and (
-            status.get("grav_comp_enabled") is True
-            or float(status.get("force_gain_target") or 0.0) >= 0.99
-        )
-        for status in statuses
-    )
+    sides = configured_leader_sides()
+    statuses = [_arms.read_leader_grav_comp_status(side) for side in sides]
     states = [_arms.grav_comp_state(status) for status in statuses]
-    if any(state in ("enabled", "enabling") for state in states):
-        hotkey_action = "disable"
-    elif any(state in ("disabling", "disabled") for state in states):
-        hotkey_action = "enable"
-    else:
-        hotkey_action = "none"
+    grav_action = _factr_toggle_action(states)
     st.markdown(
-        _grav_comp_button_css(disable_is_action)
-        + f'<span data-factr-hotkey="{hotkey_action}" style="display:none"></span>',
+        _factr_toggle_button_css(
+            "factr_grav_toggle", solid=grav_action == "enable"
+        ),
         unsafe_allow_html=True,
     )
 
-    grav_cols = st.columns(2)
+    grav_cols = st.columns([1, 0.34])
+    grav_label = {
+        "enable": "▶ Enable grav comp [G]",
+        "disable": "■ Disable grav comp [G]",
+        None: "Grav comp unavailable [G]",
+    }[grav_action]
     if grav_cols[0].button(
-        "▶ Enable grav comp [F]", key="factr_enable", use_container_width=True,
-        help=(
-            "Ramp every leader's master output gain 0→1 over ~1s — the arms go "
-            "from limp to gravity-compensated. The teleop processes stay up "
-            "(they auto-start with the daemon)."
-        ),
-    ):
-        if registry.enable_grav_comp():
-            st.toast("Enabling grav comp — leaders energizing…", icon="🤖")
-        else:
-            st.warning("Session daemon not reachable.", icon="⚠️")
-        st.rerun(scope="fragment")
-    if grav_cols[1].button(
-        "■ Disable grav comp [F]", key="factr_disable",
+        grav_label,
+        key="factr_grav_toggle",
         use_container_width=True,
+        disabled=grav_action is None,
         help=(
-            "Ramp every leader's master output gain 1→0 over ~1s — the arms go "
-            "limp (energized but applying no torque). The processes stay up; "
-            "use Enable to re-energize."
+            "Toggle every leader's gravity-compensation term. The live state "
+            "determines whether this click ramps 0→1 or 1→0 over ~1s. Force "
+            "feedback keeps its independent state and gain."
         ),
     ):
-        if registry.disable_grav_comp():
-            st.toast("Disabling grav comp — leaders de-energizing…", icon="🔻")
+        if grav_action == "disable":
+            ok = registry.disable_grav_comp()
+            message, icon = "Disabling gravity compensation…", "🔻"
+        else:
+            ok = registry.enable_grav_comp()
+            message, icon = "Enabling gravity compensation…", "🤖"
+        if ok:
+            st.toast(message, icon=icon)
         else:
             st.warning("Session daemon not reachable.", icon="⚠️")
         st.rerun(scope="fragment")
+    grav_cols[1].markdown(
+        _factr_gain_markup(
+            _format_factr_gain(sides, statuses, "grav_comp_gain")
+        ),
+        unsafe_allow_html=True,
+    )
+
+    feedback_states = [_arms.force_feedback_state(status) for status in statuses]
+    feedback_action = _factr_toggle_action(feedback_states)
+    st.markdown(
+        _factr_toggle_button_css(
+            "factr_feedback_toggle", solid=feedback_action == "enable"
+        ),
+        unsafe_allow_html=True,
+    )
+    feedback_cols = st.columns([1, 0.34])
+    feedback_label = {
+        "enable": "▶ Enable force feedback [F]",
+        "disable": "■ Disable force feedback [F]",
+        None: "Force feedback unavailable [F]",
+    }[feedback_action]
+    if feedback_cols[0].button(
+        feedback_label,
+        key="factr_feedback_toggle",
+        use_container_width=True,
+        disabled=feedback_action is None,
+        help=(
+            "Toggle the follower external-torque term on every FACTR leader. "
+            "The live state determines whether this click enables or disables "
+            "it. Gravity compensation remains independently controlled above."
+        ),
+    ):
+        if feedback_action == "disable":
+            ok = registry.disable_force_feedback()
+            message, icon = "Disabling FACTR force feedback…", "🔻"
+        else:
+            ok = registry.enable_force_feedback()
+            message, icon = "Enabling FACTR force feedback…", "🤖"
+        if ok:
+            st.toast(message, icon=icon)
+        else:
+            st.warning("Session daemon not reachable.", icon="⚠️")
+        st.rerun(scope="fragment")
+    feedback_cols[1].markdown(
+        _factr_gain_markup(
+            _format_factr_gain(sides, statuses, "force_feedback_gain")
+        ),
+        unsafe_allow_html=True,
+    )
 
 
-def _grav_comp_button_css(disable_is_action: bool) -> str:
-    """Solid orange marks the action opposite the leaders' current gain state."""
-    solid = "factr_disable" if disable_is_action else "factr_enable"
-    hollow = "factr_enable" if disable_is_action else "factr_disable"
-    return f"""
-    <style>
-    .st-key-{solid} button {{
+def _factr_toggle_button_css(key: str, *, solid: bool) -> str:
+    """Render Enable as solid and Disable as outlined."""
+    if solid:
+        normal = """
         background-color: #f97316 !important;
         border-color: #f97316 !important;
         color: white !important;
-    }}
-    .st-key-{solid} button:hover {{
+        """
+        hover = """
         background-color: #ea580c !important;
         border-color: #ea580c !important;
-    }}
-    .st-key-{hollow} button {{
+        """
+    else:
+        normal = """
         background-color: transparent !important;
         border-color: #f97316 !important;
         color: #f97316 !important;
-    }}
-    .st-key-{hollow} button:hover {{
+        """
+        hover = """
         background-color: rgba(249, 115, 22, 0.12) !important;
         border-color: #ea580c !important;
         color: #ea580c !important;
+        """
+    return f"""
+    <style>
+    .st-key-{key} button:not(:disabled) {{
+        {normal}
+    }}
+    .st-key-{key} button:not(:disabled):hover {{
+        {hover}
     }}
     </style>
     """
+
+
 def _render_camera_row(s: CameraStatus) -> None:
     dot = "🟢" if s.detected else "⚫"
     if s.detected:
@@ -808,7 +969,7 @@ def _run_status_panel(registry: _runner.RunRegistry) -> None:
 
 
 def _collection_keybinds() -> None:
-    """Bind C=start Collection and S=stop through the existing guarded buttons."""
+    """Bind C/S for runs, G for grav comp, and F for force feedback."""
     components.html(
         """
         <script>
@@ -836,16 +997,14 @@ def _collection_keybinds() -> None:
               button = host.document.querySelector('.st-key-collection_launch button');
             } else if (key === 's') {
               button = host.document.querySelector('.st-key-collection_stop button');
+            } else if (key === 'g') {
+              button = host.document.querySelector(
+                '.st-key-factr_grav_toggle button'
+              );
             } else if (key === 'f') {
-              // The grav-comp section publishes the authoritative F action as
-              // a hidden marker; "none" (state unknown) keeps F inert.
-              const marker = host.document.querySelector('[data-factr-hotkey]');
-              const action = marker && marker.getAttribute('data-factr-hotkey');
-              if (action === 'disable') {
-                button = host.document.querySelector('.st-key-factr_disable button');
-              } else if (action === 'enable') {
-                button = host.document.querySelector('.st-key-factr_enable button');
-              }
+              button = host.document.querySelector(
+                '.st-key-factr_feedback_toggle button'
+              );
             }
             if (!button || button.disabled) return;
             event.preventDefault();
@@ -1281,53 +1440,23 @@ def _calib_gripper(side: str):
     return st.session_state[ok], st.session_state[ck]
 
 
-@st.fragment(run_every="0.3s")
-def _calibration_view_feed(side: str) -> None:
-    """Pose the live ghost at the leader's commanded config (in-progress convention).
+def _render_calibration_controls() -> None:
+    """Measure a leader convention from the swappable calibration control pane.
 
-    Only this fragment reruns on its cadence — it reads the leader and logs one arm
-    frame into the calibration recording: the **ghost** tracks the leader (under the
-    working offsets **and** sign flips, so a flip visibly mirrors that link — same
-    solid/ghost split as the metrics viewer) while the **solid** arm holds the
-    selected reference pose; the embedded viewer picks it up over gRPC. On a read
-    failure it says so rather than fabricating motion.
-    """
-    offsets = st.session_state.get(f"calib_offsets::{side}")
-    if offsets is None:
-        return
-    flips = sorted(st.session_state.get(f"calib_flips::{side}", set()))
-    target = st.session_state.get(f"calib_target::{side}")
-    pose_name = st.session_state.get(f"calib_pose::{side}")
-    try:
-        _calibration.render(side, offsets, flips, target)
-        solid = f"`{pose_name}` reference" if target and pose_name else "straight/home"
-        st.caption(f"🟢 live: {solid} (solid) vs `{side}` leader (ghost)")
-    except Exception as exc:  # noqa: BLE001 - leader down -> report, hold the last pose
-        st.caption(f"⚪ no live `{side}` leader — {exc}")
-
-
-def _render_calibration_tab() -> None:
-    """Measure a leader's joint convention from a fixed pose set, with a live view.
-
-    Primary flow: move the leader into each **reference pose** (shown as the solid
-    arm in the 3D view), **📸 Capture** a sample there, and once a handful are
-    captured **🧮 Solve** fits the whole convention — per-joint offsets *and* sign
-    flips — by circular least squares over the samples, with per-joint residuals to
-    flag a badly matched pose. The ghost arm tracks the live leader under the
-    working convention (same solid/ghost split as the metrics viewer), so after a
-    solve the ghost snaps onto each reference pose as you strike it. A per-joint
-    fine-tune (straighten one link, capture it; ``offset =
+    Primary flow: move the leader into each reference pose, capture a sample there,
+    and solve the convention by circular least squares. A per-joint fine-tune
+    (straighten one link, capture it; ``offset =
     wrap(-degrees(leader_joint))``) remains available in an expander.
     """
     sides = _calibration.configured_leader_sides()
     if not sides:
+        _robot.clear_calibration_targets()
         st.info("No FACTR leader is configured for the active rig — nothing to calibrate.")
         return
     if _arms.runtime_is_sim():
         st.warning(
             "`runtime.sim` is on — leader positions are a synthetic sinusoid, so "
-            "captured offsets are meaningless (the view still animates so you can "
-            "confirm the plumbing). Calibrate against real hardware.",
+            "captured offsets are meaningless. Calibrate against real hardware.",
             icon="⚠️",
         )
 
@@ -1341,10 +1470,9 @@ def _render_calibration_tab() -> None:
     poses = _calibration.reference_poses(side)
     samples = st.session_state.setdefault(f"calib_samples::{side}", {})  # pose name -> deg
 
-    left, right = st.columns([2, 3], gap="large")
-    with left:
+    with st.container():
         st.caption(
-            "Move the leader into each reference pose (the **solid** arm in the view), "
+            "Move the leader into each reference pose described below, "
             f"**Capture** it, then **Solve** for offsets + sign flips. "
             f"**{len(samples)}/{len(poses)}** poses captured."
         )
@@ -1355,10 +1483,11 @@ def _render_calibration_tab() -> None:
             label_visibility="collapsed",
         )
         pose = poses[names.index(sel)]
-        # Feed target for the live-view fragment: the solid arm holds this pose.
-        st.session_state[f"calib_target::{side}"] = list(pose.q_deg)
         st.caption(pose.hint)
         st.caption("targets: " + " · ".join(f"J{i}`{v:+.0f}°`" for i, v in enumerate(pose.q_deg)))
+        _robot.show_calibration_target(
+            side, [math.radians(v) for v in pose.q_deg]
+        )
         b0, b1, b2 = st.columns([1, 1, 1])
         if b0.button("📸 Capture", key=f"calib_pcap::{side}", use_container_width=True,
                      help=f"Record the leader while it holds “{pose.name}”."):
@@ -1407,7 +1536,8 @@ def _render_calibration_tab() -> None:
         with st.expander("Per-joint fine-tune (straighten one link at a time)"):
             st.caption(
                 f"Straighten one link at a time: **Capture** its offset, **Flip** its sign "
-                f"if the view mirrors the wrong way. **{len(done)}/{len(offsets)}** joints captured."
+                f"if its mapped direction is inverted. "
+                f"**{len(done)}/{len(offsets)}** joints captured."
             )
             for j in range(len(offsets)):
                 c0, c1, c2 = st.columns([3, 1, 1])
@@ -1477,33 +1607,6 @@ def _render_calibration_tab() -> None:
         with st.expander("Preview / copy the config"):
             st.code(_calibration.format_yaml(side, offsets, flips_sorted, grip_open, grip_closed),
                     language="yaml")
-
-    with right:
-        # OFF by default: st.tabs renders every tab body on each rerun and run_every
-        # fragments fire on their own timer, so an always-on feed would poll the FACTR
-        # leader (~3 Hz) and bind the viewer's gRPC port even when nobody is on this
-        # tab — contending with a live collection/eval run. Gate it behind opt-in so
-        # the leader is touched only while actively calibrating.
-        live = st.checkbox(
-            "🔴 Live 3D view",
-            value=False,
-            key=f"calib_live::{side}",
-            help="Show the selected reference pose (solid) with a ghost tracking the "
-            "leader's commanded config, refreshing ~3 Hz. Off by default so it "
-            "doesn't poll the leader while you're not calibrating.",
-        )
-        if live:
-            viewer = _calibration_viewer()
-            st.iframe(_browser_url(viewer.web_url), height=VIEWER_HEIGHT_PX)
-            _calibration_view_feed(side)
-        else:
-            st.info(
-                "Enable **Live 3D view** to see the selected reference pose (solid "
-                "arm) and a live ghost tracking the leader — after a solve the ghost "
-                "snaps onto each reference pose as you strike it. Capture/Solve/Sync "
-                "work without it."
-            )
-
 
 def _render_storage_tab(registry: _runner.RunRegistry) -> None:
     root = _storage.collection_root()
@@ -1725,6 +1828,89 @@ def _resolve_rig(rigs: list[RigInfo]) -> RigInfo | None:
     return next(r for r in rigs if r.name == name)
 
 
+def _render_control_workspace(
+    tasks: list[TaskInfo],
+    rig: RigInfo | None,
+    registry: _runner.RunRegistry,
+) -> None:
+    """Render exactly one swappable control surface in the narrow left pane."""
+    mode = st.segmented_control(
+        "Controls",
+        CONTROL_MODES,
+        default="Experiment",
+        key="control_workspace",
+        selection_mode="single",
+        required=True,
+        width="stretch",
+        label_visibility="collapsed",
+    )
+    previous = st.session_state.get("_control_workspace_seen")
+    changed = mode != previous
+    st.session_state["_control_workspace_seen"] = mode
+
+    if mode == "Calibration":
+        _render_calibration_controls()
+    else:
+        _robot.clear_calibration_targets()
+        if changed:
+            _runner.activate_metrics_view(registry.session_view())
+        _render_controls(tasks, rig, registry)
+
+
+def _render_viewer_workspace(servers: RerunServers, registry: _runner.RunRegistry) -> None:
+    """The shared Rerun viewer and its experiment overlays/status."""
+    st.iframe(_browser_url(servers.web_url), height=VIEWER_HEIGHT_PX)
+    # The robot 3D scene shares this viewer's left panel (it replaced the old EEF
+    # trace); its controls + status sit below so the viewer leads.
+    _render_skill_bar(registry)
+    depth_cams = _cameras.depth_cameras()
+    for name in depth_cams:
+        # Cheap static re-log each rerun: keeps the frustum in sync with conf/camera
+        # pose edits after a "Reset services".
+        _robot.log_camera_frustum(name, _cameras.camera_cfg(name))
+    if depth_cams:
+        # Streams whenever live RGB-D exists; show/hide the cloud from the Rerun
+        # sidebar (entity visibility) rather than a dashboard control.
+        _depth_overlay_feed(depth_cams[0])
+    st.caption("Experiment: solid = measured · translucent ghost = command.")
+    _robot_data_status()
+
+
+def _render_content_workspace(
+    servers: RerunServers,
+    cameras: list[CameraView],
+    registry: _runner.RunRegistry,
+) -> None:
+    """Render one independently selected content surface in the wide pane."""
+    view = st.segmented_control(
+        "Workspace",
+        CONTENT_VIEWS,
+        default="Viewer",
+        key="content_workspace",
+        selection_mode="single",
+        required=True,
+        width="stretch",
+        label_visibility="collapsed",
+    )
+    if view == "Cameras":
+        _render_camera_tab(cameras)
+    elif view == "Storage":
+        st.caption(
+            "Recorded LeRobot episodes — select with checkboxes, delete "
+            "individually or in bulk."
+        )
+        _render_storage_tab(registry)
+    elif view == "Logs":
+        st.caption(
+            "The live session daemon log (all dashboard runs) plus any past "
+            "`dual-flexiv-control` CLI runs — pick one, follow the tail live, "
+            "or read a past run's output."
+        )
+        _render_logs_tab(registry)
+    else:
+        _render_viewer_workspace(servers, registry)
+
+
 def main() -> None:
     st.set_page_config(
         page_title="dual-flexiv experiments", page_icon="🤖", layout="wide"
@@ -1762,54 +1948,10 @@ def main() -> None:
 
     controls, panel = st.columns([1, 3], gap="large")
     with controls:
-        _render_controls(tasks, rig, registry)
+        _render_control_workspace(tasks, rig, registry)
     with panel:
-        tab_viewer, tab_camera, tab_calib, tab_storage, tab_logs = st.tabs(
-            [
-                ":material/monitoring: Viewer",
-                ":material/videocam: Camera",
-                ":material/adjust: Calibrate",
-                ":material/database: Storage",
-                ":material/terminal: Logs",
-            ]
-        )
-        with tab_viewer:
-            st.iframe(_browser_url(servers.web_url), height=VIEWER_HEIGHT_PX)
-            # The robot 3D scene shares this viewer's left panel (it replaced the
-            # old EEF trace); its controls + status sit below so the viewer leads.
-            _render_skill_bar(registry)
-            depth_cams = _cameras.depth_cameras()
-            for name in depth_cams:
-                # Cheap static re-log each rerun: keeps the frustum in sync with
-                # conf/camera pose edits after a "Reset services".
-                _robot.log_camera_frustum(name, _cameras.camera_cfg(name))
-            if depth_cams:
-                # Streams whenever live RGB-D exists; show/hide the cloud from the
-                # Rerun sidebar (entity visibility) rather than a dashboard control.
-                _depth_overlay_feed(depth_cams[0])
-            st.caption(
-                "Rizon 4s on the Vention pedestal beside the live run metrics — "
-                "**solid** arms = measured joint state, **translucent ghost** = "
-                "commanded teleop, **red** = no live joint data."
-            )
-            _robot_data_status()
-        with tab_camera:
-            _render_camera_tab(cameras)
-        with tab_calib:
-            _render_calibration_tab()
-        with tab_storage:
-            st.caption(
-                "Recorded LeRobot episodes — select with checkboxes, delete "
-                "individually or in bulk."
-            )
-            _render_storage_tab(registry)
-        with tab_logs:
-            st.caption(
-                "The live session daemon log (all dashboard runs) plus any past "
-                "`dual-flexiv-control` CLI runs — pick one, follow the tail live, "
-                "or read a past run's output."
-            )
-            _render_logs_tab(registry)
+        _render_content_workspace(servers, cameras, registry)
 
 
-main()
+if __name__ == "__main__":
+    main()

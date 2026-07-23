@@ -17,9 +17,9 @@ The eval loop sees one interface — :class:`Policy`: ``infer(canonical_obs) ->
   (``policy.kind=hold``), also handy with ``runtime.sim=true``.
 
 Failure semantics: :class:`PolicyUnavailable` is fatal (missing dependency, or
-no server within the startup budget); :class:`PolicyError` is transient (one
-inference failed / connection dropped) — the loop holds and retries, and the
-transport reconnects on the next call.
+no server within the startup budget); :class:`PolicyError` describes one failed
+inference / connection drop. The loop holds and retries within its configured
+consecutive-error budget, and the transport reconnects on the next call.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ class PolicyUnavailable(RuntimeError):
 
 
 class PolicyError(RuntimeError):
-    """One inference failed (transient): the caller should hold and retry."""
+    """One inference failed: the caller may hold and retry within its budget."""
 
 
 # ---------------------------------------------------------------------------
