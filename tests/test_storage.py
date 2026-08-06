@@ -27,6 +27,13 @@ def test_human_size_units():
     assert storage.human_size(3 * 1024**3) == "3.0 GB"
 
 
+def test_video_download_filename_is_stable_and_portable():
+    assert (
+        storage._video_filename("dfc/tape measure", 7, "static left")
+        == "dfc-tape-measure-episode-0007-static-left.mp4"
+    )
+
+
 def _write_fake_dataset(root, repo_id, *, episodes, frames, fps=15, videos=()):
     ds_dir = os.path.join(root, *repo_id.split("/"))
     os.makedirs(os.path.join(ds_dir, "meta"), exist_ok=True)
@@ -51,6 +58,22 @@ def test_discover_datasets_reads_info(tmp_path):
     assert pick.num_episodes == 3 and pick.num_frames == 18 and pick.fps == 15
     assert pick.video_keys == ("observation.images.cam",)
     assert pick.size_bytes >= 2048
+
+
+def test_discover_datasets_derives_v3_video_keys_from_features(tmp_path):
+    ds_dir = _write_fake_dataset(tmp_path, "dfc/v3", episodes=1, frames=4)
+    info_path = os.path.join(ds_dir, "meta", "info.json")
+    with open(info_path) as f:
+        info = json.load(f)
+    info["features"] = {
+        "observation.images.left": {"dtype": "video"},
+        "observation.state": {"dtype": "float32"},
+    }
+    with open(info_path, "w") as f:
+        json.dump(info, f)
+
+    ds = storage.discover_datasets(str(tmp_path))[0]
+    assert ds.video_keys == ("observation.images.left",)
 
 
 def test_discover_empty_and_missing_root(tmp_path):

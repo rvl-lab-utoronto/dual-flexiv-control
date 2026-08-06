@@ -13,7 +13,8 @@ A control-enabled arm is an **idle ↔ control state machine**:
 * **IDLE** — connected read-only, publishing telemetry + status at ``arm.rate_hz``;
   no control action of any kind (the session's VIEWING mode).
 * **CONTROL** — entered on an :class:`EnterControl` message (which carries the
-  active phase's coefficients): enable servos (eagerly, overlapping the
+  selected policy's controller plus the active phase's coefficients): enable
+  servos (eagerly, overlapping the
   consumer's own startup — ``arm.control_eager_enable`` reverts to enabling
   after the channels attach), attach the brain's channels, bootstrap to the
   first setpoint, then run the merged telemetry+control loop at
@@ -39,6 +40,7 @@ from dataclasses import field
 import numpy as np
 
 from ...configs import ArmCfg
+from ...configs import ControlCfg
 from ...configs import ControlCoeffsCfg
 from ...configs import RuntimeCfg
 from ...control import COMMAND
@@ -81,17 +83,20 @@ STATUS_RATE_HZ = 10.0
 
 @dataclass(frozen=True)
 class EnterControl:
-    """Session-layer message: begin one control session with these coefficients.
+    """Begin one session with the policy controller and phase coefficients.
 
-    Sent by the session supervisor on an arm's session queue when a collection or
-    eval run starts (``coeffs`` are the active task's per-phase controller
-    coefficients — the values :meth:`FlexivSource._apply_coeffs` applies after
-    ``SwitchMode``). Plain dataclass of plain dataclasses, so it pickles across the
+    Sent by the session supervisor when a collection or eval run starts. ``control``
+    defines the selected policy's action/controller semantics; ``coeffs`` supplies
+    the active task phase's limits and stiffness scale applied after ``SwitchMode``.
+    Plain dataclass of plain dataclasses, so it pickles across the
     spawn boundary. The session *ends* via the control channel (a STOP command or
     the deadman), not via a queue message.
     """
 
     coeffs: ControlCoeffsCfg = field(default_factory=ControlCoeffsCfg)
+    control: ControlCfg | None = None
+    """Controller selected by the run's policy. None preserves spawn-time control
+    for backward compatibility with one-shot/stale test messages."""
     phase: str = "collection"  # collection | eval (logging/diagnostics only)
 
 
@@ -261,7 +266,7 @@ class FlexivInterface(StreamProducerNode):
             if msg is not None:
                 log.info("[%s] entering control session (phase=%s)", self.name, msg.phase)
                 try:
-                    self._control_session(stop_event, msg.coeffs)
+                    self._control_session(stop_event, msg.coeffs, msg.control)
                 except TimeoutError as exc:
                     log.error("[%s] control session never started: %s", self.name, exc)
                 log.info("[%s] control session ended; IDLE", self.name)
@@ -293,7 +298,12 @@ class FlexivInterface(StreamProducerNode):
         self._writers[f"{self.side}/{STATUS_SIGNAL}"].write(self._status_signal(t_ns), t_ns)
         return rs
 
-    def _control_session(self, stop_event, coeffs: ControlCoeffsCfg) -> None:
+    def _control_session(
+        self,
+        stop_event,
+        coeffs: ControlCoeffsCfg,
+        control: ControlCfg | None = None,
+    ) -> None:
         """One control session: attach channels → servo on → bootstrap → merged loop.
 
         EVERY exit — STOP command, deadman, robot fault, safety halt, aborted
@@ -305,7 +315,7 @@ class FlexivInterface(StreamProducerNode):
         as a crash (one-shot mode does; the session loop absorbs it).
         """
         control_reg = StreamRegistry(self.runtime_dir, self.run_id, sub="control")
-        ctrl = self.arm.control
+        ctrl = control if control is not None else self.arm.control
         ch = ctrl.channel
         sp_reader: StreamReader | None = None
         cmd_cursor: CommandCursor | None = None

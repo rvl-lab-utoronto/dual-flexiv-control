@@ -32,17 +32,13 @@ from ..cameras import camera_stream_name
 from ..cameras import view_shape
 from ..interfaces.factr.interface import factr_stream_name
 from ..interfaces.factr.interface import raw_factr_stream_name
+from ..layout import DFCStateActionLayout
+from ..layout import sorted_sides
 
 log = logging.getLogger(__name__)
 
 #: LeRobot dtype for an image feature depending on the storage mode.
 _IMAGE_DTYPE = {True: "video", False: "image"}
-
-
-def sorted_sides(mapping: dict) -> list[str]:
-    """Deterministic side ordering (``left`` before ``right``, then any others)."""
-    order = {"left": 0, "right": 1}
-    return sorted(mapping, key=lambda s: (order.get(s, 99), s))
 
 
 class FrameBuilder:
@@ -66,34 +62,14 @@ class FrameBuilder:
         self.instruction = instruction
         self.state_signals = list(state_signals)
         self.video = video
-        self._state_sides = sorted_sides(arms)
-        self._action_sides = [s for s in self._state_sides if s in teleop_sides]
-
-        # -- observation.state layout: (stream_name, slice) per (side, signal) --
-        self._state_reads: list[str] = []
-        self.state_names: list[str] = []
-        for side in self._state_sides:
-            arm = arms[side]
-            for sig in self.state_signals:
-                if sig not in arm.streams:
-                    raise ValueError(
-                        f"state signal {sig!r} not among {side} arm streams "
-                        f"{sorted(arm.streams)}"
-                    )
-                dim = int(arm.streams[sig].dim)
-                self._state_reads.append(f"{side}/{sig}")
-                self.state_names += [f"{side}.{sig}.{i}" for i in range(dim)]
-        self.state_dim = len(self.state_names)
-
-        # -- action layout: per teleop arm, q_d (dof) + gripper ----------------
-        self.action_names: list[str] = []
-        self._action_dof: dict[str, int] = {}
-        for side in self._action_sides:
-            dof = int(arms[side].dof)
-            self._action_dof[side] = dof
-            self.action_names += [f"{side}.q_d.{j}" for j in range(dof)]
-            self.action_names.append(f"{side}.gripper")
-        self.action_dim = len(self.action_names)
+        self.layout = DFCStateActionLayout.from_arms(arms, self.state_signals, teleop_sides)
+        self._state_sides = self.layout.state_sides
+        self._action_sides = self.layout.sides
+        self._state_reads = self.layout.state_stream_names
+        self.state_names = self.layout.state_names
+        self.state_dim = self.layout.state_dim
+        self.action_names = self.layout.action_names
+        self.action_dim = self.layout.action_dim
         self._factr_streams = [
             name for side in self._action_sides
             for name in (factr_stream_name(side), raw_factr_stream_name(side))
@@ -127,7 +103,7 @@ class FrameBuilder:
 
     def action_dof(self, side: str) -> int:
         """DoF of a side's recorded ``q_d`` block."""
-        return self._action_dof[side]
+        return self.layout.action_dof(side)
 
     def missing_streams(self, observation: dict) -> list[str]:
         """Subscribed streams that have no sample yet (block frame recording).
@@ -206,7 +182,7 @@ class FrameBuilder:
             if raw is None:
                 continue
             raw = np.asarray(raw, dtype=np.float64).ravel()
-            q_d[side] = raw[:self._action_dof[side]]
+            q_d[side] = raw[:self.layout.action_dof(side)]
             grip[side] = float(raw[-1]) if raw.size else 0.0
         return {"q_d": q_d, "gripper": grip}
 
@@ -221,23 +197,22 @@ class FrameBuilder:
         action, or camera frame is not yet available (the caller skips the tick).
         """
         # observation.state
-        state_parts: list[np.ndarray] = []
-        for stream in self._state_reads:
-            newest = observation.get(stream)
-            newest = newest.newest if newest is not None else None
-            if newest is None:
-                return None
-            state_parts.append(np.asarray(newest, dtype=np.float32).ravel())
-        state = np.concatenate(state_parts) if state_parts else np.zeros(0, np.float32)
+        state_values: dict[tuple[str, str], np.ndarray] = {}
+        for side in self._state_sides:
+            for signal in self.state_signals:
+                stream = f"{side}/{signal}"
+                newest = observation.get(stream)
+                newest = newest.newest if newest is not None else None
+                if newest is None:
+                    return None
+                state_values[(side, signal)] = newest
+        state = self.layout.pack_state(state_values)
 
         # action (per teleop arm: q_d + gripper)
-        action_parts: list[np.ndarray] = []
         for side in self._action_sides:
             if side not in q_d:
                 return None
-            action_parts.append(np.asarray(q_d[side], dtype=np.float32).ravel())
-            action_parts.append(np.asarray([gripper.get(side, 0.0)], dtype=np.float32))
-        action = np.concatenate(action_parts) if action_parts else np.zeros(0, np.float32)
+        action = self.layout.pack_action(q_d, gripper)
 
         frame: dict = {
             "observation.state": state,

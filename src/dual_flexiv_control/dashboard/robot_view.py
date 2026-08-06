@@ -27,18 +27,23 @@ pedestal transform are the constants below — tweak them to match the real rig.
 
 from __future__ import annotations
 
+import logging
 import math
 import threading
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import rerun as rr
 
+log = logging.getLogger(__name__)
+
 _ASSETS = Path(__file__).resolve().parent / "assets" / "robot"
 URDF_PATH = _ASSETS / "urdf" / "Rizon4s.urdf"
 PEDESTAL_GLB = _ASSETS / "pedestal.glb"
+GRAV_GRIPPER_STL = _ASSETS / "meshes" / "GRAV" / "Grav-PVT-50mm.stl"
 
 # -- placement (from the Vention CAD) ----------------------------------------
 #
@@ -61,6 +66,15 @@ MOUNT_TILT_RAD = math.pi / 4
 #: against the real rig by eye). Composed after the outward tilt, i.e. a yaw in
 #: the arm's own base frame.
 MOUNT_YAW_RAD = math.pi / 2
+#: FACTR's CAD base frame points opposite the vendor Rizon frame in both X and Y.
+#: A half-turn about local +Z aligns all seven effective joint axes while leaving
+#: the mount location, internal kinematics, inertial frames, and gravity direction
+#: unchanged. This is display-only: the production FACTR URDF is not modified.
+FACTR_BASE_YAW_RAD = math.pi
+#: FACTR leaders are a half-scale mechanism. Enlarge only their live Rerun
+#: subtree so its comparable link segments match the follower arm. Replay uses
+#: :func:`log_scene`'s unscaled default and recorded data is never transformed.
+FACTR_LIVE_DISPLAY_SCALE = 2.0
 # _MOUNTS itself is defined below the quaternion helpers it needs.
 
 #: Skeleton styling (per arm), matching the metrics 3D-track colours.
@@ -73,9 +87,11 @@ _STALE_COLOR = [200, 90, 85]
 #: URDF visual meshes as the solid arm, flat-tinted in the side's colour at 20%
 #: alpha (Rerun 0.33 honours alpha for Mesh3D/Capsules3D but not LineStrips3D).
 _GHOST_COLOR = {"left": [130, 190, 255, 51], "right": [255, 190, 140, 51]}
+# Current FACTR-server mechanism, distinct from the side-coloured legacy model.
+_FACTR_COLOR = {"left": [70, 235, 155, 115], "right": [70, 235, 155, 115]}
 #: Translucent purple ghost at the policy's horizon-END joint target (eval), plus the
-#: solid purple used for the current-EEF → horizon-EEF trace (LineStrips3D ignore
-#: alpha in 0.33, so the trace is solid on purpose). Same purple for both sides —
+#: solid purple used for the full per-step FK trajectory (LineStrips3D ignore alpha
+#: in 0.33, so the trace is solid on purpose). Same purple for both sides —
 #: the target reads as "policy intent", not as belonging to an arm's colour.
 _TARGET_COLOR = [168, 110, 255, 85]
 #: Calibration uses the same target language, but its entity subtree is separate
@@ -122,6 +138,18 @@ def _rot_from_rpy(roll: float, pitch: float, yaw: float) -> np.ndarray:
             [-sp, cp * sr, cp * cr],
         ]
     )
+
+
+def _rpy_from_rot(rot: np.ndarray) -> tuple[float, float, float]:
+    """3x3 rotation matrix -> URDF fixed-axis roll, pitch, yaw."""
+    pitch = math.atan2(-float(rot[2, 0]), math.hypot(rot[0, 0], rot[1, 0]))
+    if abs(math.cos(pitch)) > 1e-9:
+        roll = math.atan2(float(rot[2, 1]), float(rot[2, 2]))
+        yaw = math.atan2(float(rot[1, 0]), float(rot[0, 0]))
+    else:
+        roll = math.atan2(-float(rot[1, 2]), float(rot[1, 1]))
+        yaw = 0.0
+    return roll, pitch, yaw
 
 
 def _quat_from_axis_angle(axis, angle: float) -> tuple[float, float, float, float]:
@@ -200,6 +228,18 @@ _MOUNTS = {
 }
 
 
+def _factr_mount(side: str) -> dict:
+    """Pedestal mount with the FACTR CAD-to-Rizon base-frame yaw correction."""
+    mount = _MOUNTS[side]
+    correction_q = _quat_from_axis_angle((0.0, 0.0, 1.0), FACTR_BASE_YAW_RAD)
+    correction_r = _rot_from_axis_angle((0.0, 0.0, 1.0), FACTR_BASE_YAW_RAD)
+    return {
+        "translation": mount["translation"],
+        "quat_xyzw": _quat_mul(mount["quat_xyzw"], correction_q),
+        "rot": np.asarray(mount["rot"], dtype=float) @ correction_r,
+    }
+
+
 # ---------------------------------------------------------------------------
 # URDF -> kinematic chain
 # ---------------------------------------------------------------------------
@@ -214,6 +254,19 @@ class _Visual:
     xyz: tuple[float, float, float]
     rpy: tuple[float, float, float]
     scale: tuple[float, float, float]
+
+
+# The GRAV CAD is in millimetres with its mounting face at Y=-75.038 mm and
+# fingers extending along +Y. Rotate +Y onto the follower flange's +Z and move
+# that mounting face to Z=0. This is a live-viewer overlay, not part of the
+# vendor URDF or the kinematic/control model.
+_GRAV_GRIPPER_VISUAL = _Visual(
+    name="grav_gripper",
+    mesh=GRAV_GRIPPER_STL,
+    xyz=(0.0, 0.0, 0.075038),
+    rpy=(math.pi / 2, 0.0, 0.0),
+    scale=(0.001, 0.001, 0.001),
+)
 
 
 @dataclass(frozen=True)
@@ -297,6 +350,7 @@ def parse_chain(urdf_path: Path = URDF_PATH, root_link: str = "base_link") -> li
 
 #: Parse the URDF chain once; the live pose updater reuses it every tick.
 _CHAIN: list[_Link] | None = None
+_FACTR_CHAINS: dict[str, list[_Link]] = {}
 
 
 def _chain() -> list[_Link]:
@@ -306,8 +360,90 @@ def _chain() -> list[_Link]:
     return _CHAIN
 
 
+def factr_urdf_path(side: str) -> Path:
+    """Resolve the URDF selected by the running FACTR server for one side."""
+    import yaml
+
+    from .arms import discover_factr
+
+    factr = discover_factr()
+    workdir = Path(str(factr.launch.workdir)).expanduser().resolve()
+    package = workdir / "src" / "factr_teleop" / "factr_teleop"
+    config_path = package / "configs" / f"factr_rizon_{side}.yaml"
+    with config_path.open(encoding="utf-8") as stream:
+        config = yaml.safe_load(stream) or {}
+    name = config.get("arm_teleop", {}).get("leader_urdf")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"{config_path} has no arm_teleop.leader_urdf")
+    path = (package / "urdf" / name).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"FACTR {side} URDF does not exist: {path}")
+    return path
+
+
+def _factr_chain(side: str) -> list[_Link]:
+    """Per-side leader chain loaded directly from FACTR-Server."""
+    if side not in _FACTR_CHAINS:
+        try:
+            # The dashboard supplies the pedestal mount. Starting at base_link
+            # excludes FACTR's standalone world-to-base display tilt.
+            chain = parse_chain(factr_urdf_path(side), root_link="base_link")
+            _FACTR_CHAINS[side] = _localize_factr_base_frame_meshes(chain)
+        except Exception as exc:  # noqa: BLE001 - visualization remains available
+            log.warning(
+                "could not load FACTR %s URDF; using the follower model for its ghost: %s",
+                side,
+                exc,
+            )
+            _FACTR_CHAINS[side] = _chain()
+    return _FACTR_CHAINS[side]
+
+
+def _localize_factr_base_frame_meshes(chain: list[_Link]) -> list[_Link]:
+    """Make FACTR's base-frame CAD meshes link-local for hierarchical FK.
+
+    The legacy FACTR STL export stores every link's vertices in one common base
+    frame even though each URDF visual has a zero local origin. A normal URDF
+    renderer therefore applies the link's zero-pose transform twice. Insert the
+    inverse zero-pose transform as the visual origin so the mesh is continuous
+    at home and subsequently follows only its own joint.
+
+    New assets whose path explicitly says ros_zup_local are already link-local.
+    Likewise, preserve an explicit visual origin or non-unit scale: those fields
+    place millimetre/link-local assets such as the side-specific gripper meshes.
+    """
+    out: list[_Link] = []
+    translation = np.zeros(3)
+    rotation = np.eye(3)
+    for index, link in enumerate(chain):
+        if index:
+            translation = translation + rotation @ np.asarray(link.xyz, dtype=float)
+            rotation = rotation @ _rot_from_rpy(*link.rpy)
+        localized = []
+        for visual in link.visuals:
+            explicitly_placed = (
+                not np.allclose(visual.xyz, (0.0, 0.0, 0.0))
+                or not np.allclose(visual.rpy, (0.0, 0.0, 0.0))
+                or not np.allclose(visual.scale, (1.0, 1.0, 1.0))
+            )
+            if "ros_zup_local" in str(visual.mesh) or explicitly_placed:
+                localized.append(visual)
+                continue
+            inverse_rotation = rotation.T
+            inverse_translation = -inverse_rotation @ translation
+            localized.append(
+                replace(
+                    visual,
+                    xyz=tuple(float(v) for v in inverse_translation),
+                    rpy=_rpy_from_rot(inverse_rotation),
+                )
+            )
+        out.append(replace(link, visuals=tuple(localized)))
+    return out
+
+
 # ---------------------------------------------------------------------------
-# OBJ + MTL loading (the vendor visual meshes)
+# OBJ/STL loading
 # ---------------------------------------------------------------------------
 
 
@@ -402,6 +538,51 @@ def _load_obj(path: Path) -> tuple[_MeshPart, ...]:
     return out
 
 
+def _load_stl(path: Path) -> tuple[_MeshPart, ...]:
+    """Load a binary STL into the same triangle representation as OBJ meshes."""
+    cached = _MESH_CACHE.get(path)
+    if cached is not None:
+        return cached
+    raw = path.read_bytes()
+    if len(raw) < 84:
+        raise ValueError(f"invalid binary STL (short header): {path}")
+    count = int.from_bytes(raw[80:84], "little")
+    expected = 84 + 50 * count
+    if expected != len(raw):
+        raise ValueError(
+            f"unsupported or malformed STL {path}: expected {expected} bytes, got {len(raw)}"
+        )
+    facet_dtype = np.dtype(
+        [
+            ("normal", "<f4", (3,)),
+            ("vertices", "<f4", (3, 3)),
+            ("attribute", "<u2"),
+        ]
+    )
+    facets = np.frombuffer(raw, dtype=facet_dtype, count=count, offset=84)
+    positions = np.asarray(facets["vertices"], dtype=np.float32).reshape(-1, 3).copy()
+    normals = np.repeat(
+        np.asarray(facets["normal"], dtype=np.float32), 3, axis=0
+    ).copy()
+    part = _MeshPart(
+        material="stl",
+        albedo=_FALLBACK_ALBEDO,
+        positions=positions,
+        normals=normals,
+        indices=np.arange(count * 3, dtype=np.uint32).reshape(-1, 3),
+    )
+    out = (part,)
+    _MESH_CACHE[path] = out
+    return out
+
+
+def _load_mesh(path: Path) -> tuple[_MeshPart, ...]:
+    """Load one URDF visual mesh in its native OBJ or binary-STL format."""
+    if path.suffix.lower() == ".stl":
+        return _load_stl(path)
+    return _load_obj(path)
+
+
 # ---------------------------------------------------------------------------
 # scene logging (static)
 # ---------------------------------------------------------------------------
@@ -410,6 +591,11 @@ def _load_obj(path: Path) -> tuple[_MeshPart, ...]:
 def _arm_root(side: str, ghost: bool) -> str:
     """Entity subtree for one arm: ``robot/<side>`` (real) or ``robot/<side>_ghost``."""
     return f"robot/{side}_ghost" if ghost else f"robot/{side}"
+
+
+def _factr_root(side: str) -> str:
+    """Entity subtree for the current FACTR-server leader model."""
+    return f"robot/{side}_factr"
 
 
 def _log_real_skeleton(rec, side: str, chain: list[_Link], color, *, static: bool) -> None:
@@ -444,7 +630,7 @@ def _mesh_entities(side: str, chain: list[_Link]):
         for vis in lk.visuals:
             if not vis.mesh.is_file():
                 continue
-            for part in _load_obj(vis.mesh):
+            for part in _load_mesh(vis.mesh):
                 yield f"{path}/visual/{vis.name}/{part.material}", vis, part
 
 
@@ -471,6 +657,49 @@ def _log_arm_meshes(rec, side: str, chain: list[_Link]) -> None:
             )
         rec.log(
             entity,
+            rr.Mesh3D(
+                vertex_positions=part.positions,
+                triangle_indices=part.indices,
+                vertex_normals=part.normals,
+                albedo_factor=part.albedo,
+            ),
+            static=True,
+        )
+
+
+def _log_follower_gripper(rec, side: str, chain: list[_Link]) -> None:
+    """Attach the GRAV mesh to the solid follower's flange in the live viewer."""
+    if not _GRAV_GRIPPER_VISUAL.mesh.is_file():
+        log.warning(
+            "GRAV follower gripper mesh is missing: %s",
+            _GRAV_GRIPPER_VISUAL.mesh,
+        )
+        return
+
+    path = _arm_root(side, ghost=False)
+    for link in chain:
+        path = f"{path}/{link.name}"
+        if link.name == "flange":
+            break
+    else:
+        log.warning("cannot attach GRAV follower gripper: chain has no flange link")
+        return
+
+    visual_path = f"{path}/visual/{_GRAV_GRIPPER_VISUAL.name}"
+    rec.log(
+        visual_path,
+        rr.Transform3D(
+            translation=_GRAV_GRIPPER_VISUAL.xyz,
+            quaternion=rr.Quaternion(
+                xyzw=_quat_from_rpy(*_GRAV_GRIPPER_VISUAL.rpy)
+            ),
+            scale=_GRAV_GRIPPER_VISUAL.scale,
+        ),
+        static=True,
+    )
+    for part in _load_mesh(_GRAV_GRIPPER_VISUAL.mesh):
+        rec.log(
+            f"{visual_path}/{part.material}",
             rr.Mesh3D(
                 vertex_positions=part.positions,
                 triangle_indices=part.indices,
@@ -523,6 +752,24 @@ def _log_arm_geometry(rec, side: str, chain: list[_Link], *, ghost: bool) -> Non
     _log_ghost_geometry(rec, root, chain, _GHOST_COLOR[side], static=True)
 
 
+def _log_factr_geometry(
+    rec, side: str, chain: list[_Link], *, display_scale: float = 1.0
+) -> None:
+    """Log the current FACTR model beside the legacy leader ghost."""
+    root = _factr_root(side)
+    mount = _factr_mount(side)
+    rec.log(
+        root,
+        rr.Transform3D(
+            translation=mount["translation"],
+            quaternion=rr.Quaternion(xyzw=mount["quat_xyzw"]),
+            scale=(display_scale, display_scale, display_scale),
+        ),
+        static=True,
+    )
+    _log_ghost_geometry(rec, root, chain, _FACTR_COLOR[side], static=True)
+
+
 def _log_ghost_geometry(rec, root: str, chain: list[_Link], color, *, static: bool) -> None:
     """A ghost arm under ``root``: translucent URDF meshes, or capsule bones without meshes."""
     if _has_mesh_visuals(chain):
@@ -560,7 +807,7 @@ def _log_ghost_meshes(rec, root: str, chain: list[_Link], color, *, static: bool
                     ),
                     static=static,
                 )
-            for part in _load_obj(vis.mesh):
+            for part in _load_mesh(vis.mesh):
                 rec.log(
                     f"{parent}/{part.material}",
                     rr.Mesh3D(
@@ -627,8 +874,14 @@ def _log_arm_pose(
         )
 
 
-def log_scene(rec, joint_angles: dict[str, np.ndarray] | None = None) -> None:
-    """Log the whole static scene: pedestal + both arms (solid real + ghost) at home."""
+def log_scene(
+    rec,
+    joint_angles: dict[str, np.ndarray] | None = None,
+    *,
+    scale_factr_leaders: bool = False,
+    show_follower_grippers: bool = False,
+) -> None:
+    """Log the scene with optional live-only leader scale and follower grippers."""
     rec.log("/", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
 
     if PEDESTAL_GLB.exists():
@@ -646,9 +899,30 @@ def log_scene(rec, joint_angles: dict[str, np.ndarray] | None = None) -> None:
     rec.set_time(_POSE_TIMELINE, duration=0.0)
     for side in ("left", "right"):
         q = None if joint_angles is None else joint_angles.get(side)
-        for ghost in (False, True):
-            _log_arm_geometry(rec, side, chain, ghost=ghost)
-            _log_arm_pose(rec, side, chain, q, ghost=ghost, static=False)  # initial home pose
+        _log_arm_geometry(rec, side, chain, ghost=False)
+        if show_follower_grippers:
+            _log_follower_gripper(rec, side, chain)
+        _log_arm_pose(rec, side, chain, q, ghost=False, static=False)
+        # Previous leader visualization: Rizon/Flexiv geometry in DFC coordinates.
+        _log_arm_geometry(rec, side, chain, ghost=True)
+        _log_arm_pose(rec, side, chain, q, ghost=True, static=False)
+        # Current leader visualization: the per-side URDF selected by FACTR.
+        leader_chain = _factr_chain(side)
+        _log_factr_geometry(
+            rec,
+            side,
+            leader_chain,
+            display_scale=FACTR_LIVE_DISPLAY_SCALE if scale_factr_leaders else 1.0,
+        )
+        _log_arm_pose(
+            rec,
+            side,
+            leader_chain,
+            None,
+            ghost=True,
+            static=False,
+            root=_factr_root(side),
+        )
 
 
 #: Last-known measured-``q`` presence, so the solid arm is recoloured only when its
@@ -663,6 +937,8 @@ def update_poses(
     real_q: dict[str, np.ndarray],
     ghost_q: dict[str, np.ndarray],
     t: float,
+    *,
+    factr_q: dict[str, np.ndarray] | None = None,
 ) -> None:
     """Live-update the arms: solid arm(s) at measured ``real_q``, ghost(s) at commanded ``ghost_q``.
 
@@ -673,6 +949,7 @@ def update_poses(
     live data resumes. Only the FK transforms (and, on a state flip, the colour) are
     re-logged — the geometry from :func:`log_scene` rides along.
     """
+    factr_q = factr_q or {}
     rec.set_time(_POSE_TIMELINE, duration=t)
     chain = _chain()
     for side in ("left", "right"):
@@ -690,6 +967,16 @@ def update_poses(
             _log_arm_pose(rec, side, chain, real_q[side], ghost=False, static=False)
         if ghost_q.get(side) is not None:
             _log_arm_pose(rec, side, chain, ghost_q[side], ghost=True, static=False)
+        if factr_q.get(side) is not None:
+            _log_arm_pose(
+                rec,
+                side,
+                _factr_chain(side),
+                factr_q[side],
+                ghost=True,
+                static=False,
+                root=_factr_root(side),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -749,20 +1036,37 @@ def mount_world_point(side: str, p_base) -> np.ndarray:
     )
 
 
-def _log_trace(rec, side: str, p_now: np.ndarray | None, p_end: np.ndarray) -> None:
-    """The purple current→predicted EEF trace (world-frame): tip always, line when
-    the current endpoint is known."""
+def _log_trace(
+    rec,
+    side: str,
+    p_now: np.ndarray | None,
+    p_end: np.ndarray,
+    waypoints: np.ndarray | None = None,
+) -> None:
+    """Purple predicted EEF trace and endpoint in world coordinates.
+
+    ``waypoints`` contains the FK result of every policy joint row. With no path,
+    this falls back to the historical straight current→endpoint segment.
+    """
     _shown_traces.add(side)
     trace_path, tip_path = _trace_entities(side)
     rec.log(
         tip_path,
         rr.Points3D([p_end.tolist()], radii=_TRACE_TIP_RADIUS, colors=[_TRACE_COLOR]),
     )
+    points = []
     if p_now is not None:
+        points.append(np.asarray(p_now, dtype=float).tolist())
+    if waypoints is not None:
+        path = np.asarray(waypoints, dtype=float)
+        if path.ndim == 2 and path.shape[1] == 3:
+            points.extend(path.tolist())
+    elif p_now is not None:
+        points.append(np.asarray(p_end, dtype=float).tolist())
+    if len(points) >= 2:
         rec.log(
             trace_path,
-            rr.LineStrips3D([[p_now.tolist(), p_end.tolist()]],
-                            radii=_TRACE_RADIUS, colors=[_TRACE_COLOR]),
+            rr.LineStrips3D([points], radii=_TRACE_RADIUS, colors=[_TRACE_COLOR]),
         )
 
 
@@ -771,15 +1075,17 @@ def update_horizon_targets(
     target_q: dict,
     real_q: dict,
     t: float,
+    target_q_paths: dict | None = None,
     target_eef: dict | None = None,
     real_eef: dict | None = None,
 ) -> None:
     """Pose the purple horizon prediction(s): ghost + trace, or trace alone.
 
     ``target_q`` maps side -> the policy's horizon-END joint target (from the
-    ``eval/<side>/q_horizon`` stream) — posed as the purple ghost, with the
-    current→target EEF trace between the FK of the measured ``real_q`` and of the
-    target (with no measured ``q`` the ghost is still posed, the trace skipped).
+    ``eval/<side>/q_horizon`` stream), posed as the purple ghost. When
+    ``target_q_paths`` supplies every joint row from the inference, FK is evaluated
+    at every row and the purple trace follows that complete path; otherwise it
+    falls back to a straight measured-current→target segment.
     ``target_eef`` maps side -> the estimated horizon-END base-frame TCP position
     (``eval/<side>/eef_horizon``, cartesian control kinds): no joint target exists
     to pose a ghost, so only the trace + tip are drawn — from the measured
@@ -811,8 +1117,17 @@ def update_horizon_targets(
         _log_arm_pose(rec, side, chain, q, ghost=False, static=False, root=root)
 
         rq = real_q.get(side)
-        if rq is not None:
-            _log_trace(rec, side, fk_world_eef(side, rq), fk_world_eef(side, q))
+        q_path = (target_q_paths or {}).get(side)
+        path_world = None
+        if q_path is not None:
+            q_rows = np.asarray(q_path, dtype=float)
+            if q_rows.ndim == 2 and q_rows.shape[1] >= len(q):
+                path_world = np.asarray([fk_world_eef(side, row) for row in q_rows])
+        p_now = fk_world_eef(side, rq) if rq is not None else None
+        if p_now is not None or path_world is not None:
+            _log_trace(
+                rec, side, p_now, fk_world_eef(side, q), waypoints=path_world
+            )
 
     for side, p in (target_eef or {}).items():
         if p is None or side not in _MOUNTS or side in target_q:
@@ -1055,9 +1370,9 @@ def attach(rec=None):
     The robot scene shares the metrics recording rather than running its own viewer,
     so the metrics 3D panel shows the arms in place of the old EEF trace. ``rec``
     defaults to the process-global metrics recording (installed by
-    :func:`~.viewer.start_servers`'s ``rr.init``). Idempotent per process: the first
-    call logs the static scene (pedestal + both arms at home); later calls return the
-    already-bound recording without re-logging.
+    :func:`~.viewer.start_servers`). Idempotent per live-recording generation: the
+    first call logs the static scene (pedestal + both arms at home); later calls
+    return the already-bound recording without re-logging.
     """
     global _REC
     with _LOCK:
@@ -1065,7 +1380,9 @@ def attach(rec=None):
             return _REC
         rec = rec if rec is not None else rr.get_global_data_recording()
         if rec is not None:
-            log_scene(rec)
+            # Live viewer only: replay calls log_scene() directly, keeps leaders
+            # at 1x, and does not receive the physical follower gripper overlay.
+            log_scene(rec, scale_factr_leaders=True, show_follower_grippers=True)
         _REC = rec
         return _REC
 
@@ -1073,13 +1390,17 @@ def attach(rec=None):
 def reset() -> None:
     """Forget the bound metrics recording so the next :func:`attach` rebinds.
 
-    Used by the dashboard's *Reset services* action after :func:`~.viewer.teardown`
-    drops the recording the scene was logged into; without this, :func:`attach`
-    would keep returning the stale (now dead) handle instead of binding the fresh
-    recording that the restarted servers install.
+    Used after the periodic live-history rotation and by the dashboard's explicit
+    *Reset services* action. Besides dropping the dead recording handle, clear all
+    recording-specific lazy-geometry state so targets and stale-arm colours are
+    emitted into the fresh recording instead of being mistaken for already logged.
     """
     global _REC
     with _LOCK:
         _REC = None
+        _arm_has_live.clear()
+        _shown_targets.clear()
+        _shown_traces.clear()
         _shown_calibration_targets.clear()
         _calibration_target_q.clear()
+        _FACTR_CHAINS.clear()

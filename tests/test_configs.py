@@ -114,7 +114,7 @@ def test_all_control_schemas_present_and_shaped():
     # Each arm carries one ControlCfg, composed from the `control` group. Verified
     # against flexivrdk 1.8.0: all NRT, flat send API, brain-driven over IPC.
     def ctrl(kind: str):
-        return _compose(f"control@task.control={kind}").task.control
+        return _compose(f"control@policy.control={kind}").policy.control
 
     # qpos -> NRT_JOINT_POSITION / SendJointPosition(q_d, dq_d, dq_max, ddq_max)
     qpos = ctrl("qpos")
@@ -156,22 +156,21 @@ def test_all_control_schemas_present_and_shaped():
     assert len(force.force_axis_max_linear_vel) == 3
 
 
-def test_per_phase_control_coeffs_default_compliant_vs_stiff():
-    # Schema defaults (configs.py): compliant for collection (training), stiff
-    # for eval — no per-task composition boilerplate needed.
+def test_default_eval_coeffs_match_collection_compliant():
+    # The root config selects the compliant preset for eval so policy rollouts
+    # use the same stiffness and motion limits as teleoperated collection.
     obj = OmegaConf.to_object(_compose())
     coll = obj.task.collection.coeffs
     ev = obj.task.eval.coeffs
-    # phase presets still control motion limits, but no longer own impedance
-    assert coll.max_joint_vel < ev.max_joint_vel
-    # joint motion limits feed SendJointPosition max_vel/max_acc args
-    assert coll.max_joint_vel == pytest.approx(1.5)
-    assert ev.max_joint_vel == pytest.approx(2.5)
+    assert ev == coll
+    assert coll.joint_stiffness_scale == pytest.approx(1.0 / 3.0)
+    assert ev.max_joint_vel == pytest.approx(1.5)
+    assert ev.max_joint_acc == pytest.approx(2.0)
 
 
 def test_qpos_overdamped_control_owns_impedance():
-    cfg = _compose("control@task.control=qpos_overdamped")
-    imp = cfg.task.control.joint_impedance
+    cfg = _compose("control@policy.control=qpos_overdamped")
+    imp = cfg.policy.control.joint_impedance
     assert imp is not None
     assert imp.K_q_fraction == pytest.approx(0.4)
     assert not imp.K_q  # no absolute K_q hard-coded alongside the fraction
@@ -191,17 +190,25 @@ def test_control_coeffs_override_and_phase_selector():
     assert cfg.arms.left.control_enabled is True
 
 
-def test_tasks_select_controls_and_impedance_lives_on_control():
-    default = OmegaConf.to_object(_compose("task=default", "rig=bimanual"))
-    assert default.task.control.mode == "NRT_JOINT_POSITION"
-    assert default.task.control.joint_impedance is None  # Flexiv SDK defaults
-    assert all(arm.control == default.task.control for arm in default.arms.values())
+def test_policies_select_controls_and_tasks_do_not():
+    aloha = OmegaConf.to_object(
+        _compose("task=tape_measure", "policy=pi05_aloha", "rig=bimanual")
+    )
+    assert not hasattr(aloha.task, "control")
+    assert aloha.policy.control.kind == "qpos"
+    assert aloha.policy.control.mode == "NRT_JOINT_IMPEDANCE"
+    assert aloha.policy.control.joint_impedance.K_q_fraction == pytest.approx(1.0)
+    assert all(arm.control == aloha.policy.control for arm in aloha.arms.values())
 
+    qvel = OmegaConf.to_object(
+        _compose("rig=bimanual", "control@policy.control=qvel")
+    )
+    assert qvel.policy.control.kind == "qvel"
+    assert all(arm.control.kind == "qvel" for arm in qvel.arms.values())
+
+    # Changing only the task cannot change action/controller semantics.
     handover = OmegaConf.to_object(_compose("task=handover", "rig=bimanual"))
-    imp = handover.task.control.joint_impedance
-    assert handover.task.control.mode == "NRT_JOINT_IMPEDANCE"
-    assert imp.K_q_fraction == pytest.approx(0.4)
-    assert list(imp.Z_q) == [0.8] * 7
+    assert handover.policy.control == aloha.policy.control
 
 
 def test_recording_group_defaults_and_task_dataset_identity():
@@ -218,9 +225,10 @@ def test_cameras_compose_to_typed_objects():
     obj = OmegaConf.to_object(_compose("rig=bimanual"))
     assert set(obj.cameras) == {"wrist_left", "wrist_right", "static"}
     assert isinstance(obj.cameras["static"], CameraCfg)
-    # Wrist cams: ZED X Nano, left RGB only; static cam: ZED 2, stereo RGB + depth.
-    assert obj.cameras["wrist_left"].model == "zedx_nano"
-    assert obj.cameras["wrist_left"].views == ["left"]
+    # Wrist cams: RealSense RGB-D; static cam: ZED 2, stereo RGB + depth.
+    assert obj.cameras["wrist_left"].backend == "realsense"
+    assert obj.cameras["wrist_left"].model == "d4xx"
+    assert obj.cameras["wrist_left"].views == ["color", "depth"]
     assert obj.cameras["static"].model == "zed2"
     assert obj.cameras["static"].views == ["left", "right", "depth"]
     assert obj.cameras["static"].depth_mode == "ULTRA"  # depth view needs != NONE
@@ -235,11 +243,14 @@ def test_camera_stream_specs_derive_image_dims():
 
     wl = obj.cameras["wrist_left"]
     specs = {s.name: s for s in camera_streams_to_specs("wrist_left", wl)}
-    left = camera_stream_name("wrist_left", "left")
-    assert left == "cam/wrist_left/left"
-    assert specs[left].dim == wl.width * wl.height * 3       # derived, not hand-set
-    assert specs[left].dtype == "uint8"
-    assert specs[left].rate_hz == wl.fps
+    color = camera_stream_name("wrist_left", "color")
+    assert color == "cam/wrist_left/color"
+    assert specs[color].dim == wl.width * wl.height * 3       # derived, not hand-set
+    assert specs[color].dtype == "uint8"
+    assert specs[color].rate_hz == wl.fps
+    depth = camera_stream_name("wrist_left", "depth")
+    assert specs[depth].dim == wl.width * wl.height
+    assert specs[depth].dtype == "float32"
 
     static = obj.cameras["static"]
     static_specs = {s.name: s for s in camera_streams_to_specs("static", static)}
@@ -288,7 +299,7 @@ def test_cli_style_overrides():
     cfg = _compose(
         "rig=bimanual",
         "runtime.sim=true",
-        "control@task.control=force",
+        "control@policy.control=force",
         "arms.left.serial=Rizon4-AAA",
         "brain.rate_hz=250",
         "arms.right.streams.tau.capacity=8192",

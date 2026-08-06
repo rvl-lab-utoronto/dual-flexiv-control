@@ -10,6 +10,12 @@
   `robot_view._load_obj` because Rerun's OBJ loader drops MTL colours) and
   `collision/` convex STLs (not rendered; kept with the package). Vertex units
   are **metres** — the exporter's "ModelUnit: MilliMeters" comment is wrong.
+- `meshes/GRAV/Grav-PVT-50mm.stl` — binary STL converted from the GRAV
+  `GN01-PVT-50mm` STEP assembly. Its vertices remain in millimetres; the live
+  dashboard scales it to metres, rotates its CAD +Y tool axis onto flange +Z,
+  and mounts its Y=-75.038 mm circular face flush to each solid follower flange.
+  It is a viewer-only overlay and is intentionally absent from replay and the
+  vendor URDF.
 - `pedestal.glb` — **generated, git-ignored** (~15 MB). The two-arm pedestal,
   converted from the Vention STEP. Regenerate with:
 

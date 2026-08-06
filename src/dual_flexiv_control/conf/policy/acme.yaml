@@ -1,5 +1,6 @@
 defaults:
   - base_policy
+  - /control@control: qpos_impedance
 
 # ACME policy server (rvl-lab-utoronto/ACME): an HTTP service speaking
 # multipart/form-data over `POST /predict`, one action chunk per request.
@@ -27,7 +28,7 @@ acme_image_keys:
   wrist_image_left: static_left
 
 kind: remote
-schema: acme
+adapter: acme
 transport: http
 host: localhost
 port: 53805

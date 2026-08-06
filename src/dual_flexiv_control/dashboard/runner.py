@@ -277,7 +277,7 @@ class RunRegistry:
         """Ask the daemon to launch the FACTR-Server processes (countdown first)."""
         ok = self.manager.start_factr()
         if ok:
-            _log_event("FACTR server launch requested (pose the leaders now)")
+            _log_event("FACTR delayed server launch requested")
         return ok
 
     def stop_factr_servers(self) -> bool:
@@ -540,18 +540,29 @@ def _log_factr_leaders(sides: list[str], errored: set[str]) -> dict:
 
 
 def _ghost_configs(leader_samples: dict) -> dict:
-    """Return commanded Rizon joint configs for the teleop ghost.
-
-    ``factr/<side>`` is already converted from raw Dynamixel coordinates to the
-    canonical DFC/Rizon convention by :class:`FactrInterface`. Do not gate these
-    live samples on the dashboard's independently-polled calibration cache: the
-    mirror commonly starts before that cache is populated, which left the ghosts
-    frozen at their static startup pose for the lifetime of the viewer.
-    """
+    """Return the legacy leader ghost in canonical DFC/Rizon coordinates."""
     return {
         side: np.asarray(jp, dtype=float)[:7]
         for side, jp in leader_samples.items()
     }
+
+
+def _factr_configs(leader_samples: dict) -> dict:
+    """Return calibrated FACTR-URDF configs for the current leader model.
+
+    ``model_q_rad`` is the raw Dynamixel pose after the FACTR mechanism's signs,
+    offsets, and wrapping have placed it in the actual URDF's joint coordinates.
+    Older servers retain the converted DFC sample as a compatibility fallback.
+    """
+    from ..interfaces.factr import factr_telemetry_stream_name
+    from .arms import read_live_stream
+
+    configs = {}
+    for side, jp in leader_samples.items():
+        model_q = read_live_stream(factr_telemetry_stream_name(side, "model_q_rad"))
+        source = model_q if model_q is not None and len(model_q) >= 7 else jp
+        configs[side] = np.asarray(source, dtype=float)[:7]
+    return configs
 
 
 # ---------------------------------------------------------------------------
@@ -623,9 +634,10 @@ class SessionMirror:
     their ``factr/<side>`` streams (the SAME samples the control loop converts
     into setpoints — the ghost always shows exactly what teleop would command),
     the 3D robot scene (solid = measured ``<side>/q``, translucent =
-    commanded-teleop ghost, purple = eval horizon prediction from
-    ``eval/<side>/q_horizon`` — a posed ghost — or ``eval/<side>/eef_horizon`` —
-    a predicted-EEF trace). A stream nobody publishes leaves its row empty and
+    commanded-teleop ghost, purple = eval prediction from
+    ``eval/<side>/q_horizon`` — endpoint ghost plus full joint-path FK trace — or
+    ``eval/<side>/eef_horizon`` — a predicted-EEF trace). A stream nobody publishes
+    leaves its row empty and
     its arm still — the viewer never shows motion the system isn't making. It
     also switches the viewer layout + README whenever the session's mode
     changes, so VIEWING/COLLECTION/EVAL each get their blueprint without any
@@ -672,6 +684,7 @@ class SessionMirror:
     def _run_inner(self, stop: threading.Event) -> None:
         from .arms import read_live_horizon_eef
         from .arms import read_live_horizon_q
+        from .arms import read_live_horizon_q_trajectory
         from .arms import read_live_stream
 
         dt = 1.0 / _MIRROR_HZ
@@ -681,8 +694,9 @@ class SessionMirror:
         factr_errored: set[str] = set()
         live_q: dict = {}      # last-known real measured q per side
         live_eef: dict = {}    # last-known measured TCP position [x y z] per side
-        horizon_q: dict = {}   # eval horizon-end q target per side (eval runs only)
-        horizon_eef: dict = {} # eval horizon-end TCP position per side (cartesian kinds)
+        horizon_q: dict = {}      # eval horizon-end q target per side
+        horizon_q_paths: dict = {} # full per-step joint path from the latest inference
+        horizon_eef: dict = {}    # eval horizon-end TCP position (cartesian kinds)
         # Policy-server comm mirroring (eval runs only): next ring seq to surface
         # + the cumulative packet counters plotted below the robot metrics.
         comm_state = {"next_seq": 0, "sent": 0, "received": 0, "errors": 0}
@@ -724,11 +738,18 @@ class SessionMirror:
                         elif suffix == "eef" and len(vec) >= 3:
                             live_eef[side] = vec[:3]  # base-frame TCP position
                         rr.log(blueprints.proprio_path(row, side), rr.Scalars(vec.tolist()))
-                    h = read_live_horizon_q(side)
-                    if h is not None and len(h) >= 7:
-                        horizon_q[side] = np.asarray(h, dtype=float)[:7]
+                    path = read_live_horizon_q_trajectory(side)
+                    if path is not None and path.ndim == 2 and path.shape[1] >= 7:
+                        joint_path = np.asarray(path[:, :7], dtype=float)
+                        horizon_q_paths[side] = joint_path
+                        horizon_q[side] = joint_path[-1]
                     else:
-                        horizon_q.pop(side, None)
+                        horizon_q_paths.pop(side, None)
+                        h = read_live_horizon_q(side)  # endpoint-only compatibility
+                        if h is not None and len(h) >= 7:
+                            horizon_q[side] = np.asarray(h, dtype=float)[:7]
+                        else:
+                            horizon_q.pop(side, None)
                     he = read_live_horizon_eef(side)
                     if he is not None and len(he) >= 3:
                         horizon_eef[side] = np.asarray(he, dtype=float)[:3]
@@ -746,10 +767,14 @@ class SessionMirror:
             if robot_rec is not None:
                 real_q = dict(live_q)
                 ghost_q = _ghost_configs(leader_samples)
-                robot_view.update_poses(robot_rec, real_q, ghost_q, t)
+                factr_q = _factr_configs(leader_samples)
+                robot_view.update_poses(
+                    robot_rec, real_q, ghost_q, t, factr_q=factr_q
+                )
                 if horizon_q or horizon_eef:
                     robot_view.update_horizon_targets(
                         robot_rec, horizon_q, real_q, t,
+                        target_q_paths=horizon_q_paths,
                         target_eef=horizon_eef, real_eef=live_eef,
                     )
                 else:

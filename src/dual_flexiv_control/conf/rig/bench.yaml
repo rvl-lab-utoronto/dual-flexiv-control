@@ -16,7 +16,7 @@ defaults:
 
 arms:
   left:
-    control: ${task.control}
+    control: ${policy.control}
     name: "Lauer (dummy)"
     serial: Rizon4s-062841
     control_enabled: false              # no real robot to drive; record only

@@ -1,6 +1,5 @@
 defaults:
   - base_task
-  - /control@control: qpos_overdamped
   - _self_
 
 # Example task. Select with `task=handover`.

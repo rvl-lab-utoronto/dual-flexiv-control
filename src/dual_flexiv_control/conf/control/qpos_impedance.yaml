@@ -1,0 +1,11 @@
+defaults:
+  - qpos
+  - _self_
+
+# Absolute joint-position actions executed with explicit nominal impedance.
+# This is policy/controller tuning, not a teleop or dataset action type. The
+# active phase's coefficients may scale the baseline stiffness.
+mode: NRT_JOINT_IMPEDANCE
+joint_impedance:
+  K_q_fraction: 1.0
+  Z_q: [0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8]

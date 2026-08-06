@@ -3,7 +3,7 @@
 The eval loop sees one interface — :class:`Policy`: ``infer(canonical_obs) ->
 (horizon, action_dim)``. Behind it:
 
-* :class:`RemotePolicy` = a wire :class:`~.schema.PolicySchema` (payload shape)
+* :class:`RemotePolicy` = a :class:`~.adapter.PolicyEndpointAdapter`
   composed with a transport (connection + serialization). The two vary
   independently across policy-server families.
 * :class:`WebsocketTransport` speaks the openpi policy-server protocol —
@@ -111,7 +111,7 @@ def _import_http():
 
 
 class Transport(Protocol):
-    """Delivers one schema-shaped request payload and returns the raw response."""
+    """Delivers one adapter-encoded payload and returns the raw response."""
 
     def infer(self, payload: dict) -> dict: ...
     def close(self) -> None: ...
@@ -216,7 +216,7 @@ class AcmeHttpTransport:
     """The ACME HTTP policy protocol: multipart/form-data ``POST /predict``.
 
     Consumes the structured payload from
-    :class:`~.schema.AcmeSchema` (``images`` / ``lowdim`` / ``form``) and encodes
+    :class:`~.adapter.AcmeEndpointAdapter` (``images`` / ``lowdim`` / ``form``) and encodes
     it on the wire: each image tensor ``torch.save``'d as ``(B, T, C, H, W)``
     uint8, the lowdim arrays bundled into one ``lowdim_data.npz`` as
     ``(B, T, D)`` (B = T = 1 — this client sends a single frame). The server
@@ -356,7 +356,7 @@ COMM_ERROR = 2.0    # request failed (timeout / refused / server error)
 
 
 class RemotePolicy:
-    """A remote policy server = wire schema (payload shape) + transport.
+    """A remote policy server = endpoint adapter + transport.
 
     ``on_comm`` is an optional viz hook, ``(kind, seq, elapsed_s) -> None``:
     :data:`COMM_SENT` as the encoded request goes to the transport (elapsed 0),
@@ -365,8 +365,8 @@ class RemotePolicy:
     never disturbs inference.
     """
 
-    def __init__(self, schema, transport, on_comm=None) -> None:
-        self._schema = schema
+    def __init__(self, adapter, transport, on_comm=None) -> None:
+        self._adapter = adapter
         self._transport = transport
         self._on_comm = on_comm
         self._seq = 0
@@ -384,7 +384,7 @@ class RemotePolicy:
             log.exception("policy comm hook failed (inference unaffected)")
 
     def infer(self, obs: dict) -> np.ndarray:
-        payload = self._schema.request(obs)
+        payload = self._adapter.encode_request(obs)
         self._seq += 1
         seq = self._seq
         t0 = time.monotonic()
@@ -395,7 +395,7 @@ class RemotePolicy:
             self._emit(COMM_ERROR, seq, time.monotonic() - t0)
             raise
         self._emit(COMM_RECV, seq, time.monotonic() - t0)
-        return self._schema.actions(response)
+        return self._adapter.decode_actions(response)
 
     def close(self) -> None:
         self._transport.close()
@@ -434,13 +434,13 @@ def build_policy(cfg, layout, observer, stop_event=None, on_comm=None) -> Policy
     """The configured :class:`Policy` for an eval run.
 
     ``cfg`` is a :class:`~dual_flexiv_control.configs.PolicyCfg`; ``layout`` an
-    :class:`~.actions.ActionLayout`; ``observer`` an
+    :class:`~dual_flexiv_control.layout.DFCStateActionLayout`; ``observer`` an
     :class:`~.observation.ObservationBuilder` (the hold policy needs its state
     layout). Remote construction blocks until the server is reachable.
     ``on_comm`` (remote only) observes server round trips — see
     :class:`RemotePolicy`; the serverless hold policy has no comms to report.
     """
-    from .schema import build_schema  # noqa: PLC0415 - avoid import cycle at module load
+    from .adapter import build_adapter  # noqa: PLC0415 - avoid import cycle at module load
 
     if cfg.kind == "hold":
         try:
@@ -452,13 +452,13 @@ def build_policy(cfg, layout, observer, stop_event=None, on_comm=None) -> Policy
         return HoldPolicy(layout, q_slices)
     if cfg.kind == "remote":
         return RemotePolicy(
-            build_schema(cfg), _build_transport(cfg, stop_event), on_comm=on_comm
+            build_adapter(cfg), _build_transport(cfg, stop_event), on_comm=on_comm
         )
     raise ValueError(f"unknown policy.kind {cfg.kind!r} (expected 'remote' or 'hold')")
 
 
 def _build_transport(cfg, stop_event=None) -> Transport:
-    """The transport named by ``cfg.transport``, chosen independently of the schema."""
+    """The transport named by ``cfg.transport``, chosen independently of the adapter."""
     kwargs = dict(
         host=cfg.host,
         port=cfg.port,

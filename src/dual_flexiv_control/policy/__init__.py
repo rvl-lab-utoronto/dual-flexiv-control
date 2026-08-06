@@ -6,16 +6,21 @@ frame it was trained on, and post the returned joint targets on the control
 channel.
 
 * :class:`ObservationBuilder` — config -> canonical (training-frame) observation.
-* :class:`PolicySchema` / :func:`register_schema` — pluggable wire schemas per
-  policy-server family (:class:`OpenPISchema` ships first).
+* :class:`PolicyEndpointAdapter` / :func:`register_adapter` — pluggable endpoint
+  mappings per policy-server family (:class:`OpenPIEndpointAdapter` ships first).
 * :class:`WebsocketTransport` / :class:`RemotePolicy` — the openpi msgpack-numpy
   websocket protocol; :class:`HoldPolicy` — serverless stand-still smoke test.
-* :class:`ActionLayout` — the collection-matching action vector, split per side.
+* :class:`DFCStateActionLayout` — the canonical state/action contract and slices.
 * :class:`EvalLoop` — the reusable rollout core (testable in-process).
 * :class:`EvalNode` — the spawned-process node wired into the live system.
 """
 
-from .actions import ActionLayout
+from ..layout import DFCStateActionLayout
+from .adapter import AcmeEndpointAdapter
+from .adapter import OpenPIEndpointAdapter
+from .adapter import PolicyEndpointAdapter
+from .adapter import build_adapter
+from .adapter import register_adapter
 from .client import AcmeHttpTransport
 from .client import HoldPolicy
 from .client import Policy
@@ -29,30 +34,25 @@ from .loop import EvalNode
 from .loop import eef_horizon_stream_name
 from .loop import horizon_stream_name
 from .observation import ObservationBuilder
-from .schema import AcmeSchema
-from .schema import OpenPISchema
-from .schema import PolicySchema
-from .schema import build_schema
-from .schema import register_schema
 
 __all__ = [
     "AcmeHttpTransport",
-    "AcmeSchema",
-    "ActionLayout",
+    "AcmeEndpointAdapter",
+    "DFCStateActionLayout",
     "EvalLoop",
     "EvalNode",
     "HoldPolicy",
     "ObservationBuilder",
-    "OpenPISchema",
+    "OpenPIEndpointAdapter",
     "Policy",
     "PolicyError",
-    "PolicySchema",
+    "PolicyEndpointAdapter",
     "PolicyUnavailable",
     "RemotePolicy",
     "WebsocketTransport",
     "build_policy",
-    "build_schema",
+    "build_adapter",
     "eef_horizon_stream_name",
     "horizon_stream_name",
-    "register_schema",
+    "register_adapter",
 ]

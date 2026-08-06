@@ -21,6 +21,7 @@ from .client import FactrServerClient
 from .interface import FactrInterface
 from .interface import factr_stream_name
 from .interface import fresh_leader_positions
+from .interface import factr_telemetry_stream_name
 from .interface import leader_stream_names
 from .interface import raw_factr_stream_name
 from .interface import wait_leaders_fresh
@@ -34,6 +35,7 @@ __all__ = [
     "FactrServerSupervisor",
     "factr_stream_name",
     "fresh_leader_positions",
+    "factr_telemetry_stream_name",
     "leader_stream_names",
     "raw_factr_stream_name",
     "wait_leaders_fresh",

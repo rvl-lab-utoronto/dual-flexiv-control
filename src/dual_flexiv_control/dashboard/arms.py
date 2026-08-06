@@ -41,10 +41,10 @@ STATUS_MAX_AGE_S = 2.0
 #: pose the solid arms at the real configuration.
 JOINT_POS_STREAM = "{side}/q"
 
-#: Per-arm policy horizon target (published by the eval node once per inference:
-#: the joint target at the END of the returned action chunk — see
-#: ``policy.loop.horizon_stream_name``). Read by the 3D robot scene to pose the
-#: purple horizon-target ghost + the current→target EEF trace during eval runs.
+#: Per-arm policy joint trajectory. Every row in one inference's chunk shares a
+#: producer timestamp; the newest row remains the horizon endpoint for legacy
+#: readers. The 3D scene poses its purple ghost at that endpoint and traces FK
+#: through every row.
 HORIZON_STREAM = "eval/{side}/q_horizon"
 
 #: Cartesian sibling of :data:`HORIZON_STREAM` (control kinds with no joint target
@@ -181,62 +181,28 @@ def discover_factr() -> object:
 
 
 def discover_conventions() -> dict:
-    """Read leader conventions without making FACTR a dashboard dependency.
-
-    A failed/unavailable stream returns the last valid per-side value (or omits the
-    side before the first success). Dashboard reruns call this again and recover
-    automatically when FACTR appears.
-    """
-    from ..configs import JointConventionCfg
-    from ..interfaces.factr.client import FactrClient
-    from ..interfaces.factr.interface import FactrInterface
-
-    _arms_info, sim, factr, _legacy = _compose()
-    if sim:
-        return {
-            side: JointConventionCfg(
-                offsets_deg=[0.0] * (int(server.dof) - 1), sign_flip_joints=[],
-                drop_trailing=1, wrap_deg=True, gripper_open=0.0, gripper_closed=1.0,
-            )
-            for side, server in factr.servers.items()
-        }
-    discovered = {}
-    attempts = {}
-    client = FactrClient.from_config(factr, sim=False)
-    try:
-        for side, server in factr.servers.items():
-            attempted_at = time.time()
-            try:
-                data = client.get_calibration_for(side)
-                if data.get("available") is True:
-                    discovered[side] = FactrInterface._convention_from_calibration(
-                        side, int(server.dof), data
-                    )
-                    attempts[side] = {
-                        "state": "live", "attempted_at": attempted_at,
-                        "succeeded_at": attempted_at, "message": "calibration received",
-                    }
-                else:
-                    attempts[side] = {
-                        "state": "waiting", "attempted_at": attempted_at,
-                        "message": "FACTR is starting; calibration not available yet",
-                    }
-            except Exception as exc:  # FACTR is optional; poll again next fragment rerun.
-                attempts[side] = {
-                    "state": "unreachable", "attempted_at": attempted_at,
-                    "message": str(exc),
-                }
-    finally:
-        client.close()
+    """Return DFC-owned raw→canonical conventions from the active factr config."""
+    _arms_info, _sim, factr, _legacy = _compose()
+    discovered = {
+        side: leader.raw_to_dfc
+        for side, leader in factr.leaders.items()
+        if side in factr.servers
+    }
+    now = time.time()
     with _LEADER_CONVENTION_LOCK:
+        _LEADER_CONVENTIONS.clear()
         _LEADER_CONVENTIONS.update(discovered)
-        for side, attempt in attempts.items():
-            previous = _LEADER_CONVENTION_STATUS.get(side, {})
-            if side not in discovered and previous.get("succeeded_at") is not None:
-                attempt["succeeded_at"] = previous["succeeded_at"]
-                attempt["state"] = "stale"
-                attempt["message"] += "; retaining last valid calibration"
-            _LEADER_CONVENTION_STATUS[side] = attempt
+        for side in factr.servers:
+            present = side in discovered
+            _LEADER_CONVENTION_STATUS[side] = {
+                "state": "configured" if present else "missing",
+                "attempted_at": now,
+                "succeeded_at": now if present else None,
+                "message": (
+                    "loaded from DFC leader config"
+                    if present else "missing DFC leader calibration"
+                ),
+            }
         return dict(_LEADER_CONVENTIONS)
 
 
@@ -635,10 +601,56 @@ def read_live_stream(name: str, runtime_dir: str | None = None) -> np.ndarray | 
 def read_live_horizon_q(side: str, runtime_dir: str | None = None) -> np.ndarray | None:
     """Latest policy horizon-end joint target ``eval/<side>/q_horizon``, or None.
 
-    Only a running **eval** system publishes this (once per inference); None
-    outside eval runs → the caller hides the horizon-target ghost.
+    Only a running **eval** system publishes this. Each inference writes its full
+    path in order, so the newest row is always its endpoint; None outside eval
+    runs causes the caller to hide the horizon-target ghost.
     """
     return _read_live_stream_newest(HORIZON_STREAM.format(side=side), runtime_dir)
+
+
+def read_live_horizon_q_trajectory(
+    side: str, runtime_dir: str | None = None
+) -> np.ndarray | None:
+    """Newest complete policy joint path ``(steps, dof)``, or None.
+
+    The eval producer stamps every row from one inference with the same monotonic
+    timestamp. Reading all newest rows with that stamp reconstructs the chunk
+    without mixing points from the previous replan. A legacy endpoint-only stream
+    naturally appears as a one-row path.
+    """
+    root = _runtime_root(runtime_dir)
+    if not root.is_dir():
+        return None
+    try:
+        from dual_flexiv_control.streams import StreamReader
+        from dual_flexiv_control.streams import StreamRegistry
+    except Exception:  # noqa: BLE001 - streams stack unavailable -> no live data
+        return None
+
+    stream = HORIZON_STREAM.format(side=side)
+    run_dirs = sorted(
+        (p for p in root.iterdir() if (p / "streams").is_dir()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for run_dir in run_dirs:
+        try:
+            entry = StreamRegistry(str(root), run_dir.name).get(stream)
+            if entry is None:
+                continue
+            reader = StreamReader.attach(entry)
+            try:
+                samples = reader.last(reader.capacity)
+                if samples.n:
+                    newest_t_ns = samples.t_ns[-1]
+                    rows = samples.data[samples.t_ns == newest_t_ns]
+                    if rows.size:
+                        return np.asarray(rows)
+            finally:
+                reader.close()
+        except Exception:  # noqa: BLE001 - dead run / lapped buffer -> try next
+            continue
+    return None
 
 
 def read_live_horizon_eef(side: str, runtime_dir: str | None = None) -> np.ndarray | None:

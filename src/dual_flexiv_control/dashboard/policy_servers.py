@@ -27,7 +27,7 @@ class PolicyServerInfo:
     """One policy-server inspection result, suitable for cached display."""
 
     policy_type: str
-    schema: str
+    adapter: str
     transport: str
     endpoint: str
     reachable: bool
@@ -54,7 +54,7 @@ def inspect_policy_server(
     policy_dir: Path = POLICY_GROUP_DIR,
 ) -> PolicyServerInfo:
     """Probe a fully specified policy server and collect its handshake metadata."""
-    schema, transport = _policy_protocol(policy_type, policy_dir)
+    adapter, transport = _policy_protocol(policy_type, policy_dir)
     scheme = "http" if transport == "http" else "ws"
     endpoint = f"{scheme}://{host}:{port}"
     try:
@@ -67,7 +67,7 @@ def inspect_policy_server(
     except Exception as exc:  # noqa: BLE001 - inspection must never break the dashboard
         return PolicyServerInfo(
             policy_type=policy_type,
-            schema=schema,
+            adapter=adapter,
             transport=transport,
             endpoint=endpoint,
             reachable=False,
@@ -76,7 +76,7 @@ def inspect_policy_server(
         )
     return PolicyServerInfo(
         policy_type=policy_type,
-        schema=schema,
+        adapter=adapter,
         transport=transport,
         endpoint=endpoint,
         reachable=True,
@@ -92,7 +92,7 @@ def policy_server_help(info: PolicyServerInfo) -> str:
         "",
         f"- Status: **{state}**",
         f"- Type: **{info.display_type}**",
-        f"- Schema: `{info.schema}`",
+        f"- Adapter: `{info.adapter}`",
         f"- Transport: `{info.transport}`",
         f"- Address: `{info.endpoint}`",
     ]
@@ -111,12 +111,12 @@ def policy_server_help(info: PolicyServerInfo) -> str:
 
 
 def _policy_protocol(policy_type: str, policy_dir: Path) -> tuple[str, str]:
-    """Read schema/transport overrides from one selectable policy group."""
+    """Read adapter/transport overrides from one selectable policy group."""
     path = policy_dir / f"{policy_type}.yaml"
     if not path.is_file():
         raise ValueError(f"unknown policy type {policy_type!r}")
     cfg = OmegaConf.load(path)
-    return str(cfg.get("schema", "openpi")), str(cfg.get("transport", "websocket"))
+    return str(cfg.get("adapter", "openpi")), str(cfg.get("transport", "websocket"))
 
 
 def _probe_websocket(host: str, port: int, timeout_s: float) -> dict:

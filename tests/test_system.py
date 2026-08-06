@@ -55,7 +55,7 @@ def test_build_nodes_wires_per_phase_coeffs(tmp_path):
     assert arms_c, "expected FlexivInterface nodes"
     for n in arms_c:  # collection -> compliant
         assert n.coeffs.max_joint_vel == cfg_c.task.collection.coeffs.max_joint_vel
-        assert n.arm.control == cfg_c.task.control
+        assert n.arm.control == cfg_c.policy.control
 
     cfg_e = _make_config(tmp_path, "runtime.phase=eval")
     arms_e = [n for n in build_nodes(cfg_e, make_run_id()) if isinstance(n, FlexivInterface)]
@@ -493,7 +493,11 @@ def test_arm_session_idle_control_idle(tmp_path):
         feeder = threading.Thread(target=_feed, daemon=True)
         feeder.start()
 
-        session_q.put(EnterControl(coeffs=config.task.collection.coeffs, phase="collection"))
+        session_q.put(EnterControl(
+            coeffs=config.task.collection.coeffs,
+            control=config.policy.control,
+            phase="collection",
+        ))
         _wait_until(
             lambda: status.latest().newest[2] == 1.0,
             msg="arm never entered the control session",
@@ -515,7 +519,11 @@ def test_arm_session_idle_control_idle(tmp_path):
         q_reader.close()
 
         # -- a second session proves re-entry works ----------------------------
-        session_q.put(EnterControl(coeffs=config.task.eval.coeffs, phase="eval"))
+        session_q.put(EnterControl(
+            coeffs=config.task.eval.coeffs,
+            control=config.policy.control,
+            phase="eval",
+        ))
         _wait_until(
             lambda: status.latest().newest[2] == 1.0,
             msg="arm never entered the SECOND control session",

@@ -17,9 +17,9 @@ from openpi.shared import normalize
 from openpi.training import config as training_config
 
 from dfc_policy import ACTION_DIM
-from dfc_policy import DFCInputs
-from dfc_policy import DFCJointDeltas
-from dfc_policy import DFCOutputs
+from dfc_policy import OpenPIActionDeltas
+from dfc_policy import OpenPIInputs
+from dfc_policy import OpenPIOutputs
 from dfc_policy import STATE_DIM
 
 
@@ -35,8 +35,8 @@ class DFCDataConfig(training_config.DataConfigFactory):
             repo_id=self.repo_id,
             asset_id="dual_flexiv",
             data_transforms=transforms.Group(
-                inputs=[DFCInputs(), DFCJointDeltas()],
-                outputs=[DFCJointDeltas(inverse=True), DFCOutputs()],
+                inputs=[OpenPIInputs(), OpenPIActionDeltas()],
+                outputs=[OpenPIActionDeltas(inverse=True), OpenPIOutputs()],
             ),
             model_transforms=training_config.ModelTransformFactory()(model_config),
             use_quantile_norm=True,

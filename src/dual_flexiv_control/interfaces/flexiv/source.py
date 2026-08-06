@@ -302,13 +302,20 @@ class FlexivSource:
         elif ctrl_cfg.mode == "NRT_JOINT_IMPEDANCE":
             imp = ctrl_cfg.joint_impedance
             if imp is not None:
+                scale = float(coeffs.joint_stiffness_scale)
+                if not 0.0 < scale <= 1.0:
+                    raise ValueError(
+                        f"joint_stiffness_scale must be in (0, 1], got {scale}"
+                    )
                 if imp.K_q_fraction is not None:
                     # Fraction of THIS robot's own nominal stiffness, read live —
                     # avoids hard-coding an absolute Nm/rad guess per arm model.
                     nom = robot.info().K_q_nom
-                    K_q = [float(imp.K_q_fraction) * float(k) for k in nom]
+                    K_q = [
+                        scale * float(imp.K_q_fraction) * float(k) for k in nom
+                    ]
                 else:
-                    K_q = imp.K_q
+                    K_q = [scale * float(k) for k in imp.K_q]
                 robot.SetJointImpedance(K_q, imp.Z_q)
         # NRT_JOINT_POSITION (qpos/qvel): no impedance setter applies; dq_max/ddq_max
         # ride on every SendJointPosition call instead.

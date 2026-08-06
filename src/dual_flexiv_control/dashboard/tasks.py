@@ -108,9 +108,9 @@ def discover_rigs(rig_dir: Path = RIG_GROUP_DIR) -> list[RigInfo]:
 def discover_policies(policy_dir: Path = POLICY_GROUP_DIR) -> list[str]:
     """Every selectable policy type in the ``conf/policy`` group, sorted by name.
 
-    These are the eval launcher's ``policy=<name>`` choices (which client/schema
+    These are the eval launcher's ``policy=<name>`` choices (which endpoint adapter
     talks to the policy server — e.g. acme's multipart HTTP vs openpi's
-    websocket). ``base_policy`` (the schema parent the real entries extend) is
+    websocket). ``base_policy`` (the config parent the real entries extend) is
     not selectable and is skipped.
     """
     return [

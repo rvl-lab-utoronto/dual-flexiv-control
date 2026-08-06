@@ -23,12 +23,14 @@ straight target the follower joint reads 0, and the sign flip multiplies zero, s
 take the one index). Un-captured joints keep their existing config offset, so a
 partial calibration is well-defined.
 
+The same session also captures the physical leader at FACTR's dynamics-model home.
+Once the raw→DFC convention is known, that sample determines the side-specific
+affine model offset: ``offset = q_model_home - signs * q_dfc``.
+
 This module reads the FACTR WebSocket cache (honouring ``runtime.sim``); it never
-opens a robot connection or creates a Rerun recording. The only file it touches is
-the rig YAML, and only via the explicit **Sync to file** action
-(:func:`apply_to_rig`), which merges the measured convention in place (preserving
-comments + gripper endpoints). Mirrors ``scripts/factr_gripper_calibrate.py`` (the
-gripper-endpoint sibling), for the arm joints and surfaced in dashboard controls.
+opens a robot connection or creates a Rerun recording. Its explicit save action
+writes all measured leader fields together in the active DFC ``conf/factr/*.yaml``:
+``raw_to_dfc``, ``home_q_rad``, and ``dfc_to_factr``.
 """
 
 from __future__ import annotations
@@ -44,6 +46,11 @@ _LOCK = threading.Lock()
 #: Cached leader client (persistent WebSocket), rebuilt on demand — avoids reconnect
 #: churn under the calibration live-render fragment. Dropped by :func:`reset`.
 _CLIENT = None
+
+#: FACTR's established gravity-model calibration pose (joint 4 at about +90°).
+#: Keep 1.57 rather than pi/2 because this is the exact pose used by the FACTR
+#: controller configuration and initial-match gate.
+FACTR_MODEL_HOME_Q_RAD: tuple[float, ...] = (0.0, 0.0, 0.0, 1.57, 0.0, 0.0, 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +71,26 @@ def current_convention(side: str):
 
     conventions = _arms.discover_conventions()
     return conventions.get(side) or JointConventionCfg()
+
+
+def current_model_signs(side: str) -> list[float]:
+    """Configured DFC→FACTR model-axis signs for one physical leader."""
+    leaders = getattr(_arms.discover_factr(), "leaders", None) or {}
+    leader = leaders.get(side)
+    transform = getattr(leader, "dfc_to_factr", None) if leader is not None else None
+    signs = list(getattr(transform, "signs", []) or [])
+    dof = follower_dof(side)
+    if len(signs) != dof or any(float(v) not in (-1.0, 1.0) for v in signs):
+        raise RuntimeError(
+            f"leaders.{side}.dfc_to_factr.signs must contain {dof} values of ±1"
+        )
+    return [float(v) for v in signs]
+
+
+def factr_model_home(side: str) -> list[float]:
+    """FACTR dynamics-model home, length-normalized to the leader arm DoF."""
+    dof = follower_dof(side)
+    return list((FACTR_MODEL_HOME_Q_RAD + (0.0,) * dof)[:dof])
 
 
 def follower_dof(side: str) -> int:
@@ -229,11 +256,13 @@ class RefPose:
     q_deg: tuple[float, ...]  # follower arm-joint targets, degrees
 
 
-#: The calibration pose set. Design constraints: every joint takes BOTH a positive
-#: and a negative reference value somewhere in the set (so the per-joint sign flip
-#: is observable — at 0/±180 the two signs are indistinguishable), every angle is a
-#: multiple of 90° so the target is easy to reproduce by eye, and each pose stays
-#: inside the Rizon 4s limits (J1 ±135°, J3 −112°..+159°, others ≥±165°).
+#: The calibration pose set. J1 is the shoulder pitch that decides whether the arm
+#: stays in front of the robot: every target therefore uses either straight-up
+#: ``J1 = 0°`` or the known-reachable elbow-bend ``J1 = -90°``. The remaining
+#: poses start from that elbow bend and vary only one roll joint at a time. Comparing
+#: each nonzero target with Straight up makes every joint's sign observable without
+#: asking the operator to reproduce a compound pose that reaches behind the base.
+#: Angles remain multiples of 90° and inside the Rizon 4s limits.
 REFERENCE_POSES: tuple[RefPose, ...] = (
     RefPose(
         "Straight up",
@@ -242,24 +271,33 @@ REFERENCE_POSES: tuple[RefPose, ...] = (
     ),
     RefPose(
         "Elbow bend",
-        "Shoulder pitched 90° back, elbow bent 90° the opposite way, and wrist bent "
-        "90° to make a simple square profile.",
+        "Set J1 to the known-reachable -90° shoulder target, then bend the elbow "
+        "and wrist +90° to make a simple square profile in front of the robot.",
         (0.0, -90.0, 0.0, 90.0, 0.0, 90.0, 0.0),
     ),
     RefPose(
-        "Reach forward",
-        "Mirror of Elbow bend: shoulder 90° forward, elbow 90° back, and wrist 90° back.",
-        (0.0, 90.0, 0.0, -90.0, 0.0, -90.0, 0.0),
+        "Base roll",
+        "Start from Elbow bend, then turn only J0 +90°. Keep J1 at the same "
+        "forward elbow-bend angle.",
+        (90.0, -90.0, 0.0, 90.0, 0.0, 90.0, 0.0),
     ),
     RefPose(
-        "Twist right",
-        "Elbow bent 90° with base, upper-arm, forearm, and flange each rolled +90°.",
-        (90.0, 0.0, 90.0, 90.0, 90.0, 0.0, 90.0),
+        "Upper-arm roll",
+        "Start from Elbow bend, then turn only J2 +90°. Keep the shoulder and "
+        "the rest of the square profile fixed.",
+        (0.0, -90.0, 90.0, 90.0, 0.0, 90.0, 0.0),
     ),
     RefPose(
-        "Twist left",
-        "Mirror of Twist right: elbow bent 90°, every roll joint turned −90°.",
-        (-90.0, 0.0, -90.0, 90.0, -90.0, 0.0, -90.0),
+        "Forearm roll",
+        "Start from Elbow bend, then turn only J4 +90°. Keep J1 at -90° so the "
+        "arm remains in front of the robot.",
+        (0.0, -90.0, 0.0, 90.0, 90.0, 90.0, 0.0),
+    ),
+    RefPose(
+        "Flange roll",
+        "Start from Elbow bend, then turn only J6 +90°. All other joints remain "
+        "at the reachable elbow-bend target.",
+        (0.0, -90.0, 0.0, 90.0, 0.0, 90.0, 90.0),
     ),
 )
 
@@ -388,8 +426,75 @@ def solve_pose_samples(side: str, samples: dict[str, list[float]]) -> PoseFit:
     )
 
 
+@dataclass(frozen=True)
+class ModelHomeFit:
+    """Measured DFC pose and solved affine transform at FACTR model home."""
+
+    home_q_rad: list[float]
+    signs: list[float]
+    offset_rad: list[float]
+    target_q_rad: list[float]
+
+
+def solve_model_home(
+    raw_leader_deg: list[float],
+    offsets_deg: list[float],
+    sign_flip_joints: list[int],
+    model_signs: list[float],
+    target_q_rad: list[float],
+) -> ModelHomeFit:
+    """Solve DFC→FACTR offset from a raw sample at known FACTR model home.
+
+    The sample is first converted through the *in-progress* raw→DFC convention,
+    so one calibration session owns both coordinate mappings. Model-axis signs are
+    mechanism/URDF facts and remain configured; this capture measures their zero
+    offsets.
+    """
+    raw = np.asarray(raw_leader_deg, dtype=np.float64)
+    offsets = np.asarray(offsets_deg, dtype=np.float64)
+    signs = np.asarray(model_signs, dtype=np.float64)
+    target = np.asarray(target_q_rad, dtype=np.float64)
+    if raw.ndim != 1 or not (raw.shape == offsets.shape == signs.shape == target.shape):
+        raise RuntimeError(
+            "model-home shape mismatch: "
+            f"raw {raw.shape}, offsets {offsets.shape}, signs {signs.shape}, "
+            f"target {target.shape}"
+        )
+    if not np.all(np.isfinite(np.concatenate((raw, offsets, signs, target)))):
+        raise RuntimeError("model-home calibration contains non-finite values")
+    if not np.all(np.isin(signs, (-1.0, 1.0))):
+        raise RuntimeError("DFC-to-FACTR model signs must be -1 or +1")
+    flips = {int(j) for j in sign_flip_joints}
+    if any(j < 0 or j >= len(raw) for j in flips):
+        raise RuntimeError(f"invalid sign-flip joints: {sorted(flips)}")
+
+    q_dfc_deg = raw + offsets
+    for j in flips:
+        q_dfc_deg[j] = -q_dfc_deg[j]
+    q_dfc_deg = _wrap_deg(q_dfc_deg)
+    home_q = np.radians(q_dfc_deg)
+    model_offset = target - signs * home_q
+    return ModelHomeFit(
+        home_q_rad=[float(v) for v in home_q],
+        signs=[float(v) for v in signs],
+        offset_rad=[float(v) for v in model_offset],
+        target_q_rad=[float(v) for v in target],
+    )
+
+
+def capture_model_home(
+    side: str, offsets_deg: list[float], sign_flip_joints: list[int], samples: int = 5
+) -> tuple[list[float], ModelHomeFit]:
+    """Capture raw arm joints at FACTR model home and solve the model offset."""
+    raw = read_leader_arm_deg(side, samples)
+    fit = solve_model_home(
+        raw, offsets_deg, sign_flip_joints, current_model_signs(side), factr_model_home(side)
+    )
+    return raw, fit
+
+
 # ---------------------------------------------------------------------------
-# Config formatting (paste into conf/rig)
+# Config formatting (paste into conf/factr)
 # ---------------------------------------------------------------------------
 
 
@@ -403,20 +508,29 @@ def format_yaml(
     sign_flip_joints: list[int],
     gripper_open: float | None = None,
     gripper_closed: float | None = None,
+    model_home: ModelHomeFit | None = None,
 ) -> str:
-    """A FACTR leader-YAML initialization snippet for the measured convention."""
+    """A DFC factr-group leader snippet for the measured convention."""
     lines = [
-        "arm_teleop:",
-        "  initialization:",
-        f"    dfc_raw_offsets_deg: {_fmt_list(offsets_deg)}",
-        f"    dfc_sign_flip_joints: {list(sign_flip_joints)}",
-        "    dfc_wrap_deg: true",
-        "    dfc_drop_trailing: 1",
+        "leaders:",
+        f"  {side}:",
+        "    raw_to_dfc:",
+        f"      offsets_deg: {_fmt_list(offsets_deg)}",
+        f"      sign_flip_joints: {list(sign_flip_joints)}",
+        "      wrap_deg: true",
+        "      drop_trailing: 1",
     ]
     if gripper_open is not None:
-        lines.append(f"    dfc_gripper_open: {float(gripper_open):.4f}")
+        lines.append(f"      gripper_open: {float(gripper_open):.4f}")
     if gripper_closed is not None:
-        lines.append(f"    dfc_gripper_closed: {float(gripper_closed):.4f}")
+        lines.append(f"      gripper_closed: {float(gripper_closed):.4f}")
+    if model_home is not None:
+        lines.extend([
+            f"    home_q_rad: {_fmt_list(model_home.home_q_rad, 10)}",
+            "    dfc_to_factr:",
+            f"      signs: {[int(v) for v in model_home.signs]}",
+            f"      offset_rad: {_fmt_list(model_home.offset_rad, 10)}",
+        ])
     return "\n".join(lines)
 
 
@@ -426,19 +540,28 @@ def format_overrides(
     sign_flip_joints: list[int],
     gripper_open: float | None = None,
     gripper_closed: float | None = None,
+    model_home: ModelHomeFit | None = None,
 ) -> str:
-    """Removed: leader conversion cannot be overridden through follower Hydra config."""
-    raise RuntimeError("FACTR conversion is leader-owned; edit the FACTR arm YAML")
+    """Hydra overrides for DFC's selected leader calibration."""
     offsets = "[" + ",".join(f"{v:.2f}" for v in offsets_deg) + "]"
     flips = "[" + ",".join(str(int(j)) for j in sign_flip_joints) + "]"
     parts = [
-        f"arms.{side}.convention.offsets_deg='{offsets}'",
-        f"arms.{side}.convention.sign_flip_joints='{flips}'",
+        f"factr.leaders.{side}.raw_to_dfc.offsets_deg='{offsets}'",
+        f"factr.leaders.{side}.raw_to_dfc.sign_flip_joints='{flips}'",
     ]
     if gripper_open is not None:
-        parts.append(f"arms.{side}.convention.gripper_open={float(gripper_open):.4f}")
+        parts.append(f"factr.leaders.{side}.raw_to_dfc.gripper_open={float(gripper_open):.4f}")
     if gripper_closed is not None:
-        parts.append(f"arms.{side}.convention.gripper_closed={float(gripper_closed):.4f}")
+        parts.append(f"factr.leaders.{side}.raw_to_dfc.gripper_closed={float(gripper_closed):.4f}")
+    if model_home is not None:
+        homes = "[" + ",".join(f"{v:.10f}" for v in model_home.home_q_rad) + "]"
+        signs = "[" + ",".join(str(int(v)) for v in model_home.signs) + "]"
+        model_offsets = "[" + ",".join(f"{v:.10f}" for v in model_home.offset_rad) + "]"
+        parts.extend([
+            f"factr.leaders.{side}.home_q_rad='{homes}'",
+            f"factr.leaders.{side}.dfc_to_factr.signs='{signs}'",
+            f"factr.leaders.{side}.dfc_to_factr.offset_rad='{model_offsets}'",
+        ])
     return " ".join(parts)
 
 
@@ -472,160 +595,120 @@ def rig_path(rig: str | None = None):
     return conf / "rig" / f"{name}.yaml"
 
 
-def _fmt_conv_inline(conv: dict) -> str:
-    """One YAML flow-map for a convention dict, matching the rig files' inline style."""
-    parts = []
-    for k, v in conv.items():
-        if isinstance(v, list):
-            if all(isinstance(x, int) and not isinstance(x, bool) for x in v):
-                s = "[" + ", ".join(str(int(x)) for x in v) + "]"
-            else:
-                s = "[" + ", ".join(f"{float(x):.2f}" for x in v) + "]"
-        elif isinstance(v, bool):
-            s = "true" if v else "false"
-        elif isinstance(v, (int, float)):
-            s = f"{v}"
-        else:
-            s = str(v)
-        parts.append(f"{k}: {s}")
-    return "{ " + ", ".join(parts) + " }"
+def factr_path(rig: str | None = None):
+    """Path of the DFC factr-group YAML selected by the active rig."""
+    import dual_flexiv_control
+    import yaml
+    from pathlib import Path
 
-
-def _splice_convention(text: str, side: str, conv: dict) -> str:
-    """Return ``text`` with ``arms.<side>.convention`` set to ``conv`` (inline), comments kept.
-
-    Text surgery (not a full YAML re-dump) so the rig file's extensive comments and
-    layout survive. Handles: no existing convention (insert), an existing inline
-    ``convention: {…}`` (replace the line), and an existing block ``convention:`` with
-    indented children (replace the whole block). Raises if the ``arms.<side>`` block is
-    absent or written as an inline flow map (which this simple splicer won't edit).
-    """
-    lines = text.splitlines()
-
-    def indent_of(s: str) -> int:
-        return len(s) - len(s.lstrip(" "))
-
-    # Locate `arms:` (top-level), then the `<side>:` child header.
-    arms_i = next(
-        (i for i, ln in enumerate(lines) if ln.lstrip().startswith("arms:") and indent_of(ln) == 0),
-        None,
-    )
-    if arms_i is None:
-        raise RuntimeError("no top-level `arms:` block in the rig file")
-    side_i = None
-    for i in range(arms_i + 1, len(lines)):
-        ln = lines[i]
-        if not ln.strip() or ln.lstrip().startswith("#"):
-            continue
-        if indent_of(ln) == 0:
-            break  # left the arms block
-        if indent_of(ln) > 0 and ln.strip().startswith(f"{side}:"):
-            rest = ln.split(":", 1)[1].strip()
-            if rest and rest != "":  # inline flow map like `left: { ... }`
-                raise RuntimeError(
-                    f"arms.{side} is written inline (`{side}: {{…}}`) — expand it to a "
-                    "block before syncing, or paste the snippet manually"
-                )
-            side_i = i
-            break
-    if side_i is None:
-        raise RuntimeError(f"no `arms.{side}:` block in the rig file")
-
-    side_indent = indent_of(lines[side_i])
-    child_indent = side_indent + 2
-
-    # Body of the side block: lines until the next line indented <= side_indent (a
-    # sibling/top-level key), skipping blanks/comments that belong to the block.
-    body_end = len(lines)
-    for i in range(side_i + 1, len(lines)):
-        ln = lines[i]
-        if not ln.strip() or ln.lstrip().startswith("#"):
-            continue
-        if indent_of(ln) <= side_indent:
-            body_end = i
-            break
-
-    # An existing ACTIVE convention line within the body?
-    conv_i = None
-    for i in range(side_i + 1, body_end):
-        ln = lines[i]
-        if ln.lstrip().startswith("convention:") and indent_of(ln) >= child_indent:
-            conv_i = i
-            break
-
-    new_line = f"{' ' * child_indent}convention: {_fmt_conv_inline(conv)}"
-
-    if conv_i is None:
-        lines.insert(side_i + 1, new_line)
-    else:
-        # Remove the convention line + any deeper-indented children (block form).
-        conv_indent = indent_of(lines[conv_i])
-        end = conv_i + 1
-        while end < body_end and (
-            not lines[end].strip()
-            or lines[end].lstrip().startswith("#")
-            or indent_of(lines[end]) > conv_indent
-        ):
-            # stop if a blank/comment is actually followed by a shallower sibling
-            if lines[end].strip() and not lines[end].lstrip().startswith("#"):
-                if indent_of(lines[end]) <= conv_indent:
+    rig_file = rig_path(rig)
+    data = yaml.safe_load(rig_file.read_text()) or {}
+    group = None
+    for item in data.get("defaults", []):
+        if isinstance(item, dict):
+            for key in ("/factr", "factr"):
+                if key in item:
+                    group = str(item[key])
                     break
-            end += 1
-        lines[conv_i:end] = [new_line]
+        if group:
+            break
+    if not group:
+        raise RuntimeError(f"no /factr group selected by {rig_file.name}")
+    conf = Path(dual_flexiv_control.__file__).resolve().parent / "conf"
+    return conf / "factr" / f"{group}.yaml"
 
-    return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
 
-
-def apply_to_rig(
+def apply_to_leader(
     side: str,
     offsets_deg: list[float],
     sign_flip_joints: list[int],
     *,
     gripper_open: float | None = None,
     gripper_closed: float | None = None,
+    model_home: ModelHomeFit | None = None,
     rig: str | None = None,
 ):
-    """Removed: conversion calibration belongs to the FACTR leader YAML.
-
-    Sets offsets + sign flips, plus ``gripper_open``/``gripper_closed`` when provided
-    (recorded endpoints win; unprovided endpoints fall back to any existing value).
-    Merges into any existing convention, edits the file text in place (keeping
-    comments), and returns the written :class:`~pathlib.Path`. Validated by re-parsing
-    before the write, so a splice that would corrupt the file raises instead of leaving
-    it broken. *Reset services* re-composes so the change takes effect.
-    """
-    raise RuntimeError("refusing follower config write: edit the FACTR arm YAML")
+    """Load, update, validate, and atomically save the active DFC factr YAML."""
+    import os
+    import tempfile
     import yaml
 
-    path = rig_path(rig)
-    text = path.read_text()
-    data = yaml.safe_load(text) or {}
-    existing = (((data.get("arms") or {}).get(side) or {}).get("convention") or {})
-    if not isinstance(existing, dict):
-        existing = {}
-
-    conv: dict = {
-        "offsets_deg": [round(float(o), 2) for o in offsets_deg],
-        "sign_flip_joints": [int(j) for j in sorted(set(int(x) for x in sign_flip_joints))],
-    }
+    path = factr_path(rig)
+    data = yaml.safe_load(path.read_text()) or {}
+    leaders = data.get("leaders")
+    if not isinstance(leaders, dict) or side not in leaders:
+        raise RuntimeError(f"no `leaders.{side}` object in {path.name}")
+    leader = leaders[side]
+    if not isinstance(leader, dict):
+        raise RuntimeError(f"`leaders.{side}` is not a YAML object in {path.name}")
+    conv = leader.get("raw_to_dfc")
+    if not isinstance(conv, dict):
+        raise RuntimeError(
+            f"`leaders.{side}.raw_to_dfc` is not a YAML object in {path.name}"
+        )
+    conv["offsets_deg"] = [round(float(o), 2) for o in offsets_deg]
+    conv["sign_flip_joints"] = [
+        int(j) for j in sorted(set(int(x) for x in sign_flip_joints))
+    ]
+    conv.setdefault("wrap_deg", True)
+    conv.setdefault("drop_trailing", 1)
     if gripper_open is not None:
         conv["gripper_open"] = round(float(gripper_open), 4)
     if gripper_closed is not None:
         conv["gripper_closed"] = round(float(gripper_closed), 4)
-    for k, v in existing.items():  # keep gripper endpoints / any other tuned keys not re-measured
-        if k not in conv:
-            conv[k] = v
-
-    new_text = _splice_convention(text, side, conv)
-
-    # Validate before writing: the spliced convention must parse back to `conv`.
-    reparsed = yaml.safe_load(new_text) or {}
-    got = (((reparsed.get("arms") or {}).get(side) or {}).get("convention") or {})
-    if got.get("offsets_deg") != conv["offsets_deg"] or got.get("sign_flip_joints") != conv["sign_flip_joints"]:
-        raise RuntimeError(f"write-back validation failed for arms.{side}.convention in {path.name}")
-
-    path.write_text(new_text)
+    if model_home is not None:
+        dof = len(conv["offsets_deg"])
+        if not (
+            len(model_home.home_q_rad)
+            == len(model_home.signs)
+            == len(model_home.offset_rad)
+            == dof
+        ):
+            raise RuntimeError(f"model-home calibration must contain {dof} arm joints")
+        leader["home_q_rad"] = [round(float(v), 10) for v in model_home.home_q_rad]
+        transform = leader.setdefault("dfc_to_factr", {})
+        if not isinstance(transform, dict):
+            raise RuntimeError(
+                f"leaders.{side}.dfc_to_factr is not a YAML object in {path.name}"
+            )
+        transform["signs"] = [int(v) for v in model_home.signs]
+        transform["offset_rad"] = [round(float(v), 10) for v in model_home.offset_rad]
+    rendered = yaml.safe_dump(data, sort_keys=False, width=120)
+    reparsed = yaml.safe_load(rendered) or {}
+    got_leader = (reparsed.get("leaders") or {}).get(side) or {}
+    got = got_leader.get("raw_to_dfc") or {}
+    if got != conv:
+        raise RuntimeError(
+            f"write-back validation failed for leaders.{side}.raw_to_dfc in {path.name}"
+        )
+    if model_home is not None:
+        if (
+            got_leader.get("home_q_rad") != leader["home_q_rad"]
+            or got_leader.get("dfc_to_factr") != leader["dfc_to_factr"]
+        ):
+            raise RuntimeError(
+                f"write-back validation failed for leaders.{side} model transform "
+                f"in {path.name}"
+            )
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as tmp:
+            temp_path = tmp.name
+            tmp.write(rendered)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None and os.path.exists(temp_path):
+            os.unlink(temp_path)
     return path
+
+
+def apply_to_rig(*args, **kwargs):
+    """Compatibility alias; calibration now saves to DFC's leader config."""
+    return apply_to_leader(*args, **kwargs)
 
 
 def reset() -> None:

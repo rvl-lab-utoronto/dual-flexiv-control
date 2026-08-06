@@ -327,7 +327,7 @@ class SessionManager:
         return self.send({"cmd": "respawn_camera", "name": name})
 
     def start_factr(self) -> bool:
-        """Launch the FACTR-Server processes (pose-then-calibrate countdown)."""
+        """Launch the FACTR-Server processes after the legacy delay."""
         return self.send({"cmd": "start_factr"})
 
     def stop_factr(self) -> bool:

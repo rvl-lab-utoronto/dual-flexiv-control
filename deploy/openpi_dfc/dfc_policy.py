@@ -1,8 +1,12 @@
-"""Dual-Flexiv transforms for an OpenPI π0.5 policy.
+"""Canonical DFC state/action layout and OpenPI-side model transforms.
 
-This module deliberately has no OpenPI imports: OpenPI accepts ordinary callable
-transforms, and keeping the robot-shape logic NumPy-only makes it possible to test
-the exact 14-state / 16-action contract on the robot workstation.
+DFC owns the 14-state / 16-action format. Endpoint projection—including which
+policy indices correspond to each arm—belongs to ``conf/policy/*.yaml`` in the
+robot client. The transforms here begin *after* that wire layout: they adapt a
+DFC-native OpenPI request to the model's internal image/action representation.
+
+This module deliberately has no OpenPI imports. Keeping the transformation
+NumPy-only makes the canonical layout independently testable.
 """
 
 from __future__ import annotations
@@ -11,8 +15,12 @@ import dataclasses
 
 import numpy as np
 
-STATE_DIM = 14
-ACTION_DIM = 16
+from dual_flexiv_control.layout import DFCStateActionLayout
+
+
+DFC_STATE_ACTION_LAYOUT = DFCStateActionLayout.bimanual_qpos()
+STATE_DIM = DFC_STATE_ACTION_LAYOUT.state_dim
+ACTION_DIM = DFC_STATE_ACTION_LAYOUT.action_dim
 
 
 def _parse_image(value: object, key: str) -> np.ndarray:
@@ -32,13 +40,12 @@ def _parse_image(value: object, key: str) -> np.ndarray:
 
 
 @dataclasses.dataclass(frozen=True)
-class DFCInputs:
-    """Map the dashboard's flat slash-keyed request into the π0.5 model shape.
+class OpenPIInputs:
+    """Map a DFC-native request into OpenPI's internal model representation.
 
-    The physical rig currently has one stereo ZED and no wrist cameras. π0.5 has
-    one base-camera slot and two wrist-camera slots, so ``static_left`` is the
-    base view and the wrist slots are explicitly masked. ``static_right`` remains
-    on the wire for recording/visualization but is not mislabeled as a wrist view.
+    The current checkpoint consumes one base-camera slot and two optional wrist
+    slots. ``static_left`` fills the base view; absent wrist views are black and
+    masked. This is checkpoint/model adaptation, not the DFC endpoint schema.
     """
 
     def __call__(self, data: dict) -> dict:
@@ -81,44 +88,41 @@ class DFCInputs:
 
 
 @dataclasses.dataclass(frozen=True)
-class DFCJointDeltas:
-    """Convert the two 7-DoF joint blocks between absolute and delta space.
+class OpenPIActionDeltas:
+    """Convert canonical DFC joint targets between absolute and delta space.
 
-    DFC observations contain 14 joints but actions interleave two gripper values:
-
-    ``left q[7], left grip, right q[7], right grip``.
-
-    OpenPI's generic ``DeltaActions`` assumes state and action columns align, so
-    it cannot represent this layout. This transform handles the two joint slices
-    explicitly and leaves both grippers absolute.
+    OpenPI's generic ``DeltaActions`` assumes state and action columns align.
+    DFC's canonical action interleaves grippers, so the global layout supplies
+    the state/action joint-block pairs. Grippers remain absolute.
     """
 
     inverse: bool = False
+    layout: DFCStateActionLayout = DFC_STATE_ACTION_LAYOUT
 
     def __call__(self, data: dict) -> dict:
         if "actions" not in data:
             return data
         state = np.asarray(data["state"])
         actions = np.asarray(data["actions"]).copy()
-        if state.shape[-1] < STATE_DIM:
+        if state.shape[-1] < self.layout.state_dim:
             raise ValueError(
-                f"DFC state must contain {STATE_DIM} joints, got {state.shape}"
+                f"DFC state must contain {self.layout.state_dim} joints, got {state.shape}"
             )
-        if actions.shape[-1] < ACTION_DIM:
+        if actions.shape[-1] < self.layout.action_dim:
             raise ValueError(
-                f"DFC actions must contain {ACTION_DIM} values, got {actions.shape}"
+                f"DFC actions must contain {self.layout.action_dim} values, got {actions.shape}"
             )
         sign = 1.0 if self.inverse else -1.0
-        actions[..., 0:7] += sign * state[..., None, 0:7]
-        actions[..., 8:15] += sign * state[..., None, 7:14]
+        for state_slice, action_slice in self.layout.state_to_action_joint_slices():
+            actions[..., action_slice] += sign * state[..., None, state_slice]
         result = dict(data)
         result["actions"] = actions
         return result
 
 
 @dataclasses.dataclass(frozen=True)
-class DFCOutputs:
-    """Crop the padded π0.5 action head back to DFC's 16-value action layout."""
+class OpenPIOutputs:
+    """Crop OpenPI's padded action head to the canonical DFC action width."""
 
     def __call__(self, data: dict) -> dict:
         actions = np.asarray(data["actions"])

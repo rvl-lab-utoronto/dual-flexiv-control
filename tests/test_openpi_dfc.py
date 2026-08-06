@@ -10,16 +10,16 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
 from deploy.openpi_dfc.dfc_policy import ACTION_DIM
-from deploy.openpi_dfc.dfc_policy import DFCInputs
-from deploy.openpi_dfc.dfc_policy import DFCJointDeltas
-from deploy.openpi_dfc.dfc_policy import DFCOutputs
+from deploy.openpi_dfc.dfc_policy import OpenPIActionDeltas
+from deploy.openpi_dfc.dfc_policy import OpenPIInputs
+from deploy.openpi_dfc.dfc_policy import OpenPIOutputs
 from deploy.openpi_dfc.dfc_policy import STATE_DIM
 
 
 def test_dfc_inputs_use_base_view_and_mask_nonexistent_wrist_cameras():
     left = np.full((3, 8, 12), 0.5, dtype=np.float32)
     right = np.full((8, 12, 3), 255, dtype=np.uint8)
-    result = DFCInputs()({
+    result = OpenPIInputs()({
         "observation/state": np.arange(STATE_DIM),
         "observation/images/static_left": left,
         "observation/images/static_right": right,
@@ -43,8 +43,8 @@ def test_dfc_joint_delta_transform_round_trips_interleaved_grippers():
     actions = np.tile(np.arange(ACTION_DIM, dtype=np.float64), (4, 1))
     original = {"state": state, "actions": actions}
 
-    delta = DFCJointDeltas()(original)
-    restored = DFCJointDeltas(inverse=True)(delta)
+    delta = OpenPIActionDeltas()(original)
+    restored = OpenPIActionDeltas(inverse=True)(delta)
 
     np.testing.assert_allclose(restored["actions"], actions)
     np.testing.assert_allclose(delta["actions"][:, 0:7], actions[:, 0:7] - state[0:7])
@@ -55,7 +55,7 @@ def test_dfc_joint_delta_transform_round_trips_interleaved_grippers():
 
 def test_dfc_contract_rejects_aloha_sized_actions():
     with pytest.raises(ValueError, match="16"):
-        DFCInputs()({
+        OpenPIInputs()({
             "observation/state": np.zeros(STATE_DIM),
             "observation/images/static_left": np.zeros((8, 12, 3)),
             "actions": np.zeros((50, 14)),
@@ -64,7 +64,7 @@ def test_dfc_contract_rejects_aloha_sized_actions():
 
 def test_dfc_outputs_crop_openpi_padding():
     actions = np.arange(50 * 32).reshape(50, 32)
-    result = DFCOutputs()({"actions": actions})
+    result = OpenPIOutputs()({"actions": actions})
     assert result["actions"].shape == (50, ACTION_DIM)
     np.testing.assert_array_equal(result["actions"], actions[:, :ACTION_DIM])
 

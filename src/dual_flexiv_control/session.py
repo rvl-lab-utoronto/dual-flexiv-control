@@ -27,7 +27,7 @@ session drops back to VIEWING with the hardware untouched.
   "name": "zed:<name>"}`` (replace that hardware node now, when no run needs
   it), ``{"cmd": "start_factr"}`` / ``{"cmd": "stop_factr"}`` (launch/stop the
   external FACTR-Server processes — grav-comp leaders + API relay — when
-  ``factr.launch.enabled``; start arms a pose-then-calibrate countdown — legacy,
+  ``factr.launch.enabled``; start arms a plain delayed launch — legacy,
   the services now auto-start with the daemon), ``{"cmd": "enable_grav_comp"}`` /
   ``{"cmd": "disable_grav_comp"}`` (POST every leader relay to ramp only its
   gravity-compensation gain up / down over ~1s),
@@ -61,7 +61,7 @@ by a flaky camera.
 The **FACTR-Server processes** (when ``factr.launch.enabled``) are supervised
 by :class:`~dual_flexiv_control.interfaces.factr.FactrServerSupervisor` in the
 same spirit: a dead API relay is respawned (paced), a dead grav-comp teleop is
-only reported (respawning would re-energize + re-calibrate an unposed leader),
+only reported (respawning would re-energize a leader without operator action),
 and daemon shutdown SIGINTs the group so the leader servos always de-energize.
 """
 
@@ -558,7 +558,7 @@ class SessionDaemon:
             )
         if not sides:
             return None
-        return FactrServerSupervisor(launch, sides)
+        return FactrServerSupervisor(launch, sides, config.factr.leaders)
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -566,10 +566,8 @@ class SessionDaemon:
         nodes = build_hardware_nodes(self.config, self.run_id, self.session_qs)
         # Arms, cameras and the FACTR producer are all supervised individually
         # (down + respawn), never session-fatal.
-        arm_nodes = [
-            n for n in nodes if not n.name.startswith("zed:") and n.name != "factr"
-        ]
-        cam_nodes = [n for n in nodes if n.name.startswith("zed:")]
+        cam_nodes = [n for n in nodes if hasattr(n, "cam_name")]
+        arm_nodes = [n for n in nodes if not hasattr(n, "cam_name") and n.name != "factr"]
         factr_node = next((n for n in nodes if n.name == "factr"), None)
         self.arms = [self._make_arm_unit(node) for node in arm_nodes]
         self.cameras = [self._make_camera_unit(node) for node in cam_nodes]
@@ -997,7 +995,13 @@ class SessionDaemon:
             )
             return
         for side in command_sides:
-            self.session_qs[side].put(EnterControl(coeffs=coeffs, phase=phase))
+            self.session_qs[side].put(
+                EnterControl(
+                    coeffs=coeffs,
+                    control=run_config.policy.control,
+                    phase=phase,
+                )
+            )
         stop_event = self.ctx.Event()
         proc = self.ctx.Process(target=run_node, args=(consumer, stop_event), name=consumer.name)
         proc.start()
@@ -1179,13 +1183,12 @@ class SessionDaemon:
         log.info("respawn_camera %s: node respawned", name)
 
     def _handle_start_factr(self) -> None:
-        """Arm the FACTR-Server launch (pose-then-calibrate countdown).
+        """Arm the legacy delayed FACTR-Server launch.
 
-        Refused while a run is active or queued: the teleops energize the leader
-        servos and calibrate against whatever pose the arms hold when they boot —
-        mid-run the operator's hands (or a rollout) are on them. The countdown is
-        the operator's window to pose the arms; the processes spawn from
-        :meth:`_tend_factr_servers` when it expires.
+        Refused while a run is active or queued because launching energizes the
+        leader servos. Calibration is injected from DFC and never inferred from
+        startup pose. Processes spawn from :meth:`_tend_factr_servers` after the
+        configured legacy delay expires.
         """
         if self.factr_servers is None:
             self.state.message = (
@@ -1196,8 +1199,8 @@ class SessionDaemon:
             return
         if self.run is not None or self.pending is not None:
             self.state.message = (
-                "cannot launch the FACTR servers during a run — the teleops "
-                "calibrate the leader arms at boot; stop the run first"
+                "cannot launch the FACTR servers during a run because doing so "
+                "energizes the leader arms; stop the run first"
             )
             return
         ok, detail = self.factr_servers.request_start()
@@ -1269,8 +1272,8 @@ class SessionDaemon:
             ok.append(side)
             log.info("grav comp %s: signalled %s leader (%s:%s)",
                      verb, side, srv.host, srv.port)
-        # FACTR carries its calibration/status diagnostics on the existing
-        # WebSocket stream; nothing extra is fetched or logged to Rerun here.
+        # FACTR carries live telemetry on the existing WebSocket stream; nothing
+        # extra is fetched here.
         # On disable the gravity gain ramps to 0 → the leader loses gravity
         # support and can SAG while
         # still streaming its (sagging) joint positions. A live collection run's

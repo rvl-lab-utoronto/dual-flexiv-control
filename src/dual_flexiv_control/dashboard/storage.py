@@ -1,11 +1,11 @@
-"""Recorded-episode storage: discover LeRobot datasets and delete episodes.
+"""Recorded-episode storage: discover, download, and delete saved episodes.
 
 Backs the dashboard's **Storage** tab. Collection writes demonstrations as
 LeRobot datasets under ``recording.root`` (one folder per ``repo_id``,
 possibly namespaced, e.g. ``dfc/pick``). This module:
 
 * finds every dataset under that root (any folder with a ``meta/info.json``),
-* lists each dataset's episodes (index, frame count, duration, task), and
+* lists each dataset's episodes (index, frame count, duration, task, MP4 files),
 * deletes episodes — single or in bulk.
 
 Deletion detail: LeRobot's :func:`dataset_tools.delete_episodes` is an *immutable*
@@ -21,6 +21,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import threading
 from dataclasses import dataclass
@@ -55,6 +56,17 @@ _ROOT: str | None = None
 
 
 @dataclass(frozen=True)
+class EpisodeVideo:
+    """One finalized camera MP4 belonging to a saved episode."""
+
+    key: str                   # LeRobot feature key, e.g. observation.images.static_left
+    label: str                 # compact camera label for the Storage UI
+    path: str                  # absolute existing MP4 path
+    filename: str              # friendly exported download filename
+    size_bytes: int
+
+
+@dataclass(frozen=True)
 class EpisodeInfo:
     """One recorded episode within a dataset."""
 
@@ -62,6 +74,7 @@ class EpisodeInfo:
     length: int              # frames
     duration_s: float        # length / fps
     tasks: tuple[str, ...]   # language instruction(s)
+    videos: tuple[EpisodeVideo, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -139,13 +152,23 @@ def discover_datasets(root: str | None = None) -> list[DatasetInfo]:
 
 def _read_dataset(repo_id: str, ds_dir: str, info_path: Path) -> DatasetInfo:
     info = json.loads(info_path.read_text())
+    # LeRobot v2 wrote ``video_keys`` at the top level; v3 derives the same list
+    # from features whose dtype is ``video``. Accept both so old and newly
+    # recorded datasets expose identical downloads.
+    video_keys = list(info.get("video_keys", []) or [])
+    if not video_keys:
+        video_keys = [
+            key
+            for key, feature in (info.get("features", {}) or {}).items()
+            if isinstance(feature, dict) and feature.get("dtype") == "video"
+        ]
     return DatasetInfo(
         repo_id=repo_id,
         path=ds_dir,
         num_episodes=int(info.get("total_episodes", 0)),
         num_frames=int(info.get("total_frames", 0)),
         fps=float(info.get("fps", 0) or 0),
-        video_keys=tuple(info.get("video_keys", []) or []),
+        video_keys=tuple(video_keys),
         size_bytes=_dir_size(ds_dir),
     )
 
@@ -175,18 +198,61 @@ def list_episodes(ds: DatasetInfo) -> list[EpisodeInfo]:
 
     episodes = []
     for row in rows:
+        index = int(row["episode_index"])
         length = int(row["length"])
         tasks = row.get("tasks") or []
         episodes.append(
             EpisodeInfo(
-                index=int(row["episode_index"]),
+                index=index,
                 length=length,
                 duration_s=length / fps,
                 tasks=tuple(str(t) for t in tasks),
+                videos=_episode_videos(ds, meta, index),
             )
         )
     episodes.sort(key=lambda e: e.index)
     return episodes
+
+
+def _episode_videos(ds: DatasetInfo, meta, episode_index: int) -> tuple[EpisodeVideo, ...]:
+    """Resolve every finalized MP4 for one episode through LeRobot metadata."""
+    videos = []
+    for key in ds.video_keys:
+        try:
+            rel = Path(meta.get_video_file_path(episode_index, key))
+            path = rel if rel.is_absolute() else Path(ds.path) / rel
+            path = path.resolve(strict=True)
+            size_bytes = path.stat().st_size
+        except Exception as exc:  # noqa: BLE001 - one missing video must not hide the episode
+            log.warning(
+                "saved video unavailable for %s episode %d (%s): %s",
+                ds.repo_id,
+                episode_index,
+                key,
+                exc,
+            )
+            continue
+        if path.suffix.lower() != ".mp4":
+            log.warning("saved video is not MP4; skipping download: %s", path)
+            continue
+        label = key.removeprefix("observation.images.")
+        videos.append(
+            EpisodeVideo(
+                key=key,
+                label=label,
+                path=str(path),
+                filename=_video_filename(ds.repo_id, episode_index, label),
+                size_bytes=size_bytes,
+            )
+        )
+    return tuple(videos)
+
+
+def _video_filename(repo_id: str, episode_index: int, label: str) -> str:
+    """Stable, portable exported filename identifying dataset/episode/camera."""
+    clean_repo = re.sub(r"[^A-Za-z0-9._-]+", "-", repo_id).strip(".-") or "dataset"
+    clean_label = re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip(".-") or "camera"
+    return f"{clean_repo}-episode-{episode_index:04d}-{clean_label}.mp4"
 
 
 def delete_dataset(ds: DatasetInfo) -> None:

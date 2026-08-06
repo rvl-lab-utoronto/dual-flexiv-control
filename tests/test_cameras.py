@@ -12,6 +12,7 @@ from dual_flexiv_control.cameras import reshape_frame
 from dual_flexiv_control.cameras import view_channels
 from dual_flexiv_control.cameras import view_dtype
 from dual_flexiv_control.configs import CameraCfg
+from dual_flexiv_control.interfaces.realsense import FakeRealSenseSource
 from dual_flexiv_control.interfaces.zed import FakeZedSource
 
 
@@ -34,8 +35,10 @@ def test_view_channels_and_dtype():
     assert view_channels("left") == 3
     assert view_channels("right") == 3
     assert view_channels("depth") == 1
+    assert view_channels("color") == 3
     assert view_dtype("left") == "uint8"
     assert view_dtype("depth") == "float32"
+    assert view_dtype("color") == "uint8"
     with pytest.raises(ValueError):
         view_channels("bogus")
     with pytest.raises(ValueError):
@@ -99,4 +102,19 @@ def test_reshape_frame_roundtrips_flattened_sample():
 
     flat_depth = np.ascontiguousarray(frames["depth"]).reshape(-1)
     np.testing.assert_array_equal(reshape_frame(flat_depth, cam, "depth"), frames["depth"])
+    src.close()
+
+
+def test_fake_realsense_color_depth_shapes_and_dtypes():
+    cam = CameraCfg(
+        backend="realsense", model="d435", placement="static", resolution="640x480",
+        width=8, height=6, fps=30.0, views=["color", "depth"], capacity=4,
+    )
+    src = FakeRealSenseSource(cam)
+    src.open()
+    frames = src.read()
+    assert frames["color"].shape == (6, 8, 3)
+    assert frames["color"].dtype == np.uint8
+    assert frames["depth"].shape == (6, 8)
+    assert frames["depth"].dtype == np.float32
     src.close()

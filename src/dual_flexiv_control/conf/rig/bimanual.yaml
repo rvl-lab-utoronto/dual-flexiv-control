@@ -1,6 +1,7 @@
 # @package _global_
-# The full bimanual rig: two Flexiv Rizon 4s arms, two ZED X Nano wrist cameras,
-# one static ZED 2i, and both FACTR leaders. The default rig (`config.yaml`).
+# The full bimanual rig: two Flexiv Rizon 4s arms, two RealSense RGB-D wrist
+# cameras, one static ZED 2i, and both FACTR leaders. The default rig
+# (`config.yaml`).
 #
 # A rig answers "what hardware exists": which arms/cameras/FACTR servers to spawn,
 # their serials and display names, and each arm's control mode. Switch rigs with
@@ -8,15 +9,15 @@
 defaults:
   - /arm@arms.left: flexiv
   - /arm@arms.right: flexiv
-  # - /camera@cameras.wrist_left: zedx_wrist
-  # - /camera@cameras.wrist_right: zedx_wrist
+  - /camera@cameras.wrist_left: realsense_rgbd
+  - /camera@cameras.wrist_right: realsense_rgbd
   - /camera@cameras.static: zed2_static
   - /factr: bimanual
   - _self_
 
 arms:
   left:
-    control: ${task.control}
+    control: ${policy.control}
     name: "Lauer"
     serial: Rizon4s-062841
     control_enabled: true
@@ -27,12 +28,12 @@ arms:
       enabled: true
       name: "Flexiv-GN01"
       velocity: 0.1          # Move velocity [m/s] (clamped to the gripper's params)
-      force: 20.0            # Move force [N]      (clamped to the gripper's params)
+      force: 40.0            # Move force [N]      (clamped to the gripper's params)
       # open_width: 0.10     # override physical width [m] at 0.0 (default: params max_width)
       # closed_width: 0.0    # override physical width [m] at 1.0 (default: params min_width)
       # move_rate_hz: 15.0   # max Move rate; deadband: 0.02; init_on_start: true
   right:
-    control: ${task.control}
+    control: ${policy.control}
     name: "Rogers"
     serial: Rizon4s-062837
     control_enabled: true
@@ -43,7 +44,7 @@ arms:
       enabled: true
       name: "Flexiv-GN01"
       velocity: 0.1          # Move velocity [m/s] (clamped to the gripper's params)
-      force: 20.0            # Move force [N]      (clamped to the gripper's params)
+      force: 40.0            # Move force [N]      (clamped to the gripper's params)
       # open_width: 0.10     # override physical width [m] at 0.0 (default: params max_width)
       # closed_width: 0.0    # override physical width [m] at 1.0 (default: params m
 # `serial` "" opens the first available camera; set each camera's real (numeric)
@@ -51,6 +52,15 @@ arms:
 # whatever single ZED is connected (overrides `serial`).
 
 cameras:
+  # Set distinct serials when two RealSense devices are connected. Empty serials
+  # let each source use its first available device and are useful for simulation
+  # or single-camera bring-up, but should not be used for a two-camera run.
+  wrist_left:
+    placement: wrist_left
+    serial: ""
+  wrist_right:
+    placement: wrist_right
+    serial: ""
   static:
     placement: static
     serial: ""

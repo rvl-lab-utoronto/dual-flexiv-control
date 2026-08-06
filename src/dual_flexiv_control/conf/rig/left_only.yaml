@@ -15,7 +15,7 @@ defaults:
 
 arms:
   left:
-    control: ${task.control}
+    control: ${policy.control}
     name: "Lauer"
     serial: Rizon4s-062841
     control_enabled: true
@@ -28,7 +28,7 @@ arms:
       # (warns, arm keeps running).
       name: "Flexiv-GN01"
       velocity: 0.1          # Move velocity [m/s] (clamped to the gripper's params)
-      force: 20.0            # Move force [N]      (clamped to the gripper's params)
+      force: 40.0            # Move force [N]      (clamped to the gripper's params)
       # open_width: 0.10     # override physical width [m] at 0.0 (default: params max_width)
       # closed_width: 0.0    # override physical width [m] at 1.0 (default: params min_width)
       # move_rate_hz: 15.0   # max Move rate; deadband: 0.02; init_on_start: true

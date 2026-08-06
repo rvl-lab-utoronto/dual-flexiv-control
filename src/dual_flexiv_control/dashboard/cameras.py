@@ -265,7 +265,8 @@ def depth_point_cloud(
     (NaN/Inf/0) and anything beyond ``max_depth_m`` is dropped.
     """
     views = {v.view: v for v in discover_camera_views() if v.camera == camera}
-    depth_view, rgb_view = views.get("depth"), views.get("left")
+    depth_view = views.get("depth")
+    rgb_view = views.get("left") or views.get("color")
     if depth_view is None or rgb_view is None:
         return None
     depth = _read_live_frame(depth_view, runtime_dir)

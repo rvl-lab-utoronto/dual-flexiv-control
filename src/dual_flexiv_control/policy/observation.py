@@ -11,14 +11,13 @@ no teleop sides. The canonical observation IS the LeRobot frame::
 
 built from the same config inputs (arms, cameras, ``state_signals``,
 instruction) as collection — identical layout by construction, not by
-convention. Policy schemas (:mod:`.schema`) then map this canonical dict onto
+convention. Endpoint adapters (:mod:`.adapter`) then map this canonical dict onto
 each policy server's wire format.
 """
 
 from __future__ import annotations
 
 from ..collection.features import FrameBuilder
-from ..collection.features import sorted_sides
 
 
 class ObservationBuilder:
@@ -33,18 +32,9 @@ class ObservationBuilder:
     def __init__(self, arms: dict, cameras: dict, instruction: str, state_signals) -> None:
         # No teleop sides: the frame has an empty action, which build() drops.
         self._frames = FrameBuilder(arms, [], cameras, instruction, list(state_signals))
+        self.layout = self._frames.layout
 
-        # Where each (side, signal) lands inside observation.state — same
-        # iteration order as FrameBuilder's state layout (sides, then signals).
-        self._state_slices: dict[tuple[str, str], slice] = {}
-        offset = 0
-        for side in sorted_sides(arms):
-            for sig in state_signals:
-                dim = int(arms[side].streams[sig].dim)
-                self._state_slices[(side, sig)] = slice(offset, offset + dim)
-                offset += dim
-
-    # -- schema ----------------------------------------------------------------
+    # -- canonical layout -------------------------------------------------------
 
     @property
     def stream_names(self) -> list[str]:
@@ -63,11 +53,11 @@ class ObservationBuilder:
     def state_slice(self, side: str, signal: str) -> slice:
         """Where ``(side, signal)`` lands inside ``observation.state``."""
         try:
-            return self._state_slices[(side, signal)]
+            return self.layout.state_slice(side, signal)
         except KeyError:
             raise KeyError(
                 f"({side!r}, {signal!r}) is not part of observation.state; "
-                f"available: {sorted(self._state_slices)}"
+                f"available: {sorted(self.layout._state)}"
             ) from None
 
     def missing(self, observation: dict) -> list[str]:

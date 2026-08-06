@@ -1,0 +1,19 @@
+defaults:
+  - base_camera
+  - _self_
+
+# Typical RealSense RGB-D profile. Both SDK frames are acquired as one frameset;
+# depth is aligned to color and both are published through DFC shared memory.
+# Recording is performed by the LeRobot recorder, never an SDK .bag file.
+backend: realsense
+model: d4xx
+resolution: 640x480
+width: 640
+height: 480
+fps: 30.0
+depth_mode: NONE
+align_depth: true
+capacity: 16
+views: [color, depth]
+pose_frame: world
+hfov_deg: 69.0

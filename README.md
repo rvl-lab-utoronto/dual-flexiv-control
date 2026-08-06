@@ -20,7 +20,8 @@ own process at its own rate:
    **ZED X Nano** wrist cameras (one per arm) and one static external **ZED 2**
    stereo camera.
 4. **The FACTR interface** (`interfaces/factr/`) — consumes each leader's WebSocket and
-   publishes both its raw Dynamixel reading and its converted DFC/Rizon pose. The
+   publishes its raw Dynamixel reading, converted DFC/Rizon pose, and explicit
+   per-field live telemetry streams. The
    socket is duplex: `FactrClient.send_force_feedback` pushes follower external
    joint torques back up it (joint-space `force_feedback` frames) for the leader's
    force-feedback term. At that boundary, RDK's environment-on-follower `tau_ext`
@@ -161,19 +162,35 @@ per tick (the rest are static limits from the coeffs). All paths are **NRT**
 | Controller | RDK mode | send fn | streamed (per-tick) |
 |---|---|---|---|
 | `qpos` | `NRT_JOINT_POSITION` | `SendJointPosition` | `q_d`, `dq_d` |
+| `qpos_impedance` | `NRT_JOINT_IMPEDANCE` | `SendJointPosition` | `q_d`, `dq_d` |
 | `qpos_overdamped` | `NRT_JOINT_IMPEDANCE` | `SendJointPosition` | `q_d`, `dq_d` (overdamped) |
 | `qvel` | `NRT_JOINT_POSITION` | `SendJointPosition` | `dq_d` (arm integrates `q_d`) |
 | `end_effector` | `NRT_CARTESIAN_MOTION_FORCE` | `SendCartesianMotionForce` | `pose_d`, `twist_d` |
 | `eef_vel` | `NRT_CARTESIAN_MOTION_FORCE` | `SendCartesianMotionForce` | `twist_d` (arm integrates `pose_d`) |
 | `force` | `NRT_CARTESIAN_MOTION_FORCE` | `SendCartesianMotionForce` | `wrench_d`, `pose_d` |
 
-Each task imports its controller under `task.control`, and each arm in the selected
-rig uses that controller. Impedance lives explicitly in the controller YAML; the
-default `qpos` leaves it to Flexiv's SDK, while `qpos_overdamped` and Cartesian
-controllers carry their own impedance blocks.
+Each policy imports its action/controller semantics under `policy.control`, and
+each arm in the selected rig uses that controller for the run. Tasks contain the
+instruction, observation schema, dataset identity, and phase counts only. Collection
+still records its complete configured frame and teleop action regardless of the
+selected policy controller. ``qpos_impedance`` is the neutral absolute-joint preset;
+plain ``qpos`` leaves stiffness to Flexiv's SDK, while ``qpos_overdamped`` and
+Cartesian controllers carry their own impedance blocks.
 
-**Controller coefficients** (motion/contact limits) default per phase from the
-schema. The named presets
+**Policy boundary.** DFC owns the canonical observation and action vectors.
+`layout.py` derives state/action names, dimensions, and per-arm slices from the
+selected rig and controller; collection and evaluation both reuse it. An
+endpoint adapter only implements an endpoint family's protocol. For OpenPI this
+means request key placement, image nesting/layout,
+prompt placement, and response parsing. Any checkpoint-specific embodiment
+projection is declared in its policy YAML as named `source` → `target` index
+copies, constants, and measured-state holds. See
+`conf/policy/pi05_aloha.yaml`: the omitted Flexiv joints, ALOHA gripper slots,
+camera mapping, and the complete 14-D → 16-D return mapping are readable there;
+there is no ALOHA-specific Python adapter.
+
+**Controller coefficients** (motion/contact limits plus a joint-stiffness scale)
+default per phase from the schema. The named presets
 (`compliant`/`stiff`/`default`/`very_compliant`) are registered in
 [configs.py](src/dual_flexiv_control/configs.py) (single source of truth — no YAML
 files); swap one per phase with an appended group override, e.g.
@@ -188,18 +205,18 @@ The convention boundary is intentionally at the FACTR interface. `factr/raw/<sid
 is the untouched hardware payload; it is retained for diagnostics and datasets as
 `observation.factr_raw.<side>`. `factr/<side>` is converted once into the canonical
 DFC/Rizon convention and is what the viewer, brain, and
-`observation.factr.<side>` use. The FACTR server keeps a separate FACTR-model
-convention internally for leader gravity compensation. Its arm YAML stores the complete
-raw-Dynamixel→DFC convention (offsets, sign flips, wrapping, trailing-field handling,
-and gripper endpoints), the distinct DFC-straight and FACTR-model reference coordinates,
-and the explicit DFC→FACTR transform (including FACTR's joint-4 `pi/2`). DFC loads the
-raw→DFC part of this contract from the diagnostics frame sent first on the leader's
-WebSocket and crashes if it is absent or malformed; no leader conversion values live
-in the follower rig YAML and calibration is not pushed between services.
+`observation.factr.<side>` use. All calibration lives in DFC under
+`conf/factr/<group>.yaml` → `leaders.<side>`: `raw_to_dfc`, canonical
+`home_q_rad`, and `dfc_to_factr`. The Calibration tab loads that YAML object,
+updates `raw_to_dfc`, and atomically saves it. For managed FACTR processes, the
+DFC supervisor injects the leader object at launch; FACTR derives its private
+inverse-dynamics model calibration rather than storing a second copy.
 
-FACTR diagnostics remain on the leader's existing WebSocket stream. They are used
-for calibration and dashboard status but are not published as a separate Rerun
-recording.
+Each leader WebSocket carries two outbound frame types: `reading` (raw encoder
+packet) and `telemetry` (live FACTR model/control state). DFC publishes telemetry
+as individual `factr/telemetry/<side>/<field>` streams: raw/model position,
+model velocity, home error, model offsets/signs, limit/null/gravity/friction/
+force-feedback/applied torque, and the gravity/feedback gain values and targets.
 
 With `arm.control_enabled=true`, the brain posts the already-converted FACTR pose as
 the Rizon qpos setpoint. A hardware-free run:
@@ -228,7 +245,7 @@ dual-flexiv-control arms.left.serial=Rizon4-XXXXXX arms.right.serial=Rizon4-YYYY
 More overrides:
 
 ```bash
-dual-flexiv-control control@task.control=force arms.left.wrench_frame=world \
+dual-flexiv-control control@policy.control=force arms.left.wrench_frame=world \
                   brain.rate_hz=200 arms.right.streams.tau.capacity=8192
 dual-flexiv-control factr.host=192.168.1.50 factr.port=8080   # FACTR server location
 dual-flexiv-control --cfg job        # print the fully composed config and exit
@@ -265,12 +282,15 @@ is tabbed: **📊 Viewer** embeds a live Rerun web viewer (live in every mode,
 including VIEWING) topped by the teach-and-repeat bar (pick a taught skill,
 **▶ Repeat**, ✏️ rename, 🗑 delete); **📷 Camera** shows a live view of any camera stream
 (`cam/<camera>/<view>`, streaming continuously while the session is up);
-**💾 Storage** lists recorded episodes with replay and (bulk) delete.
+**💾 Storage** lists recorded episodes with direct per-camera MP4 downloads,
+replay, teach, and (bulk) delete. Downloads stream the finalized files from disk
+instead of buffering copies in the dashboard process.
 
 ```bash
 pip install -e ".[dashboard]"     # adds rerun-sdk + streamlit
 dfc-dashboard                      # streamlit run; open the URL it prints
 # ports configurable: DFC_DASHBOARD_GRPC_PORT / DFC_DASHBOARD_WEB_PORT
+# MP4 downloads: DFC_DOWNLOAD_PORT (default 9092)
 ```
 
 Rerun's viewer is a visualization layer and can't host the dropdown/launch
@@ -285,7 +305,7 @@ Streamlit rerun.
  │  Task: [▼]   │   ┌────────────┬───────────────┐            │
  │  ✏️ YAML  ✏️  │   │  3D robot  │ proprio series│            │  Viewer  → skills bar + live 3D scene/plots
  │  ▶ Collection│   │  scene     │ FACTR leaders │            │  Camera  → live cam/<cam>/<view>
- │  ▶ Eval      │   └────────────┴───────────────┘            │  Storage → episodes: ▶ replay, 🎓 teach, 🗑 delete
+ │  ▶ Eval      │   └────────────┴───────────────┘            │  Storage → MP4 ⬇, ▶ replay, 🎓 teach, 🗑 delete
  │  Running ▣   │                                             │
  └──────────────┴─────────────────────────────────────────────┘
 ```
@@ -360,13 +380,12 @@ src/dual_flexiv_control/
 
 ## Status / TODO
 
-* FACTR streams **joint positions** and diagnostics as typed JSON frames on one
+* FACTR streams raw **joint positions** and live telemetry as typed JSON frames on one
   persistent WebSocket per leader, and accepts `force_feedback` frames back on
-  the same socket. The diagnostics frame carries the calibration contract.
+  the same socket. Calibration is DFC-owned and not part of the wire protocol.
 * **Control is implemented** over the control channel (`control/`). `qpos` FACTR
   teleop is verified end-to-end in sim; `qvel`/`end_effector`/`eef_vel`/`force` send
   paths are wired and verified against the flexivrdk 1.8 docs but **not yet
   hardware-tested**. The brain's `process()` runs FACTR→follower teleop by default;
   override it to post policy setpoints (`pack_streamed` + `Brain.command`).
-* Only the **left** arm's `JointConventionCfg` is known (from the test); the right
-  arm's offsets/sign-flips must be measured — do not assume symmetry.
+* Both leaders have independent DFC-owned calibration; do not assume symmetry.

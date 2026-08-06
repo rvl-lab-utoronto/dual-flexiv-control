@@ -16,19 +16,18 @@ signal target the python process itself, with no shell wrapper in between.
 Lifecycle, mirroring the task's semantics:
 
 * **Start is automatic at daemon boot** (:meth:`start_now`). The leader teleops
-  now boot with gravity and feedback activation at 0 and ramp each independently
-  when told to over HTTP, so there is no pose to hold and no calibration window
-  to honour. The legacy user-initiated path (``request_start()`` arms a
-  ``cfg.calib_delay_s`` pose-then-calibrate countdown, spawning when it expires)
-  is kept but is no longer the primary route.
+  receive their DFC-owned calibration as a launch contract, boot with gravity
+  and feedback activation at 0, and ramp each independently when told to over
+  HTTP. The legacy user-initiated path (``request_start()``) remains as a plain
+  delayed launch; startup pose never defines calibration.
 * **Stop means SIGINT.** The teleop nodes de-energize (zero + disable torque,
   close the serial port) only from ``KeyboardInterrupt``; SIGTERM kills them
   with the servos still energized. Escalation past ``cfg.stop_grace_s`` is
   therefore a last resort and logged as such.
 * **Supervision matches the hardware units' spirit:** a dead API relay is
   respawned (paced) — it never touches the servos. A dead teleop is only
-  *reported*: respawning it would re-energize and re-calibrate an unposed arm,
-  so relaunching stays the operator's call.
+  *reported*: respawning it would re-energize a leader without an explicit
+  operator action, so relaunching stays the operator's call.
 
 stdout of the teleops is discarded (they clear the screen at 500 Hz); their
 stderr — the per-second ``[health]`` telemetry — goes to the same
@@ -38,6 +37,7 @@ stderr — the per-second ``[health]`` telemetry — goes to the same
 from __future__ import annotations
 
 import logging
+import json
 import os
 import shlex
 import shutil
@@ -45,8 +45,10 @@ import signal
 import subprocess
 import time
 from dataclasses import dataclass
+from dataclasses import asdict
 from dataclasses import field
 
+from ...configs import FactrLeaderCfg
 from ...configs import FactrLaunchCfg
 
 log = logging.getLogger(__name__)
@@ -77,6 +79,7 @@ class _ServerUnit:
     log_path: str
     #: Teleop stdout is a 500 Hz screen-clear — discarded; the API's is kept.
     keep_stdout: bool
+    side: str | None = None
     proc: subprocess.Popen | None = None
     spawned_at: float = 0.0
     announced_down: bool = False
@@ -95,8 +98,19 @@ class FactrServerSupervisor:
     except :meth:`shutdown` (daemon teardown), which waits out the stop grace.
     """
 
-    def __init__(self, cfg: FactrLaunchCfg, sides: list[str]) -> None:
+    def __init__(
+        self,
+        cfg: FactrLaunchCfg,
+        sides: list[str],
+        leaders: dict[str, FactrLeaderCfg] | None = None,
+    ) -> None:
         self.cfg = cfg
+        self.leaders = dict(leaders or {})
+        missing = sorted(set(sides) - set(self.leaders))
+        if leaders is not None and missing:
+            raise ValueError(
+                f"managed FACTR teleop side(s) {missing} have no DFC leader calibration"
+            )
         self.workdir = os.path.expanduser(cfg.workdir)
         log_dir = os.path.join(self.workdir, "logs")
         self.units: list[_ServerUnit] = [
@@ -106,6 +120,7 @@ class FactrServerSupervisor:
                 module=cfg.teleop_modules[side],
                 log_path=os.path.join(log_dir, f"factr_health_{side}.log"),
                 keep_stdout=False,
+                side=side,
             )
             for side in sides
         ]
@@ -128,36 +143,28 @@ class FactrServerSupervisor:
     # -- commands ---------------------------------------------------------------
 
     def request_start(self) -> tuple[bool, str]:
-        """Arm the pose-then-calibrate countdown; processes spawn when it ends."""
+        """Arm the legacy delayed launch; processes spawn when it ends."""
         if self.state == COUNTDOWN:
             return False, "FACTR launch already counting down"
         if self.state == STOPPING:
             return False, "FACTR servers are still stopping — retry when they are down"
         if self.state == RUNNING:
             return False, (
-                "FACTR servers already launched — stop them first to relaunch "
-                "(a relaunch re-runs leader calibration)"
+                "FACTR servers already launched — stop them first to relaunch"
             )
         delay = max(0.0, float(self.cfg.calib_delay_s))
         self.state = COUNTDOWN
         self._deadline = time.monotonic() + delay
         self._countdown_ends_ts = time.time() + delay
-        log.info(
-            "FACTR launch armed: pose the leader arm(s) at %s — spawning in %.0fs",
-            self.cfg.calib_pose, delay,
-        )
-        return True, (
-            f"FACTR launch armed — pose the leader arm(s) at {self.cfg.calib_pose} "
-            f"NOW; calibration reads them in {delay:.0f}s"
-        )
+        log.info("FACTR delayed launch armed — spawning in %.0fs", delay)
+        return True, f"FACTR delayed launch armed — spawning in {delay:.0f}s"
 
     def start_now(self) -> tuple[bool, str]:
-        """Spawn the processes immediately, skipping the pose-then-calibrate countdown.
+        """Spawn the processes immediately, skipping the legacy launch delay.
 
-        The daemon's boot auto-start: the leader teleops now boot with gravity
-        and follower-feedback activation at 0 and ramp each term independently
-        from its dashboard signal, so there is nothing to pose for and no
-        calibration window to wait out. Idempotent — a no-op once the
+        The daemon's boot auto-start: leader calibration comes from DFC, while
+        gravity and follower-feedback activation start at 0 and ramp each term
+        independently from its dashboard signal. Idempotent — a no-op once the
         servers are counting down, running, or stopping (guards double-start).
         """
         if self.state in (COUNTDOWN, RUNNING, STOPPING):
@@ -212,8 +219,9 @@ class FactrServerSupervisor:
                 if unit.kind == "teleop":
                     log.error(
                         "FACTR %s exited (code %s) — its leader stream goes stale; "
-                        "NOT auto-respawned (that would re-energize and re-calibrate "
-                        "an unposed arm). Stop + relaunch from the dashboard; see %s",
+                        "NOT auto-respawned (that would re-energize a leader without "
+                        "an explicit operator action). Stop + relaunch from the "
+                        "dashboard; see %s",
                         unit.name, code, unit.log_path,
                     )
                 else:
@@ -327,12 +335,14 @@ class FactrServerSupervisor:
             [f"source {shlex.quote(s)}" for s in self.cfg.setup_scripts]
             + [f"exec {shlex.quote(self.cfg.python_exe)} -m {shlex.quote(unit.module)}"]
         )
-        # FACTR diagnostics stay on the existing WebSocket control/status channel.
-        # Never let the external relay create a second Rerun recording on the
-        # dashboard endpoint: the web viewer eagerly reloads background recordings
-        # after memory GC, which can turn this source into a relaunch loop.
         env = dict(os.environ)
-        env["FACTR_RERUN_URL"] = "disabled"
+        if unit.kind == "teleop" and unit.side in self.leaders:
+            # FACTR receives a derived-model input contract at process launch.
+            # The source calibration remains owned and persisted by DFC.
+            env["DFC_LEADER_CONFIG"] = json.dumps(
+                {"side": unit.side, **asdict(self.leaders[unit.side])},
+                separators=(",", ":"),
+            )
         # One log per launch (truncate), like the task; Popen inherits its own fd.
         with open(unit.log_path, "w") as logf:
             unit.proc = subprocess.Popen(

@@ -10,8 +10,9 @@ The hierarchy mirrors the stream paths discussed for the system:
     arms.left.streams.{q,dq,tau,tau_ext,wrench,eef,eef_vel} -> "left/<sig>"
     arms.right.streams.{...}                           -> streams "right/<sig>"
     factr.servers.{left,right}                         -> streams "factr/<side>"
-    arms.{left,right}.control                          -> per-arm ControlCfg
+    policy.control                                     -> policy action/controller semantics
                                                           (qpos|qvel|end_effector|force)
+    arms.{left,right}.control                          -> interpolation of policy.control
     task.{language_instruction, collection, eval}      -> active task + per-phase templates
 
 Control configs lay out the *command schema* (command field -> dim) plus the
@@ -136,7 +137,7 @@ class ControlChannelCfg:
 
 @dataclass
 class ControlCoeffsCfg:
-    """Per-phase motion, contact, and null-space limits.
+    """Per-phase motion, contact, stiffness-scale, and null-space limits.
 
     A separate importable config group (``control_coeffs``) so each task can give
     different coefficients to collection (training) vs eval. The arm controller
@@ -144,12 +145,16 @@ class ControlCoeffsCfg:
     against flexivrdk 1.8.0):
 
     Joint limits feed ``SendJointPosition``; Cartesian limits feed
-    ``SendCartesianMotionForce``. Impedance is applied separately from the selected
-    :class:`ControlCfg`, after ``SwitchMode``.
+    ``SendCartesianMotionForce``. Base impedance comes from the selected
+    :class:`ControlCfg`; ``joint_stiffness_scale`` scales its joint stiffness for
+    this phase after ``SwitchMode``.
     """
 
     max_contact_wrench: Optional[List[float]] = None            # [6] SetMaxContactWrench [N,Nm]
     null_space_posture: Optional[List[float]] = None            # [DoF] SetNullSpacePosture [rad]
+    joint_stiffness_scale: float = 1.0
+    """Multiplier on the selected joint-impedance controller's base ``K_q``.
+    Collection uses one third; eval and non-impedance modes retain their baseline."""
     # NRT joint motion limits -> SendJointPosition(..., max_vel, max_acc):
     max_joint_vel: float = 2.0       # [rad/s]
     max_joint_acc: float = 3.0       # [rad/s^2]
@@ -160,8 +165,8 @@ class ControlCoeffsCfg:
     max_angular_acc: float = 5.0     # [rad/s^2]
 
 
-# -- named per-phase limit presets. Controller impedance is intentionally absent:
-#    it lives explicitly in conf/control/*.yaml.
+# -- named per-phase presets. Base impedance lives in conf/control/*.yaml; the
+#    per-phase stiffness multiplier lives here.
 
 
 def compliant_coeffs() -> ControlCoeffsCfg:
@@ -171,6 +176,7 @@ def compliant_coeffs() -> ControlCoeffsCfg:
     """
     return ControlCoeffsCfg(
         max_contact_wrench=[40.0, 40.0, 40.0, 12.0, 12.0, 12.0],
+        joint_stiffness_scale=1.0 / 3.0,
         max_joint_vel=1.5,
         max_joint_acc=2.0,
         max_linear_vel=0.3,
@@ -318,7 +324,8 @@ class CollectionCfg:
     recording root. Required per task so tasks never silently share a dataset."""
 
     coeffs: ControlCoeffsCfg = field(default_factory=compliant_coeffs)
-    """Motion/contact limits during collection. Impedance lives on ``TaskCfg.control``."""
+    """Motion/contact limits and stiffness scale during collection. Base impedance
+    lives on the selected policy controller."""
 
     frequency_hz: float = 15.0
     """Collection loop rate: command + record cadence (also the dataset ``fps``)."""
@@ -339,7 +346,7 @@ class EvalCfg:
     """Rollout horizon — max timesteps before an eval episode is cut off."""
 
     coeffs: ControlCoeffsCfg = field(default_factory=stiff_coeffs)
-    """Controller coefficients during eval; stiff by default (precise tracking).
+    """Controller coefficients during eval; baseline stiffness and faster limits.
     Swap with ``control_coeffs@task.eval.coeffs=<preset>``."""
 
     frequency_hz: float = 15.0
@@ -360,7 +367,6 @@ class TaskCfg:
     """
 
     language_instruction: str = MISSING                            # shared by both phases
-    control: ControlCfg = MISSING
     state_signals: List[str] = field(default_factory=lambda: ["q"])
     """Proprio signals concatenated (per arm, side order) into ``observation.state``
     — shared by collection (recorded) and eval (observed) by construction."""
@@ -376,14 +382,14 @@ class TaskCfg:
 
 @dataclass
 class JointConventionCfg:
-    """Leader-owned FACTR → Rizon mapping loaded from the leader's calibration contract.
+    """Raw FACTR/Dynamixel → canonical DFC/Rizon mapping.
 
-    This is a runtime value object, not an ``ArmCfg``/follower setting. ``offsets_deg`` is added
+    This belongs to a DFC ``FactrLeaderCfg``, never an ``ArmCfg``/follower
+    setting. ``offsets_deg`` is added
     per-joint after converting the leader's radians to degrees; ``sign_flip_joints``
     negates those joint indices; the result is wrapped to ``[-180,180]`` and
     converted back to radians. ``drop_trailing`` discards FACTR's trailing gripper
-    value(s) (its payload is ``DoF+1``). The values must come from the corresponding
-    FACTR leader YAML; DFC deliberately has no calibrated defaults.
+    value(s) (its payload is ``DoF+1``).
 
     ``gripper_open``/``gripper_closed`` calibrate that trailing gripper value. FACTR
     serves it as an un-normalized servo angle in radians. Both endpoints are required
@@ -396,6 +402,31 @@ class JointConventionCfg:
     drop_trailing: int = 1
     gripper_open: Optional[float] = None       # raw FACTR gripper value [rad] mapped to normalized 0.0
     gripper_closed: Optional[float] = None      # raw FACTR gripper value [rad] mapped to normalized 1.0
+
+
+@dataclass
+class FactrTransformCfg:
+    """Canonical DFC/Rizon → FACTR dynamics-model affine transform.
+
+    ``q_factr = signs * q_dfc + offset_rad``. DFC combines this transform with
+    :class:`JointConventionCfg` when launching a managed FACTR teleop, deriving
+    the raw Dynamixel offsets/signs its inverse-dynamics model requires.
+    """
+
+    signs: List[float] = field(default_factory=list)
+    offset_rad: List[float] = field(default_factory=list)
+
+
+@dataclass
+class FactrLeaderCfg:
+    """All calibration for one physical FACTR leader, expressed on the DFC side."""
+
+    raw_to_dfc: JointConventionCfg = field(default_factory=JointConventionCfg)
+    home_q_rad: List[float] = field(default_factory=list)
+    """The leader's calibration/home pose in canonical DFC/Rizon coordinates."""
+
+    dfc_to_factr: FactrTransformCfg = field(default_factory=FactrTransformCfg)
+    """Conversion used only to derive FACTR's runtime inverse-dynamics model."""
 
 
 @dataclass
@@ -456,7 +487,7 @@ class GripperCfg:
 
 @dataclass
 class ArmCfg:
-    """One Flexiv arm: connection, read settings, stream schemas, default controller."""
+    """One Flexiv arm: hardware settings plus the active policy controller."""
 
     serial: str = MISSING
     name: str = ""                       # display name (e.g. dashboard); "" => the side
@@ -485,33 +516,36 @@ class ArmCfg:
 
 @dataclass
 class CameraCfg:
-    """One ZED camera publishing image streams (one process per camera).
+    """One camera publishing image streams (one process per camera).
 
     A camera publishes one stream per entry in ``views`` — canonical view names
-    (see :mod:`dual_flexiv_control.cameras`): ``left``/``right`` RGB (uint8,
-    HxWx3) and optional ``depth`` (float32, HxW, metres). Per-stream ``dim`` is
+    (see :mod:`dual_flexiv_control.cameras`): ZED ``left``/``right`` or
+    RealSense ``color`` RGB (uint8, HxWx3), and optional ``depth`` (float32,
+    HxW, metres). Per-stream ``dim`` is
     *derived* from ``width``/``height`` (× channels), so image sizes are never
     hand-computed. Streams are named ``"cam/<name>/<view>"`` where ``<name>`` is
     the camera's key in :attr:`Config.cameras` (e.g. ``cam/wrist_left/left``).
 
-    ``resolution`` is the ZED SDK ``sl.RESOLUTION`` enum name handed to the real
+    For ZED, ``resolution`` is the SDK ``sl.RESOLUTION`` enum name handed to the real
     camera; ``width``/``height`` must be what that resolution yields (the real
     source validates this at open and fails fast on mismatch). Valid enums are
     model-specific — ZED 2: HD2K/HD1080/HD720/VGA; ZED X (Nano): HD1200/HD1080/
     SVGA — confirm against your installed SDK.
     """
 
-    model: str = MISSING          # "zed2" | "zedx_nano" (informational; SDK auto-detects)
-    serial: str = ""              # ZED serial number (numeric); "" => first available
-    auto_serial: bool = False     # bind to the sole connected ZED's serial at open
+    backend: str = "zed"          # "zed" | "realsense"
+    model: str = MISSING           # informational model name
+    serial: str = ""              # device serial; "" => first available
+    auto_serial: bool = False     # bind to a connected camera's serial at open
                                   # (overrides `serial`; use only when exactly one
                                   # ZED is attached, e.g. single-camera bringup)
     placement: str = MISSING      # "wrist_left" | "wrist_right" | "static"
-    resolution: str = "HD720"     # sl.RESOLUTION enum name handed to the real camera
+    resolution: str = "HD720"     # ZED enum name; informational for RealSense
     width: int = MISSING          # frame width  [px]; must match `resolution`
     height: int = MISSING         # frame height [px]; must match `resolution`
     fps: float = 30.0             # capture rate -> this producer's rate_hz
     depth_mode: str = "NONE"      # sl.DEPTH_MODE name; must be != NONE if "depth" in views
+    align_depth: bool = True       # RealSense: align depth pixels to the color frame
     views: List[str] = MISSING    # canonical views to publish, e.g. ["left"] or ["left","right"]
     capacity: int = 16            # ring depth (frames retained) for each of this camera's streams
 
@@ -532,7 +566,7 @@ class CameraCfg:
 class FactrServerCfg:
     """One FACTR leader-arm WebSocket stream.
 
-    ``ws://{host}:{port}/{endpoint}`` pushes typed reading and diagnostics frames
+    ``ws://{host}:{port}/{endpoint}`` pushes typed reading and telemetry frames
     for that leader. ``{side}`` in the endpoint is expanded by the client. A
     reading contains ``dof`` values: arm joints plus the trailing gripper.
     """
@@ -553,9 +587,9 @@ class FactrLaunchCfg:
     process per leader arm plus the WebSocket/control relay, supervised like the
     hardware
     nodes (see :class:`~dual_flexiv_control.interfaces.factr.FactrServerSupervisor`)
-    and driven from the dashboard's Teleop leaders panel. Launching is always
-    user-initiated — the teleops energize the leader servos and read a
-    calibration pose at boot.
+    and driven from the dashboard's Teleop leaders panel. The daemon injects
+    each leader's DFC-owned calibration into its teleop process at launch;
+    teleops never infer calibration from their startup pose.
 
     The processes run outside our environment on purpose: ``python_exe`` is the
     system interpreter (conda's python cannot load rclpy) and ``setup_scripts``
@@ -592,11 +626,11 @@ class FactrLaunchCfg:
     relay holding them would kill the fresh one at bind."""
 
     calib_delay_s: float = 30.0
-    """Seconds between the operator's Launch and the spawn: the teleops read the
-    leaders' pose for calibration at boot, so the arms must be posed FIRST."""
+    """Legacy/manual launch countdown in seconds. It only delays process spawn;
+    calibration is already supplied by DFC."""
 
     calib_pose: str = "[0, 0, 0, 1.57, 0, 0, 0] (J4 ≈ 90°)"
-    """Human-readable calibration pose, shown with the countdown."""
+    """Deprecated dashboard hint retained for status-payload compatibility."""
 
     stop_grace_s: float = 10.0
     """Cooperative window after SIGINT (the only stop that de-energizes the
@@ -610,13 +644,16 @@ class FactrCfg:
     The :class:`~dual_flexiv_control.interfaces.factr.FactrInterface` node is
     the single WebSocket consumer: it reads each configured server's latest
     cached frame at ``rate_hz`` and
-    publishes each leader's raw payload as a ``factr/<side>`` shared-memory
-    stream. Consumers (the collection loop, the brain, the dashboard) attach
+    publishes each leader's raw payload as ``factr/raw/<side>``, its DFC/Rizon
+    conversion as ``factr/<side>``, and live FACTR control telemetry as
+    per-field ``factr/telemetry/<side>/<field>`` streams. Consumers attach
     read-only to those streams — never to the servers — so control and the
     viewer see identical samples by construction.
     """
 
     servers: Dict[str, FactrServerCfg] = field(default_factory=dict)
+    leaders: Dict[str, FactrLeaderCfg] = field(default_factory=dict)
+    """side → DFC-owned leader calibration. Its keys must match ``servers``."""
 
     rate_hz: float = 100.0
     """The producer's shared-memory publish rate. Far above the collection
@@ -627,13 +664,84 @@ class FactrCfg:
     treated as a leader dropout (consumers hold their last real target; the
     dashboard shows the leader as disconnected)."""
 
-    calibration_timeout_s: float = 30.0
-    """Maximum startup wait for each leader's calibration contract. Connection refusal
-    or ``available=false`` is treated as startup-in-progress until this deadline;
-    malformed calibration still fails immediately."""
-
     launch: FactrLaunchCfg = field(default_factory=FactrLaunchCfg)
     """Daemon-managed launch of the FACTR-Server processes (off by default)."""
+
+
+@dataclass
+class IndexCopyCfg:
+    """A human-readable vector copy: ``target[...] = source[...]``."""
+
+    name: str = ""
+    source: List[int] = field(default_factory=list)
+    target: List[int] = field(default_factory=list)
+
+
+@dataclass
+class IndexConstantCfg:
+    """A constant assigned to one or more target-vector indices."""
+
+    name: str = ""
+    target: List[int] = field(default_factory=list)
+    value: float = 0.0
+
+
+@dataclass
+class OpenPIVectorCfg:
+    """One OpenPI wire vector and its projection from the canonical DFC vector.
+
+    ``dim=0`` means pass the complete canonical vector through unchanged.
+    """
+
+    key: str = "observation/state"
+    dim: int = 0
+    slices: List[IndexCopyCfg] = field(default_factory=list)
+    constants: List[IndexConstantCfg] = field(default_factory=list)
+
+
+@dataclass
+class OpenPIImageCfg:
+    """One canonical DFC camera view mapped to an OpenPI request image."""
+
+    source: str = ""
+    key: str = ""
+    layout: str = "hwc"
+
+
+@dataclass
+class OpenPIRequestCfg:
+    """General OpenPI request conventions plus YAML-owned vector/image mapping."""
+
+    state: OpenPIVectorCfg = field(default_factory=OpenPIVectorCfg)
+    images_key: str = ""
+    images: List[OpenPIImageCfg] = field(default_factory=list)
+    prompt_key: str = "prompt"
+    image_key_template: str = "observation/images/{camera}"
+    image_keys: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class OpenPIActionsCfg:
+    """OpenPI response actions projected into the canonical DFC action vector."""
+
+    key: str = "actions"
+    dim: int = 0
+    slices: List[IndexCopyCfg] = field(default_factory=list)
+    state_holds: List[IndexCopyCfg] = field(default_factory=list)
+    constants: List[IndexConstantCfg] = field(default_factory=list)
+
+
+@dataclass
+class OpenPIResponseCfg:
+    actions: OpenPIActionsCfg = field(default_factory=OpenPIActionsCfg)
+
+
+@dataclass
+class OpenPIEndpointCfg:
+    """All OpenPI endpoint idiosyncrasies; embodiment copies remain in YAML."""
+
+    request: OpenPIRequestCfg = field(default_factory=OpenPIRequestCfg)
+    response: OpenPIResponseCfg = field(default_factory=OpenPIResponseCfg)
 
 
 @dataclass
@@ -642,22 +750,28 @@ class PolicyCfg:
 
     The eval loop builds a *canonical* observation — the same LeRobot-keyed dict
     collection records (``observation.state``, ``observation.images.<cam>``,
-    ``task``) — and a :class:`~dual_flexiv_control.policy.schema.PolicySchema`
-    (selected by ``schema``) maps it onto one server's wire format and parses
+    ``task``) — and a
+    :class:`~dual_flexiv_control.policy.adapter.PolicyEndpointAdapter`
+    (selected by ``adapter``) maps it onto one server's wire format and parses
     the response back into an action chunk. Supporting a new policy-server
-    protocol = registering a new schema (and, if the transport differs, a new
+    protocol = registering a new adapter (and, if the transport differs, a new
     client); this config stays the single switchboard.
     """
+
+    control: ControlCfg = MISSING
+    """Policy action semantics and matching physical controller. A qvel policy
+    selects qvel here; an absolute-joint policy selects qpos. Collection recording
+    remains controller-independent."""
 
     kind: str = "remote"
     """``remote`` — a live policy server; ``hold`` — no server: repeat the measured
     joint positions (stand still), an end-to-end smoke test of the eval path."""
 
-    schema: str = "openpi"
-    """Registered request/response wire schema (see ``policy/schema.py``)."""
+    adapter: str = "openpi"
+    """Registered request/response endpoint adapter (see ``policy/adapter.py``)."""
 
     transport: str = "websocket"
-    """Wire transport to the server, chosen independently of ``schema``:
+    """Wire transport to the server, chosen independently of ``adapter``:
     ``websocket`` — openpi msgpack-numpy frames; ``http`` — the ACME
     multipart/form-data ``POST /predict`` protocol (see ``policy/client.py``)."""
 
@@ -674,7 +788,7 @@ class PolicyCfg:
     """Abort an eval after this many consecutive inference failures.
 
     A small retry budget rides through a transient connection reset or policy
-    server restart without hiding a persistent schema/checkpoint error forever.
+    server restart without hiding a persistent adapter/checkpoint error forever.
     Any successful inference resets the counter.
     """
 
@@ -682,19 +796,12 @@ class PolicyCfg:
     """Actions executed from each returned chunk before re-inferring (receding
     horizon); 0 executes the full chunk (open-loop within a chunk)."""
 
-    # -- request/response key mapping (openpi schema) ---------------------------
-    state_key: str = "observation/state"
-    prompt_key: str = "prompt"
-    actions_key: str = "actions"
-    image_key_template: str = "observation/images/{camera}"
-    """Request key for a camera image; ``{camera}`` is the canonical camera key
-    (e.g. ``wrist_left`` or ``static_left``) unless overridden in ``image_keys``."""
+    # -- OpenPI endpoint protocol and declarative embodiment projection ----------
+    openpi: OpenPIEndpointCfg = field(default_factory=OpenPIEndpointCfg)
+    """OpenPI request/response rules. All index copies and held dimensions are
+    declared in the selected policy YAML rather than hard-coded per embodiment."""
 
-    image_keys: Dict[str, str] = field(default_factory=dict)
-    """Per-camera overrides of the template (camera key -> request key). Map a
-    camera to ``""`` to drop its view from requests (unused by the checkpoint)."""
-
-    # -- request mapping (acme schema) ------------------------------------------
+    # -- request mapping (ACME endpoint adapter) --------------------------------
     acme_image_keys: Dict[str, str] = field(
         default_factory=lambda: {
             "exterior_image_1_left": "static_left",

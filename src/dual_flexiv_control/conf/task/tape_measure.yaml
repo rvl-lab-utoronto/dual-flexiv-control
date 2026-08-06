@@ -7,7 +7,7 @@ defaults:
 # it with `task=<name>`.
 #
 # Controller/action semantics are selected by the policy, not the task.
-language_instruction: "Perform the bimanual task."
+language_instruction: "Pick up the tape measure"
 collection:
   repo_id: dfc/bimanual  # LeRobot dataset for this task (under the recording root)
   num_episodes: 50      # demonstrations to teleoperate and record

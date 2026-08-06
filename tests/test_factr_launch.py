@@ -17,6 +17,9 @@ import time
 import pytest
 
 from dual_flexiv_control.configs import FactrLaunchCfg
+from dual_flexiv_control.configs import FactrLeaderCfg
+from dual_flexiv_control.configs import FactrTransformCfg
+from dual_flexiv_control.configs import JointConventionCfg
 from dual_flexiv_control.interfaces.factr import launch as fl
 
 
@@ -114,7 +117,7 @@ def _running_supervisor(tmp_path, spawned, **kw):
 def test_countdown_gates_the_spawn(tmp_path, spawned):
     sup = fl.FactrServerSupervisor(_cfg(tmp_path, calib_delay_s=0.15), ["left", "right"])
     ok, detail = sup.request_start()
-    assert ok and "pose the leader arm(s)" in detail.lower()
+    assert ok and "delayed launch" in detail.lower()
     assert sup.state == fl.COUNTDOWN and not spawned
     ends = sup.status()["countdown_ends_ts"]
     assert ends == pytest.approx(time.time() + 0.15, abs=0.1)
@@ -131,10 +134,7 @@ def test_countdown_gates_the_spawn(tmp_path, spawned):
     assert not ok and "stop them first" in detail
 
 
-def test_spawn_commands_and_logs(tmp_path, spawned, monkeypatch):
-    # Even a stale parent-shell setting must not make FACTR create a background
-    # recording on the dashboard's Rerun endpoint.
-    monkeypatch.setenv("FACTR_RERUN_URL", "rerun+http://127.0.0.1:9876/proxy")
+def test_spawn_commands_and_logs(tmp_path, spawned):
     sup = _running_supervisor(tmp_path, spawned)
     by_name = {u.name: u for u in sup.units}
     left = by_name["teleop:left"].proc
@@ -148,7 +148,6 @@ def test_spawn_commands_and_logs(tmp_path, spawned, monkeypatch):
     assert script.endswith("exec /usr/bin/python3 -m src.factr_teleop.factr_teleop.factr_rizon_teleop")
     assert left.kwargs["cwd"] == str(tmp_path / "FACTR_Teleop")
     assert left.kwargs["start_new_session"] is True
-    assert all(proc.kwargs["env"]["FACTR_RERUN_URL"] == "disabled" for proc in spawned)
 
     # Teleop stdout (the 500 Hz screen-clear) is discarded; the API's is kept.
     assert left.kwargs["stdout"] is subprocess.DEVNULL
@@ -165,6 +164,33 @@ def test_spawn_commands_and_logs(tmp_path, spawned, monkeypatch):
     json.dumps(status)
     assert status["state"] == "running" and status["down"] == []
     assert set(status["units"]) == {"teleop:left", "teleop:right", "api"}
+
+
+def test_managed_teleop_receives_dfc_leader_contract(tmp_path, spawned):
+    leader = FactrLeaderCfg(
+        raw_to_dfc=JointConventionCfg(
+            offsets_deg=[1.0] * 7,
+            sign_flip_joints=[2],
+            gripper_open=0.1,
+            gripper_closed=0.9,
+        ),
+        home_q_rad=[0.0] * 7,
+        dfc_to_factr=FactrTransformCfg(
+            signs=[1.0, 1.0, -1.0, 1.0, 1.0, 1.0, 1.0],
+            offset_rad=[0.0] * 7,
+        ),
+    )
+    sup = fl.FactrServerSupervisor(
+        _cfg(tmp_path), ["left"], {"left": leader}
+    )
+    sup.start_now()
+    teleop = next(u for u in sup.units if u.name == "teleop:left").proc
+    payload = json.loads(teleop.kwargs["env"]["DFC_LEADER_CONFIG"])
+    assert payload["side"] == "left"
+    assert payload["raw_to_dfc"]["offsets_deg"] == [1.0] * 7
+    assert payload["dfc_to_factr"]["signs"][2] == -1.0
+    api = next(u for u in sup.units if u.name == "api").proc
+    assert "DFC_LEADER_CONFIG" not in api.kwargs["env"]
 
 
 def test_cancel_during_countdown_spawns_nothing(tmp_path, spawned):
@@ -188,7 +214,7 @@ def test_dead_teleop_is_reported_never_respawned(tmp_path, spawned):
     sup.tend()
     sup.tend()
     assert sup.status()["down"] == ["teleop:left"]
-    assert len(spawned) == n  # energizing + calibrating an unposed arm: never automatic
+    assert len(spawned) == n  # re-energizing a leader is never automatic
     assert sup.status()["units"]["teleop:left"] == "down"
     assert sup.status()["units"]["api"] == "running"
 

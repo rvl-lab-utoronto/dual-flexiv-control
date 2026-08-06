@@ -16,6 +16,8 @@ Stream contract, each dim ``server.dof`` at :attr:`FactrCfg.rate_hz`:
 * ``factr/raw/<side>`` — untouched server/Dynamixel payload.
 * ``factr/<side>`` — arm joints converted once to DFC/Rizon coordinates, with
   the untouched trailing gripper retained.
+* ``factr/telemetry/<side>/<field>`` — one explicit live FACTR model/control
+  signal per stream (7-D joint vectors or 1-D scalar gains/timestamp).
 
 Outage behavior: per-side tolerant, never crashes. An unreachable leader is
 logged once (and once on recovery) and simply publishes nothing — its stream
@@ -54,6 +56,34 @@ def factr_stream_name(side: str) -> str:
 def raw_factr_stream_name(side: str) -> str:
     """Unmodified FACTR-server/Dynamixel payload."""
     return f"factr/raw/{side}"
+
+
+TELEMETRY_VECTOR_FIELDS = (
+    "raw_q_rad",
+    "model_q_rad",
+    "model_dq_rad_s",
+    "home_error_rad",
+    "joint_offsets_rad",
+    "model_signs",
+    "limit_torque_nm",
+    "null_torque_nm",
+    "gravity_torque_nm",
+    "friction_torque_nm",
+    "force_feedback_torque_nm",
+    "applied_torque_nm",
+)
+TELEMETRY_SCALAR_FIELDS = (
+    "stamp_monotonic_ns",
+    "grav_comp_gain",
+    "grav_comp_gain_target",
+    "force_feedback_gain",
+    "force_feedback_gain_target",
+)
+
+
+def factr_telemetry_stream_name(side: str, field: str) -> str:
+    """One explicit live telemetry signal from a FACTR leader."""
+    return f"factr/telemetry/{side}/{field}"
 
 
 def leader_stream_names(cfg: FactrCfg) -> list[str]:
@@ -132,6 +162,7 @@ class FactrInterface(StreamProducerNode):
         self.sim = runtime.sim
         self._client: FactrClient | None = None
         self._conventions: dict[str, JointConventionCfg] = {}
+        self._telemetry_versions: dict[str, int] = {}
         #: Read-only views of each follower's estimated external joint torque.
         #: They are discovered lazily because the arm and FACTR processes start
         #: concurrently. This process owns the duplex leader sockets, so it is the
@@ -155,43 +186,40 @@ class FactrInterface(StreamProducerNode):
                     name=name, dim=server.dof, capacity=4096,
                     dtype="float64", rate_hz=self.cfg.rate_hz,
                 ))
+            for field in TELEMETRY_VECTOR_FIELDS:
+                specs.append(StreamSpec(
+                    name=factr_telemetry_stream_name(side, field),
+                    dim=server.dof - 1, capacity=4096,
+                    dtype="float64", rate_hz=self.cfg.rate_hz,
+                ))
+            for field in TELEMETRY_SCALAR_FIELDS:
+                specs.append(StreamSpec(
+                    name=factr_telemetry_stream_name(side, field),
+                    dim=1, capacity=4096,
+                    dtype="float64", rate_hz=self.cfg.rate_hz,
+                ))
         return specs
 
     def open_source(self) -> None:
         self._client = FactrClient.from_config(self.cfg, sim=self.sim)
         self._feedback_registry = StreamRegistry(self.runtime_dir, self.run_id)
         for side, server in self.cfg.servers.items():
-            if self.sim:
-                self._conventions[side] = JointConventionCfg(
-                    offsets_deg=[0.0] * (server.dof - 1),
-                    sign_flip_joints=[],
-                    drop_trailing=1,
-                    wrap_deg=True,
-                    gripper_open=0.0,
-                    gripper_closed=1.0,
-                )
-                continue
-            calibration = self._client.wait_calibration_for(
-                side, timeout_s=self.cfg.calibration_timeout_s
+            leader = self.cfg.leaders.get(side)
+            if leader is None:
+                raise RuntimeError(f"FACTR {side} has a server but no DFC leader config")
+            self._conventions[side] = self._validate_convention(
+                side, server.dof, leader.raw_to_dfc
             )
-            self._conventions[side] = self._convention_from_calibration(side, server.dof, calibration)
 
     @staticmethod
-    def _convention_from_calibration(side: str, dof: int, data: dict) -> JointConventionCfg:
-        """Build the raw-leader conversion exclusively from the leader's YAML contract."""
-        if data.get("available") is not True:
-            raise RuntimeError(f"FACTR {side} calibration is unavailable")
-        required = (
-            "dfc_raw_offsets_deg", "dfc_sign_flip_joints", "dfc_wrap_deg",
-            "dfc_drop_trailing", "dfc_gripper_open", "dfc_gripper_closed",
-        )
-        missing = [key for key in required if data.get(key) is None]
-        if missing:
-            raise RuntimeError(f"FACTR {side} leader calibration missing {missing}")
-        drop = int(data["dfc_drop_trailing"])
+    def _validate_convention(
+        side: str, dof: int, conv: JointConventionCfg
+    ) -> JointConventionCfg:
+        """Validate and return DFC's persisted raw-leader convention."""
+        drop = int(conv.drop_trailing)
         arm_dof = dof - drop
-        offsets = [float(x) for x in data["dfc_raw_offsets_deg"]]
-        flips = [int(x) for x in data["dfc_sign_flip_joints"]]
+        offsets = [float(x) for x in conv.offsets_deg]
+        flips = [int(x) for x in conv.sign_flip_joints]
         if drop < 1 or arm_dof <= 0 or len(offsets) != arm_dof:
             raise RuntimeError(
                 f"FACTR {side} invalid leader convention: dof={dof}, drop={drop}, "
@@ -199,20 +227,22 @@ class FactrInterface(StreamProducerNode):
             )
         if len(set(flips)) != len(flips) or any(i < 0 or i >= arm_dof for i in flips):
             raise RuntimeError(f"FACTR {side} invalid sign-flip indices: {flips}")
-        opened = float(data["dfc_gripper_open"])
-        closed = float(data["dfc_gripper_closed"])
+        if conv.gripper_open is None or conv.gripper_closed is None:
+            raise RuntimeError(f"FACTR {side} leader gripper calibration is missing")
+        opened = float(conv.gripper_open)
+        closed = float(conv.gripper_closed)
         if not np.all(np.isfinite(offsets + [opened, closed])) or opened == closed:
             raise RuntimeError(f"FACTR {side} leader calibration contains invalid values")
-        conv = JointConventionCfg(
+        validated = JointConventionCfg(
             offsets_deg=offsets,
             sign_flip_joints=flips,
-            wrap_deg=bool(data["dfc_wrap_deg"]),
+            wrap_deg=bool(conv.wrap_deg),
             drop_trailing=drop,
             gripper_open=opened,
             gripper_closed=closed,
         )
-        log.info("[factr] %s convention loaded from leader calibration: %s", side, conv)
-        return conv
+        log.info("[factr] %s convention loaded from DFC leader config: %s", side, validated)
+        return validated
 
     def poll(self) -> dict[str, np.ndarray] | None:
         sample: dict[str, np.ndarray] = {}
@@ -235,8 +265,37 @@ class FactrInterface(StreamProducerNode):
             converted = np.append(q_dfc, normalize_gripper(jp[-1], conv))
             sample[raw_factr_stream_name(side)] = jp
             sample[factr_stream_name(side)] = converted
+            self._append_telemetry(side, sample)
             self._forward_force_feedback(side)
         return sample or None
+
+    def _append_telemetry(self, side: str, sample: dict[str, np.ndarray]) -> None:
+        """Publish each newly received telemetry field as its own typed stream."""
+        cached = self._client.get_telemetry_for(side)
+        if cached is None:
+            return
+        version, telemetry = cached
+        if self._telemetry_versions.get(side) == version:
+            return
+        arm_dof = self.cfg.servers[side].dof - 1
+        parsed: dict[str, np.ndarray] = {}
+        try:
+            for field in TELEMETRY_VECTOR_FIELDS:
+                value = np.asarray(telemetry[field], dtype=np.float64)
+                if value.shape != (arm_dof,) or not np.all(np.isfinite(value)):
+                    raise ValueError(f"{field} has shape {value.shape}, expected ({arm_dof},)")
+                parsed[factr_telemetry_stream_name(side, field)] = value
+            for field in TELEMETRY_SCALAR_FIELDS:
+                value = float(telemetry[field])
+                if not np.isfinite(value):
+                    raise ValueError(f"{field} is not finite")
+                parsed[factr_telemetry_stream_name(side, field)] = np.asarray([value])
+        except (KeyError, TypeError, ValueError) as exc:
+            log.warning("[factr] dropping malformed %s telemetry frame: %s", side, exc)
+            self._telemetry_versions[side] = version
+            return
+        sample.update(parsed)
+        self._telemetry_versions[side] = version
 
     def _forward_force_feedback(self, side: str) -> None:
         """Send one fresh follower ``tau_ext`` sample to its matching leader.

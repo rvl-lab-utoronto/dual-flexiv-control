@@ -195,41 +195,58 @@ def horizon_signals(ctrl_cfg) -> list[str]:
     return [sig] if sig is not None else []
 
 
-def estimate_chunk_end(ctrl_cfg, primary_chunk, dt: float, measured: dict | None = None):
-    """Estimate where an action chunk lands the arm, for visualization.
+def estimate_chunk_trajectory(
+    ctrl_cfg, primary_chunk, dt: float, measured: dict | None = None
+):
+    """Estimate every state reached by an action chunk, for visualization.
 
-    ``primary_chunk`` is the chunk's primary-field columns ``(horizon, action_dim)``
-    (the :func:`action_field` slice of every action); ``dt`` is the seconds per
-    action step; ``measured`` maps the signals from :func:`horizon_signals` to their
-    latest measured values. Returns ``(horizon_kind, vector)`` — a ``(dof,)`` joint
-    config for ``"q"``, a ``(3,)`` base-frame TCP position for ``"eef"`` — or None
-    when the kind predicts no motion (``force``) or a needed measured baseline is
-    missing (a velocity chunk is relative; there is nothing to integrate from).
-
-    Velocity kinds are integrated forward assuming each action is held for one
-    step (Euler) — an *estimate* of the rollout, exact only if the arm tracks
-    perfectly at the loop rate.
+    Returns ``(horizon_kind, path)`` where ``path`` retains one row per policy
+    step. Absolute kinds already contain their path. Velocity kinds are Euler
+    integrated from the latest measured baseline, independently for every joint
+    or Cartesian axis. ``force`` and velocity chunks without a baseline return
+    None.
     """
     kind = _HORIZON_KIND.get(ctrl_cfg.kind)
     if kind is None:
         return None
     chunk = np.asarray(primary_chunk, dtype=np.float64)
+    if chunk.ndim == 1:
+        chunk = chunk[None, :]
+    if chunk.ndim != 2 or chunk.shape[0] == 0:
+        raise ValueError(f"expected a non-empty action chunk, got {chunk.shape}")
+
     measured = measured or {}
     if ctrl_cfg.kind == "qpos":
-        return ("q", chunk[-1].copy())
+        return ("q", chunk.copy())
     if ctrl_cfg.kind == "qvel":
         q = measured.get("q")
         if q is None:
             return None
-        return ("q", np.asarray(q, dtype=np.float64) + chunk.sum(axis=0) * dt)
+        q0 = np.asarray(q, dtype=np.float64)
+        return ("q", q0[None, :] + np.cumsum(chunk, axis=0) * dt)
     if ctrl_cfg.kind == "end_effector":
-        return ("eef", chunk[-1, :3].copy())  # pose_d = [x y z qw qx qy qz]
-    # eef_vel: integrate the twist's linear part from the measured TCP position.
+        return ("eef", chunk[:, :3].copy())  # pose_d = [x y z qw qx qy qz]
+
+    # eef_vel: integrate every twist's linear part from the measured TCP position.
     pose = measured.get("eef")
     if pose is None:
         return None
-    p0 = np.asarray(pose, dtype=np.float64)[:3]  # eef stream = [x y z qw qx qy qz]
-    return ("eef", p0 + chunk[:, :3].sum(axis=0) * dt)
+    p0 = np.asarray(pose, dtype=np.float64)[:3]  # eef = [x y z qw qx qy qz]
+    return ("eef", p0[None, :] + np.cumsum(chunk[:, :3], axis=0) * dt)
+
+
+def estimate_chunk_end(ctrl_cfg, primary_chunk, dt: float, measured: dict | None = None):
+    """Estimate where an action chunk lands the arm, for visualization.
+
+    This is the endpoint compatibility view of :func:`estimate_chunk_trajectory`.
+    Velocity kinds are integrated step-by-step and the final integrated row is
+    returned; absolute kinds return the final policy row.
+    """
+    estimate = estimate_chunk_trajectory(ctrl_cfg, primary_chunk, dt, measured)
+    if estimate is None:
+        return None
+    kind, path = estimate
+    return kind, path[-1].copy()
 
 
 def control_specs(side: str, ctrl_cfg) -> dict[str, StreamSpec]:

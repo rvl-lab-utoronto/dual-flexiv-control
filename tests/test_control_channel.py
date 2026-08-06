@@ -31,8 +31,8 @@ from dual_flexiv_control.streams.stream import StreamWriter
 def _ctrl(kind: str):
     register_configs()
     with initialize_config_module(config_module="dual_flexiv_control.conf", version_base=None):
-        cfg = compose(config_name="config", overrides=[f"control@task.control={kind}"])
-    return OmegaConf.to_object(cfg).task.control
+        cfg = compose(config_name="config", overrides=[f"control@policy.control={kind}"])
+    return OmegaConf.to_object(cfg).policy.control
 
 
 @pytest.mark.parametrize(
@@ -147,6 +147,27 @@ def test_estimate_chunk_end_per_kind():
     np.testing.assert_allclose(v, pose0[:3] + np.array([1.0, 2.0, 3.0]) * 2 * dt)
 
     assert estimate_chunk_end(_ctrl("force"), np.ones((3, 6)), dt) is None
+
+
+def test_estimate_chunk_trajectory_integrates_every_qvel_step():
+    from dual_flexiv_control.control import estimate_chunk_trajectory
+
+    q0 = np.arange(7.0)
+    dq = np.vstack([
+        np.ones(7),
+        np.arange(7.0),
+        -np.ones(7),
+    ])
+    kind, path = estimate_chunk_trajectory(_ctrl("qvel"), dq, 0.1, {"q": q0})
+
+    assert kind == "q"
+    assert path.shape == (3, 7)
+    np.testing.assert_allclose(path, q0 + np.cumsum(dq, axis=0) * 0.1)
+
+    q_targets = np.vstack([q0 + 1, q0 + 2])
+    kind, absolute_path = estimate_chunk_trajectory(_ctrl("qpos"), q_targets, 0.1)
+    assert kind == "q"
+    np.testing.assert_allclose(absolute_path, q_targets)
 
 
 def test_estimate_chunk_end_needs_measured_baseline_for_velocity_kinds():
@@ -497,6 +518,24 @@ def test_apply_coeffs_resolves_K_q_fraction_against_live_nominal_stiffness():
     src._apply_coeffs(_ctrl("qpos_overdamped"), ControlCoeffsCfg())
 
     src._robot.SetJointImpedance.assert_called_once_with([400.0] * 7, [0.8] * 7)
+
+
+def test_apply_coeffs_scales_joint_stiffness_for_collection():
+    """Collection applies one third of the selected controller's base stiffness."""
+    pytest.importorskip("flexivrdk")
+    from unittest.mock import MagicMock
+
+    from dual_flexiv_control.configs import ControlCoeffsCfg
+    from dual_flexiv_control.interfaces.flexiv.source import FlexivSource
+
+    src = FlexivSource("sim", dof=7)
+    src._robot = MagicMock()
+    src._robot.info.return_value.K_q_nom = [900.0] * 7
+    coeffs = ControlCoeffsCfg(joint_stiffness_scale=1.0 / 3.0)
+
+    src._apply_coeffs(_ctrl("qpos_impedance"), coeffs)
+
+    src._robot.SetJointImpedance.assert_called_once_with([300.0] * 7, [0.8] * 7)
 
 
 def test_apply_coeffs_falls_back_to_absolute_K_q_without_a_fraction():

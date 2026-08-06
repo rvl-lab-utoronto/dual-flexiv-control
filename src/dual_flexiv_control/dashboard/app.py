@@ -29,6 +29,7 @@ from dual_flexiv_control.dashboard import arms as _arms
 from dual_flexiv_control.dashboard import blueprints
 from dual_flexiv_control.dashboard import calibration as _calibration
 from dual_flexiv_control.dashboard import cameras as _cameras
+from dual_flexiv_control.dashboard import downloads as _downloads
 from dual_flexiv_control.dashboard import factr_servers as _factr_srv
 from dual_flexiv_control.dashboard import logs as _logs
 from dual_flexiv_control.dashboard import replay as _replay
@@ -51,7 +52,7 @@ from dual_flexiv_control.dashboard.editor import open_in_vscode
 from dual_flexiv_control.dashboard.policy_servers import PolicyServerInfo
 from dual_flexiv_control.dashboard.policy_servers import inspect_policy_server
 from dual_flexiv_control.dashboard.policy_servers import policy_server_help
-from dual_flexiv_control.dashboard.ssh_hosts import discover_ssh_hosts
+from dual_flexiv_control.dashboard.ssh_hosts import policy_server_hosts
 from dual_flexiv_control.dashboard.tasks import RigInfo
 from dual_flexiv_control.dashboard.tasks import TaskInfo
 from dual_flexiv_control.dashboard.tasks import discover_policies
@@ -229,6 +230,12 @@ def _replay_viewer() -> _replay.ReplayViewer:
 
 
 @st.cache_resource
+def _download_server() -> _downloads.DownloadServer:
+    """Stream finalized episode MP4s without copying them into Streamlit RAM."""
+    return _downloads.start_server()
+
+
+@st.cache_resource
 def _registry() -> _runner.RunRegistry:
     return _runner.RunRegistry()
 
@@ -389,19 +396,20 @@ def _render_controls(
         "Policy type", ["default", *discover_policies()], key="eval_policy_type",
         label_visibility="collapsed",
         help=(
-            "Policy client/schema for this eval run (overrides the policy "
+            "Policy endpoint adapter for this eval run (overrides the policy "
             "group, e.g. acme's multipart HTTP vs openpi's websocket). "
             "'default' uses the task's policy config."
         ),
     )
     policy = None if policy_choice == "default" else policy_choice
-    by_alias = {h.alias: h.address for h in discover_ssh_hosts()}
+    by_alias = {h.alias: h.address for h in policy_server_hosts()}
     host_choice = eval_cols[1].selectbox(
         "Policy host", ["default", *by_alias], key="eval_policy_host",
         label_visibility="collapsed",
         help=(
             "Policy server for this eval run (overrides policy.host with the "
-            "Host's real address). Options come from ~/.ssh/config; "
+            "Host's real address). Localhost is always available; remote "
+            "options come from ~/.ssh/config. "
             "'default' uses the task's policy config."
         ),
     )
@@ -511,25 +519,17 @@ def _arm_status_rows(registry: _runner.RunRegistry) -> None:
 def _render_leader_row(s: LeaderStatus, poll: dict, service_state: str | None) -> None:
     """One leader's row: name + status on one line, live detail below.
 
-    A fully-up leader shows its calibration state on the name line (green when
-    the diagnostics poll succeeds, orange when running on a retained
-    calibration). A leader still coming up — FACTR service starting, teleop
-    waiting for its first calibration — reads 🟡 Booting instead of surfacing
-    calibration internals. ``service_state`` is the managed FACTR supervisor
-    state (None when this session does not manage the servers).
+    Calibration status comes from DFC's local leader config; reachability comes
+    from the live leader stream. ``service_state`` is the managed FACTR
+    supervisor state (None when this session does not manage the servers).
     """
     status = ""
     if s.sim:
         dot = "🟢" if s.reachable else "⚫"
-    elif s.reachable and poll.get("state") == "live":
+    elif s.reachable and poll.get("state") == "configured":
         dot = "🟢"
-        attempted = poll.get("attempted_at")
-        age = f" · {max(0, int(time.time() - attempted))}s ago" if attempted else ""
-        status = f" · :green[calibration received]{age}"
-    elif s.reachable and poll.get("state") == "stale":
-        dot = "🟢"
-        status = " · :orange[retaining last valid calibration]"
-    elif service_state == "countdown" or poll.get("state") in ("waiting", "reset"):
+        status = " · :green[DFC calibration loaded]"
+    elif service_state == "countdown":
         st.markdown(f"🟡 **{s.name}** · :orange[Booting]")
         return
     else:
@@ -573,8 +573,7 @@ def _leader_status_rows(registry: _runner.RunRegistry) -> None:
         return
     info = registry.session_view().factr_servers or {}
     logs = info.get("logs") or {}
-    # This fragment runs every 2 s. Convention discovery is deliberately a
-    # non-blocking observer poll and cannot bring down the dashboard.
+    # This fragment runs every 2 s. Convention discovery is a local config read.
     _arms.discover_conventions()
     for side in sides:
         cols = st.columns([5, 1], vertical_alignment="center")
@@ -1469,6 +1468,20 @@ def _render_calibration_controls() -> None:
     done = st.session_state.setdefault(f"calib_done::{side}", {})  # joint -> captured_deg
     poses = _calibration.reference_poses(side)
     samples = st.session_state.setdefault(f"calib_samples::{side}", {})  # pose name -> deg
+    model_home_raw = st.session_state.get(f"calib_model_home_raw::{side}")
+    model_home_fit = None
+    model_home_error = None
+    if model_home_raw is not None:
+        try:
+            model_home_fit = _calibration.solve_model_home(
+                model_home_raw,
+                offsets,
+                sorted(flips),
+                _calibration.current_model_signs(side),
+                _calibration.factr_model_home(side),
+            )
+        except Exception as exc:  # noqa: BLE001 - show stale/malformed capture in UI
+            model_home_error = str(exc)
 
     with st.container():
         st.caption(
@@ -1512,6 +1525,7 @@ def _render_calibration_controls() -> None:
                      help="Drop the captured pose samples (keeps the current offsets/flips)."):
             st.session_state[f"calib_samples::{side}"] = {}
             st.session_state.pop(f"calib_fit::{side}", None)
+            st.session_state.pop(f"calib_model_home_raw::{side}", None)
             st.rerun()
 
         fit = st.session_state.get(f"calib_fit::{side}")
@@ -1565,6 +1579,55 @@ def _render_calibration_controls() -> None:
                     st.rerun()
 
         st.divider()
+        st.markdown("**FACTR gravity-model home**")
+        target_home = _calibration.factr_model_home(side)
+        st.caption(
+            "Physically place the leader at FACTR's model home (J4 ≈ +90°, every "
+            "other joint at zero), then capture. The capture uses the current "
+            "offsets/signs; if you solve later, the model-home result is recomputed. "
+            "This measures `home_q_rad` and computes `dfc_to_factr.offset_rad`."
+        )
+        st.caption(
+            "model target: "
+            + " · ".join(f"J{i}`{math.degrees(v):+.1f}°`" for i, v in enumerate(target_home))
+        )
+        if st.button(
+            "📐 Capture FACTR model home",
+            key=f"calib_model_home::{side}",
+            use_container_width=True,
+            help="Hold the physical leader at the FACTR URDF/gravity-model home and "
+                 "capture it using the current calibration values.",
+        ):
+            try:
+                raw, _model_fit = _calibration.capture_model_home(
+                    side, offsets, sorted(flips)
+                )
+                st.session_state[f"calib_model_home_raw::{side}"] = raw
+                st.rerun()
+            except Exception as exc:  # noqa: BLE001 - surface, don't crash the page
+                st.error(f"Could not capture the {side} model home: {exc}", icon="🛑")
+        if model_home_fit is not None:
+            st.success("FACTR model home captured; its transform will be saved with this leader.")
+            st.caption(
+                "measured DFC home: "
+                + " · ".join(
+                    f"J{i}`{math.degrees(v):+.2f}°`"
+                    for i, v in enumerate(model_home_fit.home_q_rad)
+                )
+            )
+            st.caption(
+                "model offsets: "
+                + " · ".join(
+                    f"J{i}`{math.degrees(v):+.2f}°`"
+                    for i, v in enumerate(model_home_fit.offset_rad)
+                )
+            )
+        elif model_home_error:
+            st.error(f"Stored FACTR model-home capture is invalid: {model_home_error}", icon="🛑")
+        else:
+            st.info("Capture the FACTR model home using the current values; solve the pose set before Save.")
+
+        st.divider()
         st.markdown("**Gripper** — record the raw trigger reading at each extreme:")
         g0, g1 = st.columns(2)
         if g0.button("📗 Record open", key=f"calib_gopen::{side}", use_container_width=True,
@@ -1600,13 +1663,48 @@ def _render_calibration_controls() -> None:
             st.session_state[f"calib_done::{side}"] = {}
             st.session_state[f"calib_samples::{side}"] = {}
             st.session_state.pop(f"calib_fit::{side}", None)
+            st.session_state.pop(f"calib_model_home_raw::{side}", None)
             st.rerun()
 
         flips_sorted = sorted(flips)
-        st.info("Calibration is leader-owned. Copy the values below into the FACTR arm YAML and restart FACTR.")
+        st.info(
+            "Calibration is DFC leader-owned. Save writes directly to the active "
+            "`conf/factr/*.yaml`; reset services afterward to relaunch FACTR with it."
+        )
+        if st.button(
+            "💾 Save complete leader calibration",
+            key=f"calib_save::{side}",
+            type="primary",
+            disabled=fit is None or model_home_fit is None,
+        ):
+            try:
+                path = _calibration.apply_to_leader(
+                    side,
+                    offsets,
+                    flips_sorted,
+                    gripper_open=grip_open,
+                    gripper_closed=grip_closed,
+                    model_home=model_home_fit,
+                )
+                _arms.reset()
+                _calibration.reset()
+                st.success(
+                    f"Saved the complete `leaders.{side}` calibration to `{path}`."
+                )
+            except Exception as exc:  # noqa: BLE001 - surface write/validation errors
+                st.error(f"Could not save calibration: {exc}", icon="🛑")
         with st.expander("Preview / copy the config"):
-            st.code(_calibration.format_yaml(side, offsets, flips_sorted, grip_open, grip_closed),
-                    language="yaml")
+            st.code(
+                _calibration.format_yaml(
+                    side,
+                    offsets,
+                    flips_sorted,
+                    grip_open,
+                    grip_closed,
+                    model_home_fit,
+                ),
+                language="yaml",
+            )
 
 def _render_storage_tab(registry: _runner.RunRegistry) -> None:
     root = _storage.collection_root()
@@ -1670,6 +1768,13 @@ def _render_storage_tab(registry: _runner.RunRegistry) -> None:
             _render_delete_dataset_button(ds)
         return
 
+    download_server = None
+    if any(e.videos for e in episodes):
+        try:
+            download_server = _download_server()
+        except Exception as exc:  # noqa: BLE001 - downloads should not hide Storage
+            st.warning(f"Video downloads are unavailable: {exc}", icon="⚠️")
+
     selected = _selected_indices(ds.repo_id, episodes)
 
     # -- bulk action bar ------------------------------------------------------
@@ -1711,10 +1816,26 @@ def _render_storage_tab(registry: _runner.RunRegistry) -> None:
                 disabled=locked,
             )
             task = (e.tasks[0] if e.tasks else "—")
-            row[1].markdown(
+            details = (
                 f"**#{e.index}** · {e.length} frames · {e.duration_s:.1f}s  \n"
                 f":gray[{task}]"
             )
+            if download_server is not None and e.videos:
+                links = []
+                for video in e.videos:
+                    url = _browser_url(
+                        download_server.register(
+                            video.path,
+                            video.filename,
+                            content_type="video/mp4",
+                        )
+                    )
+                    label = video.label.replace("_", " ")
+                    links.append(
+                        f"[⬇ {label} MP4 · {_storage.human_size(video.size_bytes)}]({url})"
+                    )
+                details += "  \n" + " · ".join(links)
+            row[1].markdown(details)
             if row[2].button("▶", key=f"stor_play::{ds.repo_id}::{e.index}",
                              help="Replay this episode (3D arms + cameras + plots)."):
                 st.session_state["replay_target"] = (ds.repo_id, e.index)

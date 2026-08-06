@@ -101,3 +101,17 @@ def discover_ssh_hosts(config_path: Path | None = None) -> list[SshHost]:
     hosts: list[SshHost] = []
     _parse_file(path, depth=0, out=hosts, seen=set())
     return hosts
+
+
+def policy_server_hosts(config_path: Path | None = None) -> list[SshHost]:
+    """Dashboard policy hosts: localhost followed by configured SSH hosts.
+
+    ``localhost`` is always available because the policy server commonly runs
+    on the same machine as the dashboard. An SSH alias with that name cannot
+    override the loopback address.
+    """
+    configured = discover_ssh_hosts(config_path)
+    return [
+        SshHost(alias="localhost", address="127.0.0.1"),
+        *(host for host in configured if host.alias != "localhost"),
+    ]

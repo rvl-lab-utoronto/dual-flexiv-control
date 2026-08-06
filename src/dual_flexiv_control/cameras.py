@@ -9,13 +9,14 @@ travels as an ``(H*W*C,)`` vector and the consumer reshapes it back with
 schema change; flattening keeps the substrate unchanged, matching the existing
 convention that consumers know a stream's shape out-of-band, from config.)
 
-Three canonical views, mapped one-to-one onto the ZED SDK:
+Four canonical views, mapped onto the camera SDKs:
 
     view     SDK source                  dtype     frame shape  channels
     -------  --------------------------  --------  -----------  --------
     left     ``VIEW.LEFT``  (RGB)        uint8     ``(H,W,3)``  3
     right    ``VIEW.RIGHT`` (RGB)        uint8     ``(H,W,3)``  3
     depth    ``MEASURE.DEPTH`` (metres)  float32   ``(H,W)``    1
+    color    RealSense color (RGB)       uint8     ``(H,W,3)``  3
 
 Stream names are ``"cam/<camera>/<view>"`` (e.g. ``"cam/wrist_left/left"``); the
 ``cam/`` namespace keeps them clear of the arm ``left``/``right`` and ``factr``
@@ -33,12 +34,13 @@ CAMERA_NS = "cam"
 
 VIEW_LEFT = "left"
 VIEW_RIGHT = "right"
+VIEW_COLOR = "color"
 VIEW_DEPTH = "depth"
 
 #: RGB stereo views (uint8, 3 channels).
-RGB_VIEWS: tuple[str, ...] = (VIEW_LEFT, VIEW_RIGHT)
+RGB_VIEWS: tuple[str, ...] = (VIEW_LEFT, VIEW_RIGHT, VIEW_COLOR)
 #: Stable ordering / canonical set of camera views.
-CAMERA_VIEWS: tuple[str, ...] = (VIEW_LEFT, VIEW_RIGHT, VIEW_DEPTH)
+CAMERA_VIEWS: tuple[str, ...] = (VIEW_LEFT, VIEW_RIGHT, VIEW_COLOR, VIEW_DEPTH)
 
 
 def view_channels(view: str) -> int:

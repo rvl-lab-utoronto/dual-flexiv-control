@@ -1,6 +1,6 @@
 # π0.5 base for Dual Flexiv
 
-This overlay serves the public `pi05_base` weights with the DFC contract:
+This overlay serves the public `pi05_base` weights with the canonical DFC state/action layout:
 
 - state: 14 joints (`left q[7], right q[7]`);
 - action: 16 values (`left q[7], grip, right q[7], grip`);
@@ -8,6 +8,11 @@ This overlay serves the public `pi05_base` weights with the DFC contract:
 - gripper actions stay absolute;
 - `static_left` fills π0.5's base-camera slot;
 - both wrist-camera slots are black and masked.
+
+The global DFC vector contract is separate from the OpenPI-side model
+transforms. Policy-endpoint projections (for example stock ALOHA's 14-D vector)
+live in the robot client's human-readable `conf/policy/*.yaml`; this overlay
+only adapts an already canonical DFC request to OpenPI's internal model slots.
 
 It intentionally does not use `serve_policy.py --env ALOHA`. That shortcut
 selects π0.5 base parameters but applies ALOHA's 6-DoF-per-arm joint/gripper

@@ -24,6 +24,7 @@ from .channel import action_hold_fields
 from .channel import control_channel_name
 from .channel import control_specs
 from .channel import estimate_chunk_end
+from .channel import estimate_chunk_trajectory
 from .channel import gripper_channel_name
 from .channel import gripper_spec
 from .channel import horizon_kind
@@ -49,6 +50,7 @@ __all__ = [
     "control_channel_name",
     "control_specs",
     "estimate_chunk_end",
+    "estimate_chunk_trajectory",
     "gripper_channel_name",
     "gripper_spec",
     "horizon_kind",

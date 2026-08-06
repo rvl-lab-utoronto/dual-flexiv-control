@@ -20,7 +20,7 @@ escalates to SIGKILL for anything wedged, then unlinks the run's shm segments.
 
 Configuration is composed by Hydra from ``conf/`` (validated against the
 structured schema in :mod:`dual_flexiv_control.configs`). Override anything from
-the CLI, e.g. ``runtime.sim=true runtime.duration_s=10 control@task.control=force``.
+the CLI, e.g. ``runtime.sim=true runtime.duration_s=10 control@policy.control=force``.
 """
 
 from __future__ import annotations
@@ -42,6 +42,7 @@ from .configs import Config
 from .configs import register_configs
 from .interfaces.factr import FactrInterface
 from .interfaces.flexiv import FlexivInterface
+from .interfaces.realsense import RealSenseInterface
 from .interfaces.zed import ZedInterface
 from .policy import EvalNode
 from .process import ProcessNode
@@ -102,10 +103,16 @@ def build_hardware_nodes(
         )
         for side, arm in config.arms.items()
     ]
-    nodes += [
-        ZedInterface(name, cam, config.runtime, run_id)
-        for name, cam in config.cameras.items()
-    ]
+    camera_interfaces = {"zed": ZedInterface, "realsense": RealSenseInterface}
+    for name, cam in config.cameras.items():
+        try:
+            interface = camera_interfaces[cam.backend.lower()]
+        except KeyError as exc:
+            raise ValueError(
+                f"camera {name!r} has unknown backend {cam.backend!r}; "
+                f"expected one of {tuple(camera_interfaces)}"
+            ) from exc
+        nodes.append(interface(name, cam, config.runtime, run_id))
     if config.factr.servers:
         # The single FACTR reader: publishes factr/<side> leader streams that the
         # consumers AND the dashboard read (never the HTTP servers directly).

@@ -201,7 +201,7 @@ def test_discover_tasks_every_entry_has_an_instruction():
 def test_discover_policies_finds_shipped_types():
     # The eval launcher's policy-type dropdown: real entries only, no schema base.
     policies = discover_policies()
-    assert {"acme", "openpi"} <= set(policies)
+    assert {"acme", "openpi", "pi05_aloha"} <= set(policies)
     assert "base_policy" not in policies
 
 
@@ -218,7 +218,7 @@ def test_policy_server_info_reports_protocol_and_checkpoint(tmp_path, monkeypatc
     from dual_flexiv_control.dashboard import policy_servers
 
     (tmp_path / "custom.yaml").write_text(
-        "schema: acme\ntransport: http\n",
+        "adapter: acme\ntransport: http\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(
@@ -235,7 +235,7 @@ def test_policy_server_info_reports_protocol_and_checkpoint(tmp_path, monkeypatc
     )
 
     assert info.reachable
-    assert info.schema == "acme"
+    assert info.adapter == "acme"
     assert info.transport == "http"
     assert info.endpoint == "http://gpu-box:53805"
     assert info.checkpoint == "/models/moose/checkpoint_12000"
@@ -249,7 +249,7 @@ def test_policy_server_info_keeps_failed_probe_informational(tmp_path, monkeypat
     from dual_flexiv_control.dashboard import policy_servers
 
     (tmp_path / "openpiish.yaml").write_text(
-        "schema: openpi\n",
+        "adapter: openpi\n",
         encoding="utf-8",
     )
 
@@ -575,18 +575,20 @@ def _wrap180(deg: float) -> float:
 
 
 def test_calibration_reference_poses_make_every_sign_observable():
-    # The pose-set solve can only recover a joint's sign flip if the set drives that
-    # joint to nonzero references; both polarities guard against a noisy single pose.
+    # J1 must never pitch behind the robot. Straight-up (0) and the established
+    # forward elbow bend (-90) are its only safe anchors. Every joint still needs
+    # at least two distinct references, one nonzero, to make its sign observable.
     from dual_flexiv_control.dashboard.calibration import REFERENCE_POSES
 
     assert len(REFERENCE_POSES) >= 3
     for pose in REFERENCE_POSES:
         assert len(pose.q_deg) == 7
         assert all(v % 90 == 0 for v in pose.q_deg)
+        assert pose.q_deg[1] in (0.0, -90.0)
     for j in range(7):
         values = [p.q_deg[j] for p in REFERENCE_POSES]
-        assert any(v > 0 for v in values), f"J{j} never positive in the pose set"
-        assert any(v < 0 for v in values), f"J{j} never negative in the pose set"
+        assert len(set(values)) >= 2, f"J{j} never moves in the pose set"
+        assert any(v != 0 for v in values), f"J{j} has no sign-observable target"
 
 
 def test_calibration_solve_recovers_full_convention():
@@ -660,6 +662,25 @@ def test_calibration_solve_residual_flags_inconsistent_joint():
         assert fit.offsets_deg[j] == pytest.approx(0.0, abs=1e-9)
 
 
+
+def test_calibration_model_home_solves_dfc_pose_and_affine_offset():
+    import numpy as np
+
+    from dual_flexiv_control.dashboard.calibration import solve_model_home
+
+    fit = solve_model_home(
+        raw_leader_deg=[10.0, -20.0, 30.0, 40.0],
+        offsets_deg=[5.0, 2.0, -3.0, 4.0],
+        sign_flip_joints=[1],
+        model_signs=[1.0, -1.0, 1.0, -1.0],
+        target_q_rad=[0.0, 0.0, 0.0, 1.57],
+    )
+    expected_home = np.radians([15.0, 18.0, 27.0, 44.0])
+    assert fit.home_q_rad == pytest.approx(expected_home)
+    assert fit.offset_rad == pytest.approx(
+        np.asarray(fit.target_q_rad) - np.asarray(fit.signs) * expected_home
+    )
+
 def test_calibration_solve_pose_samples_ignores_stale_entries():
     # The UI wrapper drops samples whose pose name vanished or whose length no longer
     # matches the follower DoF, instead of crashing the solve.
@@ -682,43 +703,25 @@ def test_calibration_solve_pose_samples_ignores_stale_entries():
 
 
 def test_calibration_format_yaml_and_overrides():
-    # The convention is leader-owned: format_yaml emits the FACTR arm-YAML
-    # initialization snippet, and follower-side Hydra overrides are refused.
+    # Calibration targets DFC's per-leader factr config.
     from dual_flexiv_control.dashboard.calibration import format_overrides
     from dual_flexiv_control.dashboard.calibration import format_yaml
 
     offsets = [180.0, -90.0, -90.0, 90.0, 90.0, 180.0, -90.0]
     y = format_yaml("right", offsets, [1, 2, 3])
-    assert "arm_teleop:" in y
-    assert "dfc_raw_offsets_deg: [180.00, -90.00" in y
-    assert "dfc_sign_flip_joints: [1, 2, 3]" in y
-    with pytest.raises(RuntimeError, match="leader-owned"):
-        format_overrides("right", offsets, [1, 2, 3])
+    assert "leaders:" in y and "raw_to_dfc:" in y
+    assert "offsets_deg: [180.00, -90.00" in y
+    assert "sign_flip_joints: [1, 2, 3]" in y
+    assert "factr.leaders.right.raw_to_dfc.offsets_deg" in format_overrides(
+        "right", offsets, [1, 2, 3]
+    )
 
 
-def test_splice_convention_inserts_and_preserves_comments():
-    # On a real rig file with no active convention, splicing inserts one inline line,
-    # the result parses, the convention is set, and existing comments survive.
-    # The shipped rig may already carry a live calibration (💾 Sync writes into it),
-    # so strip any active convention line first — the test targets insertion.
-    import yaml
-
+def test_factr_path_follows_active_rig_group():
     from dual_flexiv_control.dashboard import calibration
 
-    path = calibration.rig_path("left_only")
-    text = "\n".join(
-        line for line in path.read_text().splitlines()
-        if not line.lstrip().startswith("convention:")
-    ) + "\n"
-    assert "convention:" not in text.replace("# convention:", "")  # none active
-    out = calibration._splice_convention(
-        text, "left", {"offsets_deg": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0], "sign_flip_joints": [1, 2]}
-    )
-    data = yaml.safe_load(out)
-    assert data["arms"]["left"]["convention"]["offsets_deg"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
-    assert data["arms"]["left"]["convention"]["sign_flip_joints"] == [1, 2]
-    assert data["arms"]["left"]["serial"] == "Rizon4s-062841"  # untouched
-    assert "# NOTE: a camera exists only" in out                # comments preserved
+    assert calibration.factr_path("left_only").name == "left.yaml"
+    assert calibration.factr_path("bimanual").name == "bimanual.yaml"
 
 
 def test_apply_to_rig_merges_existing_gripper(tmp_path, monkeypatch):
@@ -728,34 +731,64 @@ def test_apply_to_rig_merges_existing_gripper(tmp_path, monkeypatch):
 
     from dual_flexiv_control.dashboard import calibration
 
-    rig_file = tmp_path / "myrig.yaml"
-    rig_file.write_text(
-        "# @package _global_\n"
-        "arms:\n"
+    factr_file = tmp_path / "factr.yaml"
+    factr_file.write_text(
+        "leaders:\n"
         "  left:\n"
-        "    name: \"Lauer\"\n"
-        "    serial: Rizon4s-000000\n"
-        "    convention: { gripper_open: 0.1, gripper_closed: 1.2 }\n"
+        "    raw_to_dfc: { gripper_open: 0.1, gripper_closed: 1.2 }\n"
+        "    home_q_rad: [1, 2, 3]\n"
+        "    dfc_to_factr: { signs: [1, 1, 1], offset_rad: [0, 0, 0] }\n"
     )
-    monkeypatch.setattr(calibration, "rig_path", lambda *_a, **_k: rig_file)
+    monkeypatch.setattr(calibration, "factr_path", lambda *_a, **_k: factr_file)
 
     offsets = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0]
     calibration.apply_to_rig("left", offsets, [3, 1])
     calibration.apply_to_rig("left", offsets, [3, 1])  # idempotent
-    data = yaml.safe_load(rig_file.read_text())
-    conv = data["arms"]["left"]["convention"]
+    data = yaml.safe_load(factr_file.read_text())
+    conv = data["leaders"]["left"]["raw_to_dfc"]
     assert conv["offsets_deg"] == [round(o, 2) for o in offsets]
     assert conv["sign_flip_joints"] == [1, 3]           # sorted+deduped
     assert conv["gripper_open"] == 0.1 and conv["gripper_closed"] == 1.2  # preserved
-    assert data["arms"]["left"]["serial"] == "Rizon4s-000000"
+    assert data["leaders"]["left"]["home_q_rad"] == [1, 2, 3]
 
+
+
+def test_apply_to_rig_saves_complete_measured_leader_calibration(tmp_path, monkeypatch):
+    import yaml
+
+    from dual_flexiv_control.dashboard import calibration
+
+    factr_file = tmp_path / "factr.yaml"
+    factr_file.write_text(
+        "leaders:\n"
+        "  left:\n"
+        "    raw_to_dfc: {}\n"
+        "    home_q_rad: [9, 9, 9]\n"
+        "    dfc_to_factr: { signs: [1, 1, 1], offset_rad: [9, 9, 9] }\n"
+    )
+    monkeypatch.setattr(calibration, "factr_path", lambda *_a, **_k: factr_file)
+    offsets = [1.0, 2.0, 3.0]
+    model = calibration.solve_model_home(
+        [10.0, -20.0, 30.0], offsets, [1], [1.0, -1.0, 1.0], [0.0, 0.0, 1.57]
+    )
+
+    calibration.apply_to_rig("left", offsets, [1], model_home=model)
+
+    leader = yaml.safe_load(factr_file.read_text())["leaders"]["left"]
+    assert leader["home_q_rad"] == pytest.approx(model.home_q_rad)
+    assert leader["dfc_to_factr"]["signs"] == [1, -1, 1]
+    assert leader["dfc_to_factr"]["offset_rad"] == pytest.approx(model.offset_rad)
+    preview = calibration.format_yaml("left", offsets, [1], model_home=model)
+    assert "home_q_rad:" in preview and "dfc_to_factr:" in preview
+    overrides = calibration.format_overrides("left", offsets, [1], model_home=model)
+    assert "dfc_to_factr.offset_rad" in overrides
 
 def test_apply_to_rig_rejects_missing_side(tmp_path, monkeypatch):
     from dual_flexiv_control.dashboard import calibration
 
-    rig_file = tmp_path / "r.yaml"
-    rig_file.write_text("arms:\n  left:\n    serial: X\n")
-    monkeypatch.setattr(calibration, "rig_path", lambda *_a, **_k: rig_file)
+    factr_file = tmp_path / "r.yaml"
+    factr_file.write_text("leaders:\n  left:\n    raw_to_dfc: {}\n")
+    monkeypatch.setattr(calibration, "factr_path", lambda *_a, **_k: factr_file)
     with pytest.raises(RuntimeError):
         calibration.apply_to_rig("right", [0.0] * 7, [])
 
@@ -793,15 +826,15 @@ def test_format_and_apply_include_gripper(tmp_path, monkeypatch):
     y = calibration.format_yaml("left", offs, [1, 2], gripper_open=0.1, gripper_closed=1.25)
     assert "gripper_open: 0.1000" in y and "gripper_closed: 1.2500" in y
     ov = calibration.format_overrides("left", offs, [1, 2], gripper_open=0.1, gripper_closed=1.25)
-    assert "convention.gripper_open=0.1000" in ov and "convention.gripper_closed=1.2500" in ov
+    assert "raw_to_dfc.gripper_open=0.1000" in ov and "raw_to_dfc.gripper_closed=1.2500" in ov
     # omitted -> no gripper keys emitted
     assert "gripper" not in calibration.format_yaml("left", offs, [1, 2])
 
-    rig_file = tmp_path / "r.yaml"
-    rig_file.write_text("arms:\n  left:\n    serial: X\n")
-    monkeypatch.setattr(calibration, "rig_path", lambda *_a, **_k: rig_file)
+    factr_file = tmp_path / "r.yaml"
+    factr_file.write_text("leaders:\n  left:\n    raw_to_dfc: {}\n")
+    monkeypatch.setattr(calibration, "factr_path", lambda *_a, **_k: factr_file)
     calibration.apply_to_rig("left", offs, [1], gripper_open=0.3, gripper_closed=1.4)
-    conv = yaml.safe_load(rig_file.read_text())["arms"]["left"]["convention"]
+    conv = yaml.safe_load(factr_file.read_text())["leaders"]["left"]["raw_to_dfc"]
     assert conv["gripper_open"] == 0.3 and conv["gripper_closed"] == 1.4
 
 
@@ -1142,6 +1175,236 @@ def test_robot_urdf_chain_parses():
     assert chain[-1].child_offset is None  # flange is the leaf (no bone)
 
 
+def test_factr_urdf_path_comes_from_server_config(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from dual_flexiv_control.dashboard import arms
+    from dual_flexiv_control.dashboard import robot_view
+
+    package = tmp_path / "src" / "factr_teleop" / "factr_teleop"
+    (package / "configs").mkdir(parents=True)
+    (package / "urdf").mkdir()
+    selected = package / "urdf" / "actual-left.urdf"
+    selected.write_text("<robot name='actual'/>")
+    (package / "configs" / "factr_rizon_left.yaml").write_text(
+        "arm_teleop:\n  leader_urdf: actual-left.urdf\n"
+    )
+    monkeypatch.setattr(
+        arms,
+        "discover_factr",
+        lambda: SimpleNamespace(launch=SimpleNamespace(workdir=str(tmp_path))),
+    )
+
+    assert robot_view.factr_urdf_path("left") == selected.resolve()
+
+
+def test_factr_current_model_uses_calibrated_factr_pose(monkeypatch):
+    import numpy as np
+
+    from dual_flexiv_control.dashboard import arms
+    from dual_flexiv_control.dashboard import runner
+
+    model_q = np.linspace(0.1, 0.7, 7)
+    monkeypatch.setattr(arms, "read_live_stream", lambda _name: model_q)
+
+    current = runner._factr_configs({"left": np.zeros(8)})
+    np.testing.assert_allclose(current["left"], model_q)
+
+
+def test_factr_mount_flips_base_x_and_y_only():
+    import numpy as np
+
+    from dual_flexiv_control.dashboard import robot_view
+
+    for side in ("left", "right"):
+        vendor = robot_view._MOUNTS[side]
+        factr = robot_view._factr_mount(side)
+        np.testing.assert_allclose(factr["translation"], vendor["translation"])
+        np.testing.assert_allclose(
+            factr["rot"],
+            np.asarray(vendor["rot"]) @ np.diag([-1.0, -1.0, 1.0]),
+            atol=1e-12,
+        )
+
+
+def test_factr_base_yaw_aligns_zero_pose_axes_with_rizon():
+    import numpy as np
+
+    from dual_flexiv_control.dashboard import robot_view
+
+    def base_axes(chain):
+        rotation = np.eye(3)
+        axes = []
+        for index, link in enumerate(chain):
+            rotation = rotation @ robot_view._rot_from_rpy(*link.rpy)
+            if index:
+                axes.append(rotation @ np.asarray(link.axis, dtype=float))
+        return np.asarray(axes)
+
+    factr_axes = base_axes(robot_view._factr_chain("left"))
+    vendor_axes = base_axes(robot_view.parse_chain())[: len(factr_axes)]
+    correction = robot_view._rot_from_axis_angle(
+        (0.0, 0.0, 1.0), robot_view.FACTR_BASE_YAW_RAD
+    )
+    corrected = (correction @ factr_axes.T).T
+    # The vendor URDF contains milliradian factory corrections, so compare the
+    # physical axis directions rather than demanding byte-identical cardinal axes.
+    dots = np.sum(vendor_axes * corrected, axis=1)
+    assert dots == pytest.approx(np.ones(7), abs=1e-4)
+
+
+def test_legacy_ghost_keeps_dfc_convention():
+    import numpy as np
+
+    from dual_flexiv_control.dashboard import runner
+
+    converted = np.linspace(-0.3, 0.4, 8)
+    ghost = runner._ghost_configs({"left": converted})
+    np.testing.assert_allclose(ghost["left"], converted[:7])
+
+
+def test_factr_left_binary_stl_meshes_load():
+    from dual_flexiv_control.dashboard import robot_view
+
+    chain = robot_view._factr_chain("left")
+    meshes = [visual.mesh for link in chain for visual in link.visuals]
+    assert meshes
+    assert all(path.suffix.lower() == ".stl" for path in meshes)
+    assert all(robot_view._load_mesh(path) for path in meshes)
+
+
+def test_factr_terminal_mesh_uses_side_asset_and_millimetre_scale():
+    from dual_flexiv_control.dashboard import robot_view
+
+    expected = {
+        "left": ("GripperLeft.stl", (-0.047, -0.08005, -0.11480)),
+        "right": ("GripperRight.stl", (-0.047, 0.00145, -0.11480)),
+    }
+    for side, (mesh_name, origin) in expected.items():
+        terminal = robot_view._factr_chain(side)[-1]
+        assert terminal.name == "rail_carriage_link"
+        assert terminal.visuals
+        visual = terminal.visuals[0]
+        assert visual.mesh.name == mesh_name
+        assert visual.mesh.is_file()
+        assert visual.xyz == pytest.approx(origin)
+        assert visual.scale == pytest.approx((0.001, 0.001, 0.001))
+
+
+def test_factr_live_display_scale_matches_follower_link_lengths():
+    import numpy as np
+
+    from dual_flexiv_control.dashboard import robot_view
+
+    follower = robot_view._chain()
+    leader = robot_view._factr_chain("left")
+    # Exclude the follower-only base riser and flange. The six comparable serial
+    # segments are manufactured at an exact 2:1 follower-to-leader scale.
+    follower_lengths = np.asarray(
+        [np.linalg.norm(link.xyz) for link in follower[2:8]]
+    )
+    leader_lengths = np.asarray(
+        [np.linalg.norm(link.xyz) for link in leader[2:8]]
+    )
+    np.testing.assert_allclose(
+        follower_lengths / leader_lengths,
+        robot_view.FACTR_LIVE_DISPLAY_SCALE,
+        rtol=1e-5,
+    )
+
+
+def test_live_scene_overlays_are_opt_in(tmp_path, monkeypatch):
+    from dual_flexiv_control.dashboard import robot_view
+
+    scales = []
+    grippers = []
+
+    class FakeRecording:
+        def log(self, *_args, **_kwargs):
+            pass
+
+        def set_time(self, *_args, **_kwargs):
+            pass
+
+    monkeypatch.setattr(robot_view, "PEDESTAL_GLB", tmp_path / "missing.glb")
+    monkeypatch.setattr(robot_view, "_chain", lambda: [])
+    monkeypatch.setattr(robot_view, "_factr_chain", lambda _side: [])
+    monkeypatch.setattr(robot_view, "_log_arm_geometry", lambda *_a, **_k: None)
+    monkeypatch.setattr(robot_view, "_log_arm_pose", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        robot_view,
+        "_log_follower_gripper",
+        lambda _rec, side, _chain: grippers.append(side),
+    )
+    monkeypatch.setattr(
+        robot_view,
+        "_log_factr_geometry",
+        lambda _rec, _side, _chain, *, display_scale=1.0: scales.append(display_scale),
+    )
+
+    robot_view.log_scene(FakeRecording())
+    assert scales == [1.0, 1.0]  # replay/default
+    assert grippers == []
+    scales.clear()
+    robot_view.log_scene(
+        FakeRecording(), scale_factr_leaders=True, show_follower_grippers=True
+    )
+    assert scales == [2.0, 2.0]  # live dashboard
+    assert grippers == ["left", "right"]
+
+
+def test_grav_follower_gripper_mesh_and_flange_transform():
+    import numpy as np
+
+    from dual_flexiv_control.dashboard import robot_view
+
+    visual = robot_view._GRAV_GRIPPER_VISUAL
+    assert visual.mesh.is_file()
+    assert visual.scale == (0.001, 0.001, 0.001)
+    assert visual.rpy == pytest.approx((np.pi / 2, 0.0, 0.0))
+
+    positions = robot_view._load_stl(visual.mesh)[0].positions
+    rotation = robot_view._rot_from_rpy(*visual.rpy)
+    mounted = (rotation @ (positions * np.asarray(visual.scale)).T).T + np.asarray(
+        visual.xyz
+    )
+    # The circular mating face is flush to flange Z=0 and fingers extend +190 mm.
+    assert mounted[:, 2].min() == pytest.approx(0.0, abs=1e-6)
+    assert mounted[:, 2].max() == pytest.approx(0.1902876, abs=1e-6)
+
+
+def test_factr_base_frame_stls_are_localized_for_fk():
+    from dual_flexiv_control.dashboard import robot_view
+
+    chain = robot_view._factr_chain("left")
+    assert chain[0].visuals[0].xyz == pytest.approx((0.0, 0.0, 0.0))
+    assert chain[2].visuals[0].xyz != pytest.approx((0.0, 0.0, 0.0))
+    assert all(
+        visual.xyz == pytest.approx((0.0, 0.0, 0.0))
+        for link in robot_view._localize_factr_base_frame_meshes(
+            [
+                robot_view._Link(
+                    name="base_link",
+                    xyz=(0.0, 0.0, 0.0),
+                    rpy=(0.0, 0.0, 0.0),
+                    axis=(0.0, 0.0, 1.0),
+                    child_offset=None,
+                    visuals=(
+                        robot_view._Visual(
+                            name="local",
+                            mesh=robot_view.Path("/tmp/meshes_ros_zup_local/link.stl"),
+                            xyz=(0.0, 0.0, 0.0),
+                            rpy=(0.0, 0.0, 0.0),
+                            scale=(1.0, 1.0, 1.0),
+                        ),
+                    ),
+                )
+            ]
+        )
+        for visual in link.visuals
+    )
+
+
 def test_robot_urdf_visual_meshes_resolve():
     # Every <visual> mesh the URDF references must exist in assets/robot/meshes
     # (the ../meshes/... paths resolve relative to the urdf/ dir). link1..7 also
@@ -1241,6 +1504,41 @@ def test_horizon_target_update_and_clear_smoke():
     robot_view.clear_horizon_targets(rec)
     assert not robot_view._shown_targets
     assert not robot_view._shown_traces
+
+
+@_needs_rerun
+def test_horizon_target_renders_fk_at_every_joint_waypoint(monkeypatch):
+    import numpy as np
+    import rerun as rr
+
+    from dual_flexiv_control.dashboard import robot_view
+
+    captured = {}
+
+    def capture_trace(_rec, side, p_now, p_end, waypoints=None):
+        captured[side] = (p_now, p_end, np.asarray(waypoints))
+
+    monkeypatch.setattr(robot_view, "_log_trace", capture_trace)
+    rec = rr.RecordingStream("dfc-test-horizon-path")
+    q0 = np.zeros(7)
+    q_path = np.vstack([q0, q0 + 0.1, q0 + 0.2, q0 + 0.3])
+    robot_view.update_horizon_targets(
+        rec,
+        {"left": q_path[-1]},
+        {"left": q0},
+        t=1.0,
+        target_q_paths={"left": q_path},
+    )
+
+    p_now, p_end, waypoints = captured["left"]
+    np.testing.assert_allclose(p_now, robot_view.fk_world_eef("left", q0))
+    np.testing.assert_allclose(p_end, robot_view.fk_world_eef("left", q_path[-1]))
+    assert waypoints.shape == (4, 3)
+    np.testing.assert_allclose(
+        waypoints,
+        np.asarray([robot_view.fk_world_eef("left", q) for q in q_path]),
+    )
+    robot_view.clear_horizon_targets(rec)
 
 
 @_needs_rerun
@@ -1350,6 +1648,48 @@ def test_read_live_horizon_q_none_without_eval_run(tmp_path):
 
     assert HORIZON_STREAM.format(side="left") == horizon_stream_name("left")
     assert read_live_horizon_q("left", runtime_dir=str(tmp_path)) is None
+
+
+def test_read_live_horizon_q_trajectory_returns_latest_timestamp_group(tmp_path):
+    import time
+
+    import numpy as np
+
+    from dual_flexiv_control.dashboard.arms import HORIZON_STREAM
+    from dual_flexiv_control.dashboard.arms import read_live_horizon_q
+    from dual_flexiv_control.dashboard.arms import read_live_horizon_q_trajectory
+    from dual_flexiv_control.streams import StreamRegistry
+    from dual_flexiv_control.streams.spec import StreamSpec
+    from dual_flexiv_control.streams.stream import StreamWriter
+
+    registry = StreamRegistry(str(tmp_path), "runX")
+    writer = StreamWriter.create(
+        StreamSpec(
+            name=HORIZON_STREAM.format(side="left"),
+            dim=7,
+            capacity=64,
+            dtype="float64",
+            rate_hz=15.0,
+        ),
+        "runX",
+        registry,
+    )
+    try:
+        old_stamp = time.monotonic_ns()
+        writer.write(np.full(7, -1.0), t_ns=old_stamp)
+        new_stamp = old_stamp + 1
+        expected = np.vstack([np.arange(7.0) + i for i in range(4)])
+        for row in expected:
+            writer.write(row, t_ns=new_stamp)
+
+        path = read_live_horizon_q_trajectory("left", runtime_dir=str(tmp_path))
+        np.testing.assert_allclose(path, expected)
+        np.testing.assert_allclose(
+            read_live_horizon_q("left", runtime_dir=str(tmp_path)), expected[-1]
+        )
+    finally:
+        writer.close()
+        writer.unlink()
 
 
 def test_read_live_horizon_eef_none_without_eval_run(tmp_path):

@@ -2,7 +2,8 @@
 
 :class:`EvalLoop` is the reusable core (takes an already-attached
 :class:`~dual_flexiv_control.brain.Brain`, an :class:`ObservationBuilder`, a
-:class:`~.client.Policy`, and an :class:`~.actions.ActionLayout`) so it runs
+:class:`~.client.Policy`, and a
+:class:`~dual_flexiv_control.layout.DFCStateActionLayout`) so it runs
 in-process in tests with fakes. :class:`EvalNode` wraps it in the standard
 spawned-process shape for the live system.
 
@@ -21,16 +22,13 @@ A rollout has no operator, so it is bounded by :attr:`EvalCfg.num_timesteps`
 failures *hold* (no setpoint posted, timestep not counted) — the arms' deadman
 then parks them at the last target, exactly as during a teleop dropout.
 
-For visualization, the node also publishes each arm's *estimated chunk-end
-state* — where the policy's returned chunk is predicted to land the arm —
-refreshed once per inference (see
-:func:`~dual_flexiv_control.control.estimate_chunk_end` for the per-kind
-estimate). Joint kinds (``qpos``/``qvel``) yield a joint config on
-``eval/<side>/q_horizon``; cartesian kinds (``end_effector``/``eef_vel``) yield
-a base-frame TCP position on ``eval/<side>/eef_horizon``; ``force`` predicts no
-motion. The dashboard's metrics viewer reads these (read-only shared memory,
-like ``<side>/q``) to pose a purple horizon-target ghost (joint kinds) and
-trace current-EEF → predicted-EEF in the 3D robot scene. Visualization does not
+For visualization, the node publishes each arm's complete predicted policy
+path once per inference. Joint kinds retain every absolute ``qpos`` row or
+Euler-integrate every ``qvel`` row from measured ``q``; their rows share a
+timestamp on ``eval/<side>/q_horizon``. Cartesian kinds publish a base-frame TCP
+endpoint on ``eval/<side>/eef_horizon``; ``force`` predicts no motion. The
+metrics viewer poses a purple ghost at the final joint row and evaluates FK at
+every row to trace the complete predicted path. Visualization does not
 require actuation: with no control-enabled arm the rollout is a *dry run* — the
 policy is still queried over the full action space and its predictions are
 published, but no setpoints are posted.
@@ -39,6 +37,7 @@ published, but no setpoints are posted.
 from __future__ import annotations
 
 import logging
+import time
 from collections import deque
 
 import numpy as np
@@ -52,7 +51,7 @@ from ..configs import RuntimeCfg
 from ..configs import TaskCfg
 from ..control import action_hold_fields
 from ..control import control_specs
-from ..control import estimate_chunk_end
+from ..control import estimate_chunk_trajectory
 from ..control import horizon_kind
 from ..control import horizon_signals
 from ..control import pack_action
@@ -62,7 +61,7 @@ from ..streams.registry import AttachAborted
 from ..streams.registry import StreamRegistry
 from ..streams.spec import StreamSpec
 from ..streams.stream import StreamWriter
-from .actions import ActionLayout
+from ..layout import DFCStateActionLayout
 from .client import Policy
 from .client import PolicyError
 from .client import build_policy
@@ -114,13 +113,14 @@ class EvalLoop:
         brain: Brain,
         observer: ObservationBuilder,
         policy: Policy,
-        layout: ActionLayout,
+        layout: DFCStateActionLayout,
         control_arms: dict[str, ArmCfg],
         frequency_hz: float = 15.0,
         num_timesteps: int = 1,
         replan_steps: int = 0,
         max_consecutive_errors: int = 3,
         on_chunk=None,
+        on_trajectory=None,
         horizon_arms: dict[str, ArmCfg] | None = None,
     ) -> None:
         self.brain = brain
@@ -136,6 +136,9 @@ class EvalLoop:
         #: inference with each arm's estimated chunk-end state (viz hook — EvalNode
         #: publishes them on ``eval/<side>/{q,eef}_horizon``). Never fatal.
         self._on_chunk = on_chunk
+        #: callable ``{side: ("q"|"eef", (steps, dim) path)} -> None``. It receives
+        #: every integrated/absolute point in the policy chunk for path rendering.
+        self._on_trajectory = on_trajectory
         #: arms the horizon estimate covers (viz): every layout side, not just the
         #: driven ones — a dry run still predicts. Defaults to ``control_arms``.
         self.horizon_arms = horizon_arms if horizon_arms is not None else control_arms
@@ -228,20 +231,20 @@ class EvalLoop:
         return arr
 
     def _announce_horizon(self, chunk: np.ndarray, snapshot: dict) -> None:
-        """Hand each arm's estimated chunk-END state to the viz hook.
+        """Hand each arm's full chunk trajectory and endpoint to viz hooks.
 
         The estimate covers the FULL chunk (the policy's intent, even when
-        ``replan_steps`` re-infers earlier), per that side's control kind (see
-        :func:`~dual_flexiv_control.control.estimate_chunk_end`): joint kinds yield
-        ``("q", joint config)``, cartesian kinds ``("eef", TCP position)``; velocity
-        kinds integrate from the measured baseline in ``snapshot`` (side skipped if
-        that stream is dry), ``force`` predicts nothing. Purely observational: a
-        failure must never disturb the rollout."""
-        if self._on_chunk is None:
+        ``replan_steps`` re-infers earlier). Joint velocity actions are integrated
+        from measured ``q`` one step at a time; absolute joint actions retain every
+        row. Endpoint hooks remain available for compatibility. Purely observational:
+        a failure must never disturb the rollout.
+        """
+        if self._on_chunk is None and self._on_trajectory is None:
             return
         try:
             dt = 1.0 / self.frequency_hz
             targets: dict[str, tuple[str, np.ndarray]] = {}
+            trajectories: dict[str, tuple[str, np.ndarray]] = {}
             for side in self.layout.sides:
                 arm = self.horizon_arms.get(side)
                 if arm is None:
@@ -252,13 +255,17 @@ class EvalLoop:
                     newest = samples.newest if samples is not None else None
                     if newest is not None:
                         measured[sig] = np.asarray(newest, dtype=np.float64)
-                est = estimate_chunk_end(
+                estimate = estimate_chunk_trajectory(
                     arm.control, chunk[:, self.layout.primary_slice(side)], dt, measured
                 )
-                if est is not None:
-                    targets[side] = est
-            if targets:
+                if estimate is not None:
+                    kind, path = estimate
+                    trajectories[side] = (kind, path)
+                    targets[side] = (kind, path[-1])
+            if targets and self._on_chunk is not None:
                 self._on_chunk(targets)
+            if trajectories and self._on_trajectory is not None:
+                self._on_trajectory(trajectories)
         except Exception:  # noqa: BLE001 - viz hook only
             log.exception("horizon viz hook failed (rollout unaffected)")
 
@@ -343,7 +350,9 @@ class EvalNode(ProcessNode):
             self.arms, self.cameras,
             self.task.language_instruction, self.task.state_signals,
         )
-        layout = ActionLayout(self.arms, action_sides)
+        layout = DFCStateActionLayout.from_arms(
+            self.arms, self.task.state_signals, action_sides
+        )
         horizon_arms = {side: self.arms[side] for side in layout.sides}
 
         # Some control kinds hold an absolute field at the measured value (force ->
@@ -379,11 +388,10 @@ class EvalNode(ProcessNode):
         brain.open_control(control_registry, specs_by_side)
         control_arms = {side: self.arms[side] for side in control_sides}
 
-        # Horizon-target streams (viz): one per layout arm, refreshed once per
-        # inference with the estimated chunk-end state — a joint config
-        # (``q_horizon``, joint kinds) or a base-frame TCP position
-        # (``eef_horizon``, cartesian kinds); ``force`` predicts nothing. Owned by
-        # this node (created + unlinked here), read by the dashboard's 3D scene.
+        # Horizon streams (viz): joint kinds publish every per-step q trajectory
+        # row with one shared timestamp; the newest row remains the chunk endpoint
+        # for backward-compatible readers. Cartesian kinds publish their endpoint.
+        # ``force`` predicts nothing. Owned here and read by the dashboard scene.
         horizon_writers: dict[str, tuple[str, StreamWriter, str]] = {}
         for side in layout.sides:
             hk = horizon_kind(self.arms[side].control)
@@ -394,7 +402,7 @@ class EvalNode(ProcessNode):
                 StreamSpec(
                     name=name,
                     dim=int(self.arms[side].dof) if hk == "q" else 3,
-                    capacity=64,
+                    capacity=4096 if hk == "q" else 64,
                     dtype="float64",
                     rate_hz=self.task.eval.frequency_hz,
                 ),
@@ -404,10 +412,33 @@ class EvalNode(ProcessNode):
             horizon_writers[side] = (hk, writer, name)
 
         def publish_horizon(targets: dict[str, tuple[str, np.ndarray]]) -> None:
+            # Publish the endpoint first as a compatibility/fallback sample. Joint
+            # paths immediately follow and end at the same vector.
             for side, (hk, vec) in targets.items():
                 entry = horizon_writers.get(side)
                 if entry is not None and entry[0] == hk:
                     entry[1].write(np.ascontiguousarray(vec, dtype=np.float64))
+
+        def publish_trajectory(paths: dict[str, tuple[str, np.ndarray]]) -> None:
+            for side, (hk, path) in paths.items():
+                entry = horizon_writers.get(side)
+                if entry is None or entry[0] != hk or hk != "q":
+                    continue
+                rows = np.asarray(path, dtype=np.float64)
+                if rows.ndim != 2 or rows.shape[1] != entry[1].spec.dim:
+                    raise ValueError(
+                        f"{side} horizon path shape {rows.shape} does not match "
+                        f"joint dimension {entry[1].spec.dim}"
+                    )
+                if rows.shape[0] > entry[1].spec.capacity:
+                    raise ValueError(
+                        f"{side} horizon has {rows.shape[0]} steps, exceeding "
+                        f"stream capacity {entry[1].spec.capacity}"
+                    )
+                # One timestamp groups the chunk for dashboard readers.
+                t_ns = time.monotonic_ns()
+                for row in rows:
+                    entry[1].write(np.ascontiguousarray(row), t_ns=t_ns)
 
         # Policy-server comm events (viz): one sample per packet sent / received /
         # failed, written by RemotePolicy's on_comm hook. Owned by this node like
@@ -441,6 +472,7 @@ class EvalNode(ProcessNode):
                 replan_steps=self.policy_cfg.replan_steps,
                 max_consecutive_errors=self.policy_cfg.max_consecutive_errors,
                 on_chunk=publish_horizon if horizon_writers else None,
+                on_trajectory=publish_trajectory if horizon_writers else None,
                 horizon_arms=horizon_arms,
             )
             loop.run(stop_event)
