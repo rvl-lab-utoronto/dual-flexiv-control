@@ -625,7 +625,12 @@ def test_calibration_solve_recovers_full_convention():
     )
     for leader, ref in pairs:
         q = np.radians(np.asarray(leader + [0.0]))  # + trailing gripper value
-        assert np.degrees(convert_factr_to_rizon(q, conv)) == pytest.approx(ref, abs=1e-9)
+        converted = np.degrees(convert_factr_to_rizon(q, conv))
+        # Calibration identifies angles modulo 360; live conversion deliberately
+        # preserves the selected continuous representative instead of wrapping it.
+        assert [_wrap180(v - r) for v, r in zip(converted, ref)] == pytest.approx(
+            [0.0] * len(ref), abs=1e-9
+        )
 
 
 def test_calibration_solve_home_only_degrades_to_straight_pose():
@@ -1228,10 +1233,73 @@ def test_factr_current_model_uses_calibrated_factr_pose(monkeypatch):
     from dual_flexiv_control.dashboard import runner
 
     model_q = np.linspace(0.1, 0.7, 7)
-    monkeypatch.setattr(arms, "read_live_stream", lambda _name: model_q)
+    monkeypatch.setattr(
+        arms,
+        "_read_live_stream_sample",
+        lambda _name, _runtime_dir, max_age_s=None: (model_q, 123),
+    )
+    monkeypatch.setattr(arms, "factr_max_age_s", lambda: 0.25)
 
     current = runner._factr_configs({"left": np.zeros(8)})
     np.testing.assert_allclose(current["left"], model_q)
+
+
+def test_factr_current_model_has_no_dfc_fallback(monkeypatch):
+    import numpy as np
+
+    from dual_flexiv_control.dashboard import arms
+    from dual_flexiv_control.dashboard import runner
+
+    monkeypatch.setattr(
+        arms,
+        "_read_live_stream_sample",
+        lambda _name, _runtime_dir, max_age_s=None: None,
+    )
+    monkeypatch.setattr(arms, "factr_max_age_s", lambda: 0.25)
+
+    assert runner._factr_configs({"left": np.arange(8.0)}) == {}
+
+
+def test_live_factr_model_hides_without_model_q_and_recovers(monkeypatch):
+    import numpy as np
+
+    from dual_flexiv_control.dashboard import robot_view
+
+    visibility = []
+    poses = []
+
+    class FakeRecording:
+        def set_time(self, *_args, **_kwargs):
+            pass
+
+    rec = FakeRecording()
+    monkeypatch.setattr(robot_view, "_chain", lambda: [])
+    monkeypatch.setattr(robot_view, "_factr_chain", lambda _side: [])
+    monkeypatch.setattr(robot_view, "_has_mesh_visuals", lambda _chain: False)
+    monkeypatch.setattr(robot_view, "_log_real_skeleton", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        robot_view,
+        "_log_arm_pose",
+        lambda _rec, side, _chain, q, **kwargs: poses.append((side, q, kwargs.get("root"))),
+    )
+    monkeypatch.setattr(
+        robot_view,
+        "_set_factr_visible",
+        lambda _rec, side, visible: visibility.append((side, visible)),
+    )
+    robot_view._arm_has_live.clear()
+    robot_view._factr_has_live.clear()
+
+    robot_view.update_poses(rec, {}, {}, 0.0, factr_q={})
+    assert visibility == [("left", False), ("right", False)]
+    assert poses == []
+
+    model_q = np.arange(7.0)
+    robot_view.update_poses(rec, {}, {}, 0.1, factr_q={"left": model_q})
+    assert visibility[-1] == ("left", True)
+    assert poses[-1][0] == "left"
+    np.testing.assert_array_equal(poses[-1][1], model_q)
+    assert poses[-1][2] == robot_view._factr_root("left")
 
 
 def test_factr_mount_flips_base_x_and_y_only():
@@ -1357,7 +1425,7 @@ def test_live_scene_overlays_are_opt_in(tmp_path, monkeypatch):
     monkeypatch.setattr(
         robot_view,
         "_log_follower_gripper",
-        lambda _rec, side, _chain: grippers.append(side),
+        lambda _rec, side, _chain, *, ghost: grippers.append((side, ghost)),
     )
     monkeypatch.setattr(
         robot_view,
@@ -1373,7 +1441,12 @@ def test_live_scene_overlays_are_opt_in(tmp_path, monkeypatch):
         FakeRecording(), scale_factr_leaders=True, show_follower_grippers=True
     )
     assert scales == [2.0, 2.0]  # live dashboard
-    assert grippers == ["left", "right"]
+    assert grippers == [
+        ("left", False),
+        ("left", True),
+        ("right", False),
+        ("right", True),
+    ]
 
 
 def test_grav_follower_gripper_mesh_and_flange_transform():
@@ -1394,6 +1467,31 @@ def test_grav_follower_gripper_mesh_and_flange_transform():
     # The circular mating face is flush to flange Z=0 and fingers extend +190 mm.
     assert mounted[:, 2].min() == pytest.approx(0.0, abs=1e-6)
     assert mounted[:, 2].max() == pytest.approx(0.1902876, abs=1e-6)
+
+
+def test_grav_follower_gripper_ghost_uses_ghost_tree_and_tint(monkeypatch):
+    from dual_flexiv_control.dashboard import robot_view
+
+    logged = []
+
+    class FakeMesh3D:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeRecording:
+        def log(self, path, value, **kwargs):
+            logged.append((path, value, kwargs))
+
+    monkeypatch.setattr(robot_view.rr, "Mesh3D", FakeMesh3D)
+    robot_view._log_follower_gripper(
+        FakeRecording(), "left", robot_view._chain(), ghost=True
+    )
+
+    mesh_logs = [item for item in logged if isinstance(item[1], FakeMesh3D)]
+    assert mesh_logs
+    assert all(path.startswith("robot/left_ghost/") for path, _, _ in logged)
+    expected = tuple(c / 255.0 for c in robot_view._GHOST_COLOR["left"])
+    assert mesh_logs[0][1].kwargs["albedo_factor"] == pytest.approx(expected)
 
 
 def test_factr_base_frame_stls_are_localized_for_fk():

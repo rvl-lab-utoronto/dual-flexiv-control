@@ -548,20 +548,31 @@ def _ghost_configs(leader_samples: dict) -> dict:
 
 
 def _factr_configs(leader_samples: dict) -> dict:
-    """Return calibrated FACTR-URDF configs for the current leader model.
+    """Return fresh calibrated FACTR-URDF configs for the current leader model.
 
     ``model_q_rad`` is the raw Dynamixel pose after the FACTR mechanism's signs,
     offsets, and wrapping have placed it in the actual URDF's joint coordinates.
-    Older servers retain the converted DFC sample as a compatibility fallback.
+    There is deliberately no DFC-coordinate fallback: without a fresh model pose,
+    the native FACTR leader must disappear instead of showing a plausible but
+    incorrect pose.
     """
     from ..interfaces.factr import factr_telemetry_stream_name
-    from .arms import read_live_stream
+    from .arms import _read_live_stream_sample
+    from .arms import factr_max_age_s
 
     configs = {}
-    for side, jp in leader_samples.items():
-        model_q = read_live_stream(factr_telemetry_stream_name(side, "model_q_rad"))
-        source = model_q if model_q is not None and len(model_q) >= 7 else jp
-        configs[side] = np.asarray(source, dtype=float)[:7]
+    for side in leader_samples:
+        sample = _read_live_stream_sample(
+            factr_telemetry_stream_name(side, "model_q_rad"),
+            None,
+            max_age_s=factr_max_age_s(),
+        )
+        if sample is None:
+            continue
+        model_q = np.asarray(sample[0], dtype=float).reshape(-1)
+        if model_q.size < 7 or not np.all(np.isfinite(model_q[:7])):
+            continue
+        configs[side] = model_q[:7]
     return configs
 
 

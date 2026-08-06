@@ -667,8 +667,10 @@ def _log_arm_meshes(rec, side: str, chain: list[_Link]) -> None:
         )
 
 
-def _log_follower_gripper(rec, side: str, chain: list[_Link]) -> None:
-    """Attach the GRAV mesh to the solid follower's flange in the live viewer."""
+def _log_follower_gripper(
+    rec, side: str, chain: list[_Link], *, ghost: bool
+) -> None:
+    """Attach the GRAV mesh to a solid or ghost follower flange."""
     if not _GRAV_GRIPPER_VISUAL.mesh.is_file():
         log.warning(
             "GRAV follower gripper mesh is missing: %s",
@@ -676,7 +678,7 @@ def _log_follower_gripper(rec, side: str, chain: list[_Link]) -> None:
         )
         return
 
-    path = _arm_root(side, ghost=False)
+    path = _arm_root(side, ghost=ghost)
     for link in chain:
         path = f"{path}/{link.name}"
         if link.name == "flange":
@@ -697,6 +699,7 @@ def _log_follower_gripper(rec, side: str, chain: list[_Link]) -> None:
         ),
         static=True,
     )
+    ghost_albedo = tuple(c / 255.0 for c in _GHOST_COLOR[side])
     for part in _load_mesh(_GRAV_GRIPPER_VISUAL.mesh):
         rec.log(
             f"{visual_path}/{part.material}",
@@ -704,7 +707,7 @@ def _log_follower_gripper(rec, side: str, chain: list[_Link]) -> None:
                 vertex_positions=part.positions,
                 triangle_indices=part.indices,
                 vertex_normals=part.normals,
-                albedo_factor=part.albedo,
+                albedo_factor=ghost_albedo if ghost else part.albedo,
             ),
             static=True,
         )
@@ -901,10 +904,12 @@ def log_scene(
         q = None if joint_angles is None else joint_angles.get(side)
         _log_arm_geometry(rec, side, chain, ghost=False)
         if show_follower_grippers:
-            _log_follower_gripper(rec, side, chain)
+            _log_follower_gripper(rec, side, chain, ghost=False)
         _log_arm_pose(rec, side, chain, q, ghost=False, static=False)
         # Previous leader visualization: Rizon/Flexiv geometry in DFC coordinates.
         _log_arm_geometry(rec, side, chain, ghost=True)
+        if show_follower_grippers:
+            _log_follower_gripper(rec, side, chain, ghost=True)
         _log_arm_pose(rec, side, chain, q, ghost=True, static=False)
         # Current leader visualization: the per-side URDF selected by FACTR.
         leader_chain = _factr_chain(side)
@@ -930,6 +935,25 @@ def log_scene(
 #: so independent recordings (the live robot viewer vs. a replay) never share tint
 #: state — one bleeding into the other would suppress the flip-triggered recolour.
 _arm_has_live: dict[tuple[int, str], bool] = {}
+#: Last-known native FACTR-model availability. Unlike the legacy DFC ghost, this
+#: model is meaningful only when ``model_q_rad`` is fresh, so its whole subtree is
+#: scaled to zero while that telemetry is absent and restored on recovery.
+_factr_has_live: dict[tuple[int, str], bool] = {}
+
+
+def _set_factr_visible(rec, side: str, visible: bool) -> None:
+    """Show or hide one native FACTR leader without deleting its static geometry."""
+    mount = _factr_mount(side)
+    display_scale = FACTR_LIVE_DISPLAY_SCALE if visible else 0.0
+    rec.log(
+        _factr_root(side),
+        rr.Transform3D(
+            translation=mount["translation"],
+            quaternion=rr.Quaternion(xyzw=mount["quat_xyzw"]),
+            scale=(display_scale, display_scale, display_scale),
+        ),
+        static=False,
+    )
 
 
 def update_poses(
@@ -942,13 +966,16 @@ def update_poses(
 ) -> None:
     """Live-update the arms: solid arm(s) at measured ``real_q``, ghost(s) at commanded ``ghost_q``.
 
-    Both dicts are ``{side: (7,) rad}``; a side absent from a dict is left at its last
-    pose. A solid arm with **no** measured ``q`` this tick (side missing from
+    The pose dicts are ``{side: (7,) rad}``. A solid arm with **no** measured ``q``
+    this tick (side missing from
     ``real_q``) is tinted :data:`_STALE_COLOR` (muted red) and not moved, so the viewer
     never shows motion the real arm isn't making; it returns to its normal colour when
-    live data resumes. Only the FK transforms (and, on a state flip, the colour) are
-    re-logged — the geometry from :func:`log_scene` rides along.
+    live data resumes. Legacy ghosts hold their last pose. When ``factr_q`` is supplied
+    by the live dashboard, a side absent from it is hidden completely rather than
+    freezing its native FACTR model at stale data; it reappears when model telemetry
+    resumes. Only transforms (and, on state flips, colour/visibility) are re-logged.
     """
+    manage_factr_visibility = factr_q is not None
     factr_q = factr_q or {}
     rec.set_time(_POSE_TIMELINE, duration=t)
     chain = _chain()
@@ -967,7 +994,13 @@ def update_poses(
             _log_arm_pose(rec, side, chain, real_q[side], ghost=False, static=False)
         if ghost_q.get(side) is not None:
             _log_arm_pose(rec, side, chain, ghost_q[side], ghost=True, static=False)
-        if factr_q.get(side) is not None:
+        has_factr = factr_q.get(side) is not None
+        if manage_factr_visibility:
+            factr_key = (id(rec), side)
+            if _factr_has_live.get(factr_key) != has_factr:
+                _factr_has_live[factr_key] = has_factr
+                _set_factr_visible(rec, side, has_factr)
+        if has_factr:
             _log_arm_pose(
                 rec,
                 side,
@@ -1399,6 +1432,7 @@ def reset() -> None:
     with _LOCK:
         _REC = None
         _arm_has_live.clear()
+        _factr_has_live.clear()
         _shown_targets.clear()
         _shown_traces.clear()
         _shown_calibration_targets.clear()

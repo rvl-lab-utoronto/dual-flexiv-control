@@ -4,7 +4,9 @@ Captured verbatim from the hardware-validated teleop test (``rizon_tests``): the
 The FACTR WebSocket returns ``DoF+1`` joint values in radians (the arm joints
 plus a trailing gripper value). Mapping to Rizon joint targets is: drop the
 gripper, convert to degrees, add per-joint offsets, flip the sign of selected
-joints, wrap to ``[-180, 180]``, convert back to radians.
+joints, and convert back to radians. Targets deliberately remain on their
+continuous branch; independently wrapping samples would create artificial
+``2π`` command jumps at the branch cut.
 
 This lives on the **brain** side — the brain reads FACTR and posts the converted
 radian setpoints onto the control channel; the arm process never talks to FACTR.
@@ -33,10 +35,8 @@ def convert_factr_to_rizon(q_leader_rad, conv: "JointConventionCfg") -> np.ndarr
     if conv.drop_trailing:
         q = q[: len(q) - conv.drop_trailing]          # drop trailing gripper value(s)
     deg = np.degrees(q) + np.asarray(conv.offsets_deg[: len(q)], dtype=np.float64)
-    for j in conv.sign_flip_joints:                   # flip AFTER offsets, BEFORE wrap
+    for j in conv.sign_flip_joints:                   # flip after offsets
         deg[j] = -deg[j]
-    if conv.wrap_deg:
-        deg = (deg + 180.0) % 360.0 - 180.0
     return np.radians(deg)
 
 
@@ -53,15 +53,14 @@ def offsets_from_straight_pose(q_leader_rad, conv: "JointConventionCfg") -> list
         offsets_deg[j] = wrap(-degrees(q_leader_arm[j]))   # wrap to [-180, 180]
 
     The returned list has one entry per follower joint (gripper dropped via
-    ``conv.drop_trailing``); ``sign_flip_joints`` / ``drop_trailing`` / ``wrap_deg``
-    are unchanged — copy those from the existing convention when writing the config.
+    ``conv.drop_trailing``). Offset normalization is safe here because offsets are
+    static calibration parameters, not live command samples.
     """
     q = np.asarray(q_leader_rad, dtype=np.float64).ravel()
     if conv.drop_trailing:
         q = q[: len(q) - conv.drop_trailing]          # drop trailing gripper value(s)
     offsets = -np.degrees(q)
-    if conv.wrap_deg:
-        offsets = (offsets + 180.0) % 360.0 - 180.0   # keep offsets in the canonical range
+    offsets = (offsets + 180.0) % 360.0 - 180.0       # canonical static offsets
     return [float(o) for o in offsets]
 
 

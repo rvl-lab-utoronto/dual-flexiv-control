@@ -538,7 +538,6 @@ def format_yaml(
         "    raw_to_dfc:",
         f"      offsets_deg: {_fmt_list(offsets_deg)}",
         f"      sign_flip_joints: {list(sign_flip_joints)}",
-        "      wrap_deg: true",
         "      drop_trailing: 1",
     ]
     if gripper_open is not None:
@@ -668,7 +667,7 @@ def apply_to_leader(
     conv["sign_flip_joints"] = [
         int(j) for j in sorted(set(int(x) for x in sign_flip_joints))
     ]
-    conv.setdefault("wrap_deg", True)
+    conv.pop("wrap_deg", None)
     conv.setdefault("drop_trailing", 1)
     if gripper_open is not None:
         conv["gripper_open"] = round(float(gripper_open), 4)

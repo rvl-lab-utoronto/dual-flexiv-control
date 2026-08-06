@@ -39,7 +39,6 @@ def _factr_cfg(left_addr, right_addr):
     convention = JointConventionCfg(
         offsets_deg=[0.0] * 6,
         sign_flip_joints=[],
-        wrap_deg=True,
         drop_trailing=1,
         gripper_open=0.0,
         gripper_closed=1.0,
@@ -408,7 +407,6 @@ def test_factr_interface_polls_live_sides_and_tolerates_a_dead_one():
                 offsets_deg=[0.0] * 6,
                 sign_flip_joints=[],
                 drop_trailing=1,
-                wrap_deg=True,
                 gripper_open=0.0,
                 gripper_closed=1.0,
             )

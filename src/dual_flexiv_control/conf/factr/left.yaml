@@ -15,7 +15,6 @@ leaders:
     raw_to_dfc:
       offsets_deg: [-78.05, 96.68, 97.47, 152.23, 1.32, 89.56, 75.94]
       sign_flip_joints: [5]
-      wrap_deg: true
       drop_trailing: 1
       gripper_open: 1.0799
       gripper_closed: 1.6153

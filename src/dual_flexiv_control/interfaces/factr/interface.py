@@ -236,7 +236,6 @@ class FactrInterface(StreamProducerNode):
         validated = JointConventionCfg(
             offsets_deg=offsets,
             sign_flip_joints=flips,
-            wrap_deg=bool(conv.wrap_deg),
             drop_trailing=drop,
             gripper_open=opened,
             gripper_closed=closed,
