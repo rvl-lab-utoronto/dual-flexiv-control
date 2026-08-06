@@ -177,7 +177,6 @@ def test_managed_teleop_receives_dfc_leader_contract(tmp_path, spawned):
         home_q_rad=[0.0] * 7,
         dfc_to_factr=FactrTransformCfg(
             signs=[1.0, 1.0, -1.0, 1.0, 1.0, 1.0, 1.0],
-            offset_rad=[0.0] * 7,
         ),
     )
     sup = fl.FactrServerSupervisor(
@@ -189,6 +188,7 @@ def test_managed_teleop_receives_dfc_leader_contract(tmp_path, spawned):
     assert payload["side"] == "left"
     assert payload["raw_to_dfc"]["offsets_deg"] == [1.0] * 7
     assert payload["dfc_to_factr"]["signs"][2] == -1.0
+    assert "offset_rad" not in payload["dfc_to_factr"]
     api = next(u for u in sup.units if u.name == "api").proc
     assert "DFC_LEADER_CONFIG" not in api.kwargs["env"]
 

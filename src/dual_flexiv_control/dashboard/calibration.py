@@ -25,7 +25,8 @@ partial calibration is well-defined.
 
 The same session also captures the physical leader at FACTR's dynamics-model home.
 Once the raw→DFC convention is known, that sample determines the side-specific
-affine model offset: ``offset = q_model_home - signs * q_dfc``.
+canonical DFC home. FACTR owns the model-home target and derives the affine zero
+offset at process launch; the derived value is never persisted by DFC.
 
 This module reads the FACTR WebSocket cache (honouring ``runtime.sim``); it never
 opens a robot connection or creates a Rerun recording. Its explicit save action
@@ -46,12 +47,6 @@ _LOCK = threading.Lock()
 #: Cached leader client (persistent WebSocket), rebuilt on demand — avoids reconnect
 #: churn under the calibration live-render fragment. Dropped by :func:`reset`.
 _CLIENT = None
-
-#: FACTR's established gravity-model calibration pose (joint 4 at about +90°).
-#: Keep 1.57 rather than pi/2 because this is the exact pose used by the FACTR
-#: controller configuration and initial-match gate.
-FACTR_MODEL_HOME_Q_RAD: tuple[float, ...] = (0.0, 0.0, 0.0, 1.57, 0.0, 0.0, 0.0)
-
 
 # ---------------------------------------------------------------------------
 # Config + leader reads
@@ -88,9 +83,30 @@ def current_model_signs(side: str) -> list[float]:
 
 
 def factr_model_home(side: str) -> list[float]:
-    """FACTR dynamics-model home, length-normalized to the leader arm DoF."""
+    """FACTR-owned dynamics-model home from the side's mechanism configuration."""
+    import yaml
+    from pathlib import Path
+
     dof = follower_dof(side)
-    return list((FACTR_MODEL_HOME_Q_RAD + (0.0,) * dof)[:dof])
+    factr = _arms.discover_factr()
+    workdir = Path(str(factr.launch.workdir)).expanduser().resolve()
+    config_path = (
+        workdir / "src" / "factr_teleop" / "factr_teleop" / "configs"
+        / f"factr_rizon_{side}.yaml"
+    )
+    data = yaml.safe_load(config_path.read_text()) or {}
+    try:
+        values = data["arm_teleop"]["initialization"]["model_home_q_rad"]
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError(
+            f"FACTR {side} config has no arm_teleop.initialization.model_home_q_rad"
+        ) from exc
+    target = np.asarray(values, dtype=np.float64)
+    if target.shape != (dof,) or not np.all(np.isfinite(target)):
+        raise RuntimeError(
+            f"FACTR {side} model_home_q_rad must contain {dof} finite values"
+        )
+    return [float(v) for v in target]
 
 
 def follower_dof(side: str) -> int:
@@ -428,12 +444,19 @@ def solve_pose_samples(side: str, samples: dict[str, list[float]]) -> PoseFit:
 
 @dataclass(frozen=True)
 class ModelHomeFit:
-    """Measured DFC pose and solved affine transform at FACTR model home."""
+    """Measured DFC pose and axis convention at FACTR model home."""
 
     home_q_rad: list[float]
     signs: list[float]
-    offset_rad: list[float]
     target_q_rad: list[float]
+
+    @property
+    def derived_offset_rad(self) -> list[float]:
+        """Non-persisted affine offset, useful only for display/audit."""
+        target = np.asarray(self.target_q_rad, dtype=np.float64)
+        signs = np.asarray(self.signs, dtype=np.float64)
+        home = np.asarray(self.home_q_rad, dtype=np.float64)
+        return [float(v) for v in target - signs * home]
 
 
 def solve_model_home(
@@ -443,7 +466,7 @@ def solve_model_home(
     model_signs: list[float],
     target_q_rad: list[float],
 ) -> ModelHomeFit:
-    """Solve DFC→FACTR offset from a raw sample at known FACTR model home.
+    """Convert a raw sample at FACTR's authoritative model home into DFC coordinates.
 
     The sample is first converted through the *in-progress* raw→DFC convention,
     so one calibration session owns both coordinate mappings. Model-axis signs are
@@ -473,11 +496,9 @@ def solve_model_home(
         q_dfc_deg[j] = -q_dfc_deg[j]
     q_dfc_deg = _wrap_deg(q_dfc_deg)
     home_q = np.radians(q_dfc_deg)
-    model_offset = target - signs * home_q
     return ModelHomeFit(
         home_q_rad=[float(v) for v in home_q],
         signs=[float(v) for v in signs],
-        offset_rad=[float(v) for v in model_offset],
         target_q_rad=[float(v) for v in target],
     )
 
@@ -485,7 +506,7 @@ def solve_model_home(
 def capture_model_home(
     side: str, offsets_deg: list[float], sign_flip_joints: list[int], samples: int = 5
 ) -> tuple[list[float], ModelHomeFit]:
-    """Capture raw arm joints at FACTR model home and solve the model offset."""
+    """Capture raw arm joints at FACTR model home in canonical DFC coordinates."""
     raw = read_leader_arm_deg(side, samples)
     fit = solve_model_home(
         raw, offsets_deg, sign_flip_joints, current_model_signs(side), factr_model_home(side)
@@ -529,7 +550,6 @@ def format_yaml(
             f"    home_q_rad: {_fmt_list(model_home.home_q_rad, 10)}",
             "    dfc_to_factr:",
             f"      signs: {[int(v) for v in model_home.signs]}",
-            f"      offset_rad: {_fmt_list(model_home.offset_rad, 10)}",
         ])
     return "\n".join(lines)
 
@@ -556,11 +576,9 @@ def format_overrides(
     if model_home is not None:
         homes = "[" + ",".join(f"{v:.10f}" for v in model_home.home_q_rad) + "]"
         signs = "[" + ",".join(str(int(v)) for v in model_home.signs) + "]"
-        model_offsets = "[" + ",".join(f"{v:.10f}" for v in model_home.offset_rad) + "]"
         parts.extend([
             f"factr.leaders.{side}.home_q_rad='{homes}'",
             f"factr.leaders.{side}.dfc_to_factr.signs='{signs}'",
-            f"factr.leaders.{side}.dfc_to_factr.offset_rad='{model_offsets}'",
         ])
     return " ".join(parts)
 
@@ -661,7 +679,6 @@ def apply_to_leader(
         if not (
             len(model_home.home_q_rad)
             == len(model_home.signs)
-            == len(model_home.offset_rad)
             == dof
         ):
             raise RuntimeError(f"model-home calibration must contain {dof} arm joints")
@@ -672,7 +689,9 @@ def apply_to_leader(
                 f"leaders.{side}.dfc_to_factr is not a YAML object in {path.name}"
             )
         transform["signs"] = [int(v) for v in model_home.signs]
-        transform["offset_rad"] = [round(float(v), 10) for v in model_home.offset_rad]
+    transform = leader.get("dfc_to_factr")
+    if isinstance(transform, dict):
+        transform.pop("offset_rad", None)
     rendered = yaml.safe_dump(data, sort_keys=False, width=120)
     reparsed = yaml.safe_load(rendered) or {}
     got_leader = (reparsed.get("leaders") or {}).get(side) or {}

@@ -663,7 +663,7 @@ def test_calibration_solve_residual_flags_inconsistent_joint():
 
 
 
-def test_calibration_model_home_solves_dfc_pose_and_affine_offset():
+def test_calibration_model_home_solves_dfc_pose_and_derives_audit_offset():
     import numpy as np
 
     from dual_flexiv_control.dashboard.calibration import solve_model_home
@@ -677,9 +677,31 @@ def test_calibration_model_home_solves_dfc_pose_and_affine_offset():
     )
     expected_home = np.radians([15.0, 18.0, 27.0, 44.0])
     assert fit.home_q_rad == pytest.approx(expected_home)
-    assert fit.offset_rad == pytest.approx(
+    assert fit.derived_offset_rad == pytest.approx(
         np.asarray(fit.target_q_rad) - np.asarray(fit.signs) * expected_home
     )
+
+
+def test_calibration_model_home_target_is_read_from_factr(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from dual_flexiv_control.dashboard import calibration
+
+    config_dir = tmp_path / "src" / "factr_teleop" / "factr_teleop" / "configs"
+    config_dir.mkdir(parents=True)
+    (config_dir / "factr_rizon_left.yaml").write_text(
+        "arm_teleop:\n"
+        "  initialization:\n"
+        "    model_home_q_rad: [0.1, 0.2, 1.3]\n"
+    )
+    monkeypatch.setattr(calibration, "follower_dof", lambda _side: 3)
+    monkeypatch.setattr(
+        calibration._arms,
+        "discover_factr",
+        lambda: SimpleNamespace(launch=SimpleNamespace(workdir=str(tmp_path))),
+    )
+
+    assert calibration.factr_model_home("left") == pytest.approx([0.1, 0.2, 1.3])
 
 def test_calibration_solve_pose_samples_ignores_stale_entries():
     # The UI wrapper drops samples whose pose name vanished or whose length no longer
@@ -750,6 +772,7 @@ def test_apply_to_rig_merges_existing_gripper(tmp_path, monkeypatch):
     assert conv["sign_flip_joints"] == [1, 3]           # sorted+deduped
     assert conv["gripper_open"] == 0.1 and conv["gripper_closed"] == 1.2  # preserved
     assert data["leaders"]["left"]["home_q_rad"] == [1, 2, 3]
+    assert "offset_rad" not in data["leaders"]["left"]["dfc_to_factr"]
 
 
 
@@ -777,11 +800,11 @@ def test_apply_to_rig_saves_complete_measured_leader_calibration(tmp_path, monke
     leader = yaml.safe_load(factr_file.read_text())["leaders"]["left"]
     assert leader["home_q_rad"] == pytest.approx(model.home_q_rad)
     assert leader["dfc_to_factr"]["signs"] == [1, -1, 1]
-    assert leader["dfc_to_factr"]["offset_rad"] == pytest.approx(model.offset_rad)
+    assert "offset_rad" not in leader["dfc_to_factr"]
     preview = calibration.format_yaml("left", offsets, [1], model_home=model)
     assert "home_q_rad:" in preview and "dfc_to_factr:" in preview
     overrides = calibration.format_overrides("left", offsets, [1], model_home=model)
-    assert "dfc_to_factr.offset_rad" in overrides
+    assert "dfc_to_factr.offset_rad" not in overrides
 
 def test_apply_to_rig_rejects_missing_side(tmp_path, monkeypatch):
     from dual_flexiv_control.dashboard import calibration

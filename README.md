@@ -210,7 +210,9 @@ DFC/Rizon convention and is what the viewer, brain, and
 `home_q_rad`, and `dfc_to_factr`. The Calibration tab loads that YAML object,
 updates `raw_to_dfc`, and atomically saves it. For managed FACTR processes, the
 DFC supervisor injects the leader object at launch; FACTR derives its private
-inverse-dynamics model calibration rather than storing a second copy.
+inverse-dynamics model calibration rather than storing a second copy. Only the
+DFC→FACTR axis signs are persisted; the affine zero offset is derived from
+`home_q_rad` and FACTR's authoritative `model_home_q_rad` at every launch.
 
 Each leader WebSocket carries two outbound frame types: `reading` (raw encoder
 packet) and `telemetry` (live FACTR model/control state). DFC publishes telemetry

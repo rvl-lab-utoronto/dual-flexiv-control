@@ -48,7 +48,7 @@ def _factr_cfg(left_addr, right_addr):
         raw_to_dfc=convention,
         home_q_rad=[0.0] * 6,
         dfc_to_factr=FactrTransformCfg(
-            signs=[1.0] * 6, offset_rad=[0.0] * 6
+            signs=[1.0] * 6
         ),
     )
     return SimpleNamespace(

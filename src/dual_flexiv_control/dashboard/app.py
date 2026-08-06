@@ -1585,7 +1585,8 @@ def _render_calibration_controls() -> None:
             "Physically place the leader at FACTR's model home (J4 ≈ +90°, every "
             "other joint at zero), then capture. The capture uses the current "
             "offsets/signs; if you solve later, the model-home result is recomputed. "
-            "This measures `home_q_rad` and computes `dfc_to_factr.offset_rad`."
+            "This measures `home_q_rad`; FACTR derives the zero offset from its "
+            "authoritative model-home target at launch."
         )
         st.caption(
             "model target: "
@@ -1616,10 +1617,10 @@ def _render_calibration_controls() -> None:
                 )
             )
             st.caption(
-                "model offsets: "
+                "derived model offsets (audit only; not saved): "
                 + " · ".join(
                     f"J{i}`{math.degrees(v):+.2f}°`"
-                    for i, v in enumerate(model_home_fit.offset_rad)
+                    for i, v in enumerate(model_home_fit.derived_offset_rad)
                 )
             )
         elif model_home_error:

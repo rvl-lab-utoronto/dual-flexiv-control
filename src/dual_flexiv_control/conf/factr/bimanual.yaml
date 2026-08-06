@@ -20,7 +20,7 @@ leaders:
       offsets_deg:
       - 0.56
       - -172.59
-      - 95.92
+      - 135
       - 173.49
       - -1.38
       - -0.79
@@ -48,14 +48,6 @@ leaders:
       - 1
       - -1
       - 1
-      offset_rad:
-      - 0
-      - 0
-      - 0
-      - 0
-      - 0
-      - 0
-      - 0
   right:
     raw_to_dfc:
       offsets_deg:
@@ -88,14 +80,6 @@ leaders:
       - 1
       - 1
       - 1
-      offset_rad:
-      - 0.0874150883
-      - -0.0474715921
-      - 0.0936000988
-      - -0.0068763449
-      - -0.0291333631
-      - -0.1166438991
-      - -0.0476202178
 launch:
   enabled: true
   workdir: ~/FACTR-Server/FACTR_Teleop

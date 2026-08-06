@@ -406,15 +406,14 @@ class JointConventionCfg:
 
 @dataclass
 class FactrTransformCfg:
-    """Canonical DFC/Rizon → FACTR dynamics-model affine transform.
+    """Canonical DFC/Rizon → FACTR dynamics-model axis directions.
 
-    ``q_factr = signs * q_dfc + offset_rad``. DFC combines this transform with
-    :class:`JointConventionCfg` when launching a managed FACTR teleop, deriving
-    the raw Dynamixel offsets/signs its inverse-dynamics model requires.
+    The zero offset is deliberately not persisted: FACTR derives it at launch from
+    the captured :attr:`FactrLeaderCfg.home_q_rad` and its authoritative model-home
+    target. This leaves no independently editable derived calibration value.
     """
 
     signs: List[float] = field(default_factory=list)
-    offset_rad: List[float] = field(default_factory=list)
 
 
 @dataclass
