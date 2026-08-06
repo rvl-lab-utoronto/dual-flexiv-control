@@ -406,7 +406,7 @@ class JointConventionCfg:
 
 @dataclass
 class FactrTransformCfg:
-    """Canonical DFC/Rizon → FACTR dynamics-model axis directions.
+    """Canonical DFC/Rizon → FACTR model and actuator axis directions.
 
     The zero offset is deliberately not persisted: FACTR derives it at launch from
     the captured :attr:`FactrLeaderCfg.home_q_rad` and its authoritative model-home
@@ -418,14 +418,14 @@ class FactrTransformCfg:
 
 @dataclass
 class FactrLeaderCfg:
-    """All calibration for one physical FACTR leader, expressed on the DFC side."""
+    """All arm calibration and direction ownership for one FACTR leader."""
 
     raw_to_dfc: JointConventionCfg = field(default_factory=JointConventionCfg)
     home_q_rad: List[float] = field(default_factory=list)
     """The leader's calibration/home pose in canonical DFC/Rizon coordinates."""
 
     dfc_to_factr: FactrTransformCfg = field(default_factory=FactrTransformCfg)
-    """Conversion used only to derive FACTR's runtime inverse-dynamics model."""
+    """Conversion used for FACTR's runtime model state and motor torque."""
 
 
 @dataclass

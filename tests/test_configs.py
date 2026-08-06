@@ -60,6 +60,22 @@ def test_left_only_rig_single_real_arm():
     assert cfg.recording.root == "datasets"                              # not quarantined
 
 
+def test_dfc_contract_owns_left_zero_indexed_j6_direction():
+    cfg = OmegaConf.to_object(_compose("rig=bimanual"))
+    leader = cfg.factr.leaders["left"]
+    raw_signs = [
+        -1.0 if joint in leader.raw_to_dfc.sign_flip_joints else 1.0
+        for joint in range(7)
+    ]
+    model_signs = [
+        raw * transform
+        for raw, transform in zip(raw_signs, leader.dfc_to_factr.signs)
+    ]
+
+    assert model_signs[5] == -1.0
+    assert model_signs[6] == 1.0
+
+
 def test_right_only_rig_single_real_arm():
     right = OmegaConf.to_container(_compose("rig=right_only"), resolve=True)
     bimanual = OmegaConf.to_container(_compose("rig=bimanual"), resolve=True)
