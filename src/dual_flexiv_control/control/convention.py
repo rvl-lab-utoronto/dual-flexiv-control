@@ -4,9 +4,10 @@ Captured verbatim from the hardware-validated teleop test (``rizon_tests``): the
 The FACTR WebSocket returns ``DoF+1`` joint values in radians (the arm joints
 plus a trailing gripper value). Mapping to Rizon joint targets is: drop the
 gripper, convert to degrees, add per-joint offsets, flip the sign of selected
-joints, and convert back to radians. Targets deliberately remain on their
-continuous branch; independently wrapping samples would create artificial
-``2π`` command jumps at the branch cut.
+joints, wrap each result to the canonical ``[-180, 180)`` range, and convert back
+to radians. Canonical wrapping is required because the leader encoder may report
+an arbitrary multi-turn branch; forwarding that branch literally makes MoveJ
+target extra full revolutions that are invisible in periodic FK visualization.
 
 This lives on the **brain** side — the brain reads FACTR and posts the converted
 radian setpoints onto the control channel; the arm process never talks to FACTR.
@@ -37,6 +38,7 @@ def convert_factr_to_rizon(q_leader_rad, conv: "JointConventionCfg") -> np.ndarr
     deg = np.degrees(q) + np.asarray(conv.offsets_deg[: len(q)], dtype=np.float64)
     for j in conv.sign_flip_joints:                   # flip after offsets
         deg[j] = -deg[j]
+    deg = (deg + 180.0) % 360.0 - 180.0              # never command encoder turns
     return np.radians(deg)
 
 

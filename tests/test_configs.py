@@ -60,6 +60,26 @@ def test_left_only_rig_single_real_arm():
     assert cfg.recording.root == "datasets"                              # not quarantined
 
 
+def test_right_only_rig_single_real_arm():
+    right = OmegaConf.to_container(_compose("rig=right_only"), resolve=True)
+    bimanual = OmegaConf.to_container(_compose("rig=bimanual"), resolve=True)
+
+    # right_only must remain exactly bimanual minus every left-side component.
+    bimanual["arms"] = {"right": bimanual["arms"]["right"]}
+    bimanual["cameras"] = {"static": bimanual["cameras"]["static"]}
+    bimanual["factr"]["servers"] = {
+        "right": bimanual["factr"]["servers"]["right"]
+    }
+    bimanual["factr"]["leaders"] = {
+        "right": bimanual["factr"]["leaders"]["right"]
+    }
+    bimanual["factr"]["launch"]["teleop_modules"] = {
+        "right": bimanual["factr"]["launch"]["teleop_modules"]["right"]
+    }
+
+    assert right == bimanual
+
+
 def test_rig_composes_with_task_and_field_overrides():
     cfg = _compose("rig=bench", "task=handover", "arms.left.serial=Rizon4-XYZ")
     assert cfg.task.collection.repo_id == "dfc/handover"  # task picks the dataset

@@ -1,0 +1,32 @@
+# @package _global_
+# Right-arm-only rig: the exact active right-side subset of the bimanual rig.
+# Keep every hardware value synchronized with bimanual.yaml; tests enforce this.
+defaults:
+  - /arm@arms.right: flexiv
+  - /camera@cameras.static: zed2_static
+  - /factr: right
+  - _self_
+
+arms:
+  right:
+    control: ${policy.control}
+    name: "Rogers"
+    serial: Rizon4s-062837
+    control_enabled: true
+    # Allow the deliberately slow MoveJ bootstrap to align the follower from an
+    # arbitrary starting pose. The target/measured delta is still logged.
+    control_safety_check: false
+    gripper:
+      enabled: true
+      name: "Flexiv-GN01"
+      velocity: 0.1          # Move velocity [m/s] (clamped to the gripper's params)
+      force: 40.0            # Move force [N]      (clamped to the gripper's params)
+      # open_width: 0.10     # override physical width [m] at 0.0 (default: params max_width)
+      # closed_width: 0.0    # override physical width [m] at 1.0 (default: params min_width)
+      # move_rate_hz: 15.0   # max Move rate; deadband: 0.02; init_on_start: true
+
+cameras:
+  static:
+    placement: static
+    serial: ""
+    auto_serial: true

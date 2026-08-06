@@ -18,6 +18,7 @@ def _reference(q_leader_rad, offsets, flips, drop=1):
     deg = np.degrees(q) + np.asarray(offsets[: len(q)], dtype=float)
     for j in flips:
         deg[j] = -deg[j]
+    deg = (deg + 180.0) % 360.0 - 180.0
     return np.radians(deg)
 
 
@@ -67,13 +68,40 @@ def test_configured_joints_1_2_mirrored_with_home_plus_90():
         assert moved[j] - home[j] == pytest.approx(-10.0)  # leader +10 -> follower -10
 
 
-def test_preserves_continuous_branch_past_180():
+def test_wraps_to_canonical_branch_past_180():
     conv = JointConventionCfg(offsets_deg=[179.0] * 7, sign_flip_joints=[], drop_trailing=0)
     before = np.degrees(convert_factr_to_rizon(np.deg2rad([0.5] * 7), conv))
     after = np.degrees(convert_factr_to_rizon(np.deg2rad([1.5] * 7), conv))
     np.testing.assert_allclose(before, [179.5] * 7, atol=1e-9)
-    np.testing.assert_allclose(after, [180.5] * 7, atol=1e-9)
-    np.testing.assert_allclose(after - before, [1.0] * 7, atol=1e-9)
+    np.testing.assert_allclose(after, [-179.5] * 7, atol=1e-9)
+
+
+def test_wraps_logged_right_leader_multiturn_targets():
+    """Regression: the 2026-08-05 incident sent 316°..440° literally to MoveJ."""
+    conv = JointConventionCfg(
+        offsets_deg=[-90, -40, 90, -160, 0, 180, 0],
+        sign_flip_joints=[],
+        drop_trailing=1,
+    )
+    raw = np.array([
+        1.2394565343856812,
+        6.214156150817871,
+        4.784486293792725,
+        3.3364081382751465,
+        0.0920388475060463,
+        3.8625636100769043,
+        7.685243606567383,
+        4.962427616119385,
+    ])
+    target_deg = np.degrees(convert_factr_to_rizon(raw, conv))
+    np.testing.assert_allclose(
+        target_deg,
+        [-18.984375, -43.955078125, 4.130859375, 31.162109375,
+         5.2734375, 41.30859375, 80.33203125],
+        atol=2e-5,  # incident sample was recovered from float32 dataset storage
+    )
+    assert np.all(target_deg >= -180.0)
+    assert np.all(target_deg < 180.0)
 
 
 # -- straight-pose offset calibration (inverse of convert_factr_to_rizon) --------

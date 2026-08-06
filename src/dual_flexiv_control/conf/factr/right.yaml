@@ -1,0 +1,32 @@
+defaults:
+  - base_factr
+  - _self_
+
+# Right leader only — the FACTR relay's WebSocket on :5001. Use when only the
+# right leader is plugged in, so no client is created for the absent left stream.
+servers:
+  right:
+    host: localhost
+    port: 5001
+    endpoint: ws/right
+    request_timeout_s: 0.5
+    dof: 8
+
+leaders:
+  right:
+    raw_to_dfc:
+      offsets_deg: [-90, -40, 90, -160, 0, 180, 0]
+      sign_flip_joints: []
+      drop_trailing: 1
+      gripper_open: 2.4
+      gripper_closed: 3.0
+    home_q_rad: [0, 0, 0, 1.57079632679, 0, 0, 0]
+    dfc_to_factr:
+      signs: [1, 1, 1, 1, 1, 1, 1]
+
+# Daemon-managed FACTR-Server launch: only the right dual-board leader process.
+launch:
+  enabled: true
+  workdir: ~/FACTR-Server/FACTR_Teleop
+  teleop_modules:
+    right: src.factr_teleop.factr_teleop.factr_rizon_dual_board

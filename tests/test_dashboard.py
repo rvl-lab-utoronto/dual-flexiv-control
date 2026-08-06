@@ -207,7 +207,7 @@ def test_discover_policies_finds_shipped_types():
 
 def test_discover_rigs_finds_shipped_rigs_with_descriptions():
     rigs = {r.name: r for r in discover_rigs()}
-    assert {"bimanual", "bench", "left_only"} <= set(rigs)
+    assert {"bimanual", "bench", "left_only", "right_only"} <= set(rigs)
     # Each rig file leads with a one-line hardware summary (after @package).
     assert all(r.description for r in rigs.values())
     assert "@package" not in rigs["bench"].description
@@ -626,8 +626,8 @@ def test_calibration_solve_recovers_full_convention():
     for leader, ref in pairs:
         q = np.radians(np.asarray(leader + [0.0]))  # + trailing gripper value
         converted = np.degrees(convert_factr_to_rizon(q, conv))
-        # Calibration identifies angles modulo 360; live conversion deliberately
-        # preserves the selected continuous representative instead of wrapping it.
+        # Calibration identifies angles modulo 360 and live conversion selects the
+        # canonical representative before it reaches the follower.
         assert [_wrap180(v - r) for v, r in zip(converted, ref)] == pytest.approx(
             [0.0] * len(ref), abs=1e-9
         )
@@ -748,6 +748,7 @@ def test_factr_path_follows_active_rig_group():
     from dual_flexiv_control.dashboard import calibration
 
     assert calibration.factr_path("left_only").name == "left.yaml"
+    assert calibration.factr_path("right_only").name == "right.yaml"
     assert calibration.factr_path("bimanual").name == "bimanual.yaml"
 
 
@@ -1457,7 +1458,7 @@ def test_grav_follower_gripper_mesh_and_flange_transform():
     visual = robot_view._GRAV_GRIPPER_VISUAL
     assert visual.mesh.is_file()
     assert visual.scale == (0.001, 0.001, 0.001)
-    assert visual.rpy == pytest.approx((np.pi / 2, 0.0, 0.0))
+    assert visual.rpy == pytest.approx((np.pi / 2, 0.0, np.pi / 2))
 
     positions = robot_view._load_stl(visual.mesh)[0].positions
     rotation = robot_view._rot_from_rpy(*visual.rpy)

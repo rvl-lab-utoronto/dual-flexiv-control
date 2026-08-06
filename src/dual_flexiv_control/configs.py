@@ -387,10 +387,10 @@ class JointConventionCfg:
     This belongs to a DFC ``FactrLeaderCfg``, never an ``ArmCfg``/follower
     setting. ``offsets_deg`` is added
     per-joint after converting the leader's radians to degrees; ``sign_flip_joints``
-    negates those joint indices and the result is converted back to radians without
-    wrapping. Preserving the continuous branch prevents artificial ``2π`` follower
-    commands. ``drop_trailing`` discards FACTR's trailing gripper value(s) (its
-    payload is ``DoF+1``).
+    negates those joint indices, wraps the result to ``[-180, 180)``, and converts
+    it back to radians. The canonical branch prevents raw encoder turns from becoming
+    literal multi-revolution follower commands. ``drop_trailing`` discards FACTR's
+    trailing gripper value(s) (its payload is ``DoF+1``).
 
     ``gripper_open``/``gripper_closed`` calibrate that trailing gripper value. FACTR
     serves it as an un-normalized servo angle in radians. Both endpoints are required

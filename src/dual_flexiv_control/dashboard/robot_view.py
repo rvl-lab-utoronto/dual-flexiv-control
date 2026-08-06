@@ -257,14 +257,15 @@ class _Visual:
 
 
 # The GRAV CAD is in millimetres with its mounting face at Y=-75.038 mm and
-# fingers extending along +Y. Rotate +Y onto the follower flange's +Z and move
-# that mounting face to Z=0. This is a live-viewer overlay, not part of the
+# fingers extending along +Y. Rotate +Y onto the follower flange's +Z, yaw the
+# STL +90 degrees around that flange axis to match the physical mounting, and
+# move the mounting face to Z=0. This is a live-viewer overlay, not part of the
 # vendor URDF or the kinematic/control model.
 _GRAV_GRIPPER_VISUAL = _Visual(
     name="grav_gripper",
     mesh=GRAV_GRIPPER_STL,
     xyz=(0.0, 0.0, 0.075038),
-    rpy=(math.pi / 2, 0.0, 0.0),
+    rpy=(math.pi / 2, 0.0, math.pi / 2),
     scale=(0.001, 0.001, 0.001),
 )
 

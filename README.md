@@ -108,17 +108,18 @@ and **phase** (`runtime.phase=collection|eval`):
 
 ```
 conf/
-  config.yaml              # tiny: composes the groups below (rig=bimanual, task=default, …)
+  config.yaml              # tiny: composes the groups below (rig=left_only, task=default, …)
   rig/                     # WHAT HARDWARE EXISTS (select with `rig=<name>`):
-    bimanual.yaml          #   both arms + 3 ZEDs + both FACTR leaders (default)
-    left_only.yaml         #   left arm + static ZED + left leader
+    bimanual.yaml          #   both arms + 3 cameras + both FACTR leaders
+    left_only.yaml         #   left arm + static ZED + left leader (default)
+    right_only.yaml        #   right arm + static camera + right leader
     bench.yaml             #   dummy left arm + the one real ZED (bring-up/testing)
   task/                    # WHAT IS DEMONSTRATED (select with `task=<name>`):
     default.yaml  handover.yaml    # instruction + dataset (repo_id) + phase counts
   recording/default.yaml   # dataset-export machinery (root, encoders, writer threads)
   runtime/default.yaml     # sim, runtime_dir, duration_s, phase, save_grace_s
   brain/default.yaml       # rate, attach timeout, subscriptions
-  factr/                   # FACTR server sets (selected by the rig): bimanual / left
+  factr/                   # FACTR server sets selected by the rig: bimanual / left / right
   arm/                     # arm templates: flexiv (real), flexiv_dummy (fabricated)
   camera/                  # camera templates: zedx_wrist, zed2_static
   control/                 # control-type library (command schemas, SDK-aligned):
@@ -134,6 +135,7 @@ with no robots is one override away:
 ```bash
 dual-flexiv-control rig=bench runtime.phase=collection   # dummy arm + real ZED,
                                                          # records to datasets/bench/
+dual-flexiv-control rig=right_only runtime.phase=collection  # right follower + right leader only
 ```
 
 Cameras compose just like arms: `camera@cameras.<name>: <template>` places a
