@@ -8,9 +8,10 @@ own process at its own rate:
    streams, observes them, and pulls the last `k` elements of any signal.
 2. **The Flexiv interface** (`interfaces/flexiv/`) — wraps **real `flexivrdk`**
    (RDK 1.8), one process per arm. Read-only by default (proprio streams only);
-   with `arm.control_enabled=true` the same process also **consumes the brain's
-   control channel and actuates** (the single robot connection per arm forces the
-   control loop to live here).
+   with `arm.control_enabled=true` it consumes the brain's control channel. Real
+   `qpos` sessions hand robot ownership to a small C++ sidecar which calls RDK
+   1.8's native `StreamJointPosition` every 1 ms; the Python process retains
+   ownership of the telemetry shared-memory segments across that handoff.
 4. **The control channel** (`control/`) — a **second IPC category**, brain→arm
    (the inverse of the telemetry streams). The brain posts targets to a latest-wins
    **setpoint** mailbox and discrete events to a reliable **command** queue; the arm
@@ -96,7 +97,15 @@ manylinux x86_64 wheel and the most mature ecosystem). A dedicated conda env:
 conda env create -f environment.yml          # creates env "dual-flexiv-control"
 conda activate dual-flexiv-control
 pip install -e ".[dev]"                       # editable install + pytest
+native/flexiv_rt_controller/build.sh          # build the RDK 1.8 qpos sidecar
 ```
+
+The native build links against the installed `flexivrdk==1.8.0` extension, whose
+C++ image exports the RT methods omitted by its Python bindings. It needs the
+matching public headers; the build fetches the exact v1.8 commit, or uses an
+existing checkout supplied through `FLEXIV_RDK_SOURCE_DIR=/path/to/flexiv_rdk`.
+Set `DFC_FLEXIV_RT_CONTROLLER=/path/to/dfc-flexiv-rt-controller` only when the
+binary is installed somewhere other than `PATH` or the default `build/` tree.
 
 ## Configuration (Hydra)
 
@@ -108,10 +117,10 @@ and **phase** (`runtime.phase=collection|eval`):
 
 ```
 conf/
-  config.yaml              # tiny: composes the groups below (rig=left_only, task=default, …)
+  config.yaml              # tiny: composes the groups below (rig=bimanual, task=default, …)
   rig/                     # WHAT HARDWARE EXISTS (select with `rig=<name>`):
-    bimanual.yaml          #   both arms + 3 cameras + both FACTR leaders
-    left_only.yaml         #   left arm + static ZED + left leader (default)
+    bimanual.yaml          #   both arms + 3 cameras + both FACTR leaders (default)
+    left_only.yaml         #   left arm + static ZED + left leader
     right_only.yaml        #   right arm + static camera + right leader
     bench.yaml             #   dummy left arm + the one real ZED (bring-up/testing)
   task/                    # WHAT IS DEMONSTRATED (select with `task=<name>`):
@@ -157,13 +166,14 @@ and tune fields inline, e.g. `task=handover task.eval.num_timesteps=800`.
 Each stream's schema (`dim`, `dtype`, `capacity`, `rate_hz`) lives under its path,
 e.g. `arms.left.streams.tau` → stream `left/tau`. The **control configs** lay out
 each control kind's command schema; `streamed` lists which fields the brain posts
-per tick (the rest are static limits from the coeffs). All paths are **NRT**
-(verified against flexivrdk 1.8) — the brain posts setpoints over IPC at
-~50-200 Hz (RDK 1.8 is NRT-only — no hard-1 kHz RT modes, no `Stream*` methods):
+per tick (the rest are static limits from the coeffs). The brain posts latest-wins
+setpoints over IPC at its own rate. Real plain `qpos` uses the native 1 kHz path;
+simulation, `arm.rt_streaming=false`, impedance variants, and the other control
+kinds use the Python NRT path:
 
 | Controller | RDK mode | send fn | streamed (per-tick) |
 |---|---|---|---|
-| `qpos` | `NRT_JOINT_POSITION` | `SendJointPosition` | `q_d`, `dq_d` |
+| `qpos` | `RT_JOINT_POSITION` | `StreamJointPosition` at 1 kHz | `q_d`, `dq_d` |
 | `qpos_impedance` | `NRT_JOINT_IMPEDANCE` | `SendJointPosition` | `q_d`, `dq_d` |
 | `qpos_overdamped` | `NRT_JOINT_IMPEDANCE` | `SendJointPosition` | `q_d`, `dq_d` (overdamped) |
 | `qvel` | `NRT_JOINT_POSITION` | `SendJointPosition` | `dq_d` (arm integrates `q_d`) |
@@ -259,8 +269,9 @@ dual-flexiv-control --cfg job        # print the fully composed config and exit
 
 ## Dashboard
 
-A dark-mode [Viser](https://viser.studio)-backed experiment dashboard, coupled to a
-long-lived **session daemon** (`dfc-session`, `session.py`) that holds the rig
+A dark-mode experiment dashboard using [Viser](https://viser.studio) for 3D and
+[Plotly Dash](https://dash.plotly.com/) for live plots, coupled to a long-lived
+**session daemon** (`dfc-session`, `session.py`) that holds the rig
 for the dashboard's whole lifespan and runs a three-mode state machine:
 
 * **VIEWING** (default while stopped) — arms connected **read-only**, cameras
@@ -293,18 +304,21 @@ replay, teach, and (bulk) delete. Downloads stream the finalized files from disk
 instead of buffering copies in the dashboard process.
 
 ```bash
-pip install -e ".[dashboard]"     # adds Viser + Streamlit
+pip install -e ".[dashboard]"     # adds Viser + Plotly Dash + Streamlit
 dfc-dashboard                      # streamlit run; open the URL it prints
-# live viewer: DFC_VISER_PORT (default 9090); replay: DFC_VISER_REPLAY_PORT (9093)
+# 3D: DFC_VISER_PORT (9090); plots: DFC_PLOTLY_PORT (9094); replay: 9093
 # MP4 downloads: DFC_DOWNLOAD_PORT (default 9092)
 ```
 
-The live viewer is an isolated, read-only stream consumer. It polls newest
-shared-memory samples at **3 Hz**, owns the robot scene and plots, and reads
-`session.json` only for display state. It is deliberately lossy and
-non-authoritative: control and recording remain at their producer/native rates.
-Streamlit only embeds its URL and sends low-rate display commands such as a
-calibration target. Episode replay uses a separate Viser server on port 9093.
+The live view uses two isolated, read-only stream consumers. Viser polls only
+scene inputs and owns the robot scene; Plotly Dash polls plot inputs and owns the
+Leader/Follower/Policy tabs. Both poll newest shared-memory values at **3 Hz**.
+Dash sends incremental trace extensions to the browser instead of retransmitting
+full histories. Both viewers are deliberately lossy and non-authoritative:
+control and recording remain at their producer/native rates. Multiple readers
+attach independently to producer-owned rings, so the plotting consumer adds no
+producer backpressure. Streamlit embeds both URLs and sends only low-rate scene
+commands such as calibration targets. Episode replay uses Viser on port 9093.
 
 The former Rerun implementation is retained but detached and deprecated. Install
 `.[rerun]` and launch `dfc-rerun` explicitly if it is needed during migration;
@@ -314,9 +328,9 @@ the normal dashboard neither imports nor starts it.
  ┌──────────────┬─[ 📊 Viewer ]──[ 📷 Camera ]─[ 💾 Storage ]─┐
  │  Rig:  [▼]   │  Skill: [▼]  ▶ Repeat  🗑                   │
  │  Task: [▼]   │   ┌────────────┬───────────────┐            │
- │  ✏️ YAML  ✏️  │   │  3D robot  │ proprio series│            │  Viewer  → skills bar + live 3D scene/plots
- │  ▶ Collection│   │  scene     │ FACTR leaders │            │  Camera  → live cam/<cam>/<view>
- │  ▶ Eval      │   └────────────┴───────────────┘            │  Storage → MP4 ⬇, ▶ replay, 🎓 teach, 🗑 delete
+ │  ✏️ YAML  ✏️  │   │        Viser 3D robot scene             │  Viewer  → skills bar + live 3D scene/plots
+ │  ▶ Collection│   ├─────────────────────────────────────────┤  Camera  → live cam/<cam>/<view>
+ │  ▶ Eval      │   │ Plotly Dash: Leader | Follower | Policy│  Storage → MP4 ⬇, ▶ replay, 🎓 teach, 🗑 delete
  │  Running ▣   │                                             │
  └──────────────┴─────────────────────────────────────────────┘
 ```
@@ -377,9 +391,10 @@ src/dual_flexiv_control/
     factr/      backend.py (black-box skeleton) · interface.py
   brain/        brain.py (Brain + BrainNode)
   visualization/ backend-neutral typed viewer schema + robot geometry/FK
-  viser/        primary 3 Hz stream consumer + live scene + episode replay
+  viser/        3 Hz scene consumer + live 3D scene + episode replay
+  plotly_dash/  3 Hz plot consumer + incremental Plotly Dash application
   rerun/        deprecated detached stream-viewer compatibility service
-  dashboard/    Streamlit controls + session facade + Viser embedding:
+  dashboard/    Streamlit controls + session facade + viewer embedding:
                 app.py · tasks.py · runner.py · session.py · launch.py
   process.py    RateLimiter · ProcessNode · StreamProducerNode · run_node
   configs.py    structured config schema (StreamCfg, ArmCfg, CameraCfg, ControlCfg, …)

@@ -168,6 +168,7 @@ def test_spawn_commands_and_logs(tmp_path, spawned):
 
 def test_managed_teleop_receives_dfc_leader_contract(tmp_path, spawned):
     leader = FactrLeaderCfg(
+        dynamixel_id_start=9,
         raw_to_dfc=JointConventionCfg(
             offsets_deg=[1.0] * 7,
             sign_flip_joints=[2],
@@ -186,6 +187,7 @@ def test_managed_teleop_receives_dfc_leader_contract(tmp_path, spawned):
     teleop = next(u for u in sup.units if u.name == "teleop:left").proc
     payload = json.loads(teleop.kwargs["env"]["DFC_LEADER_CONFIG"])
     assert payload["side"] == "left"
+    assert payload["dynamixel_id_start"] == 9
     assert payload["raw_to_dfc"]["offsets_deg"] == [1.0] * 7
     assert payload["dfc_to_factr"]["signs"][2] == -1.0
     assert "offset_rad" not in payload["dfc_to_factr"]

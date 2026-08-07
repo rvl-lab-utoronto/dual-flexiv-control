@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 
@@ -19,14 +22,139 @@ FACTR_COLOR = (70, 235, 155)
 TARGET_COLOR = (168, 110, 255)
 TRACE_COLOR = (190, 130, 255)
 
+# The external FACTR CAD is roughly 1.18 million triangles per arm. Most of
+# those triangles are threaded hardware and internal CAD shells. A raw edge
+# collapse destroys these STL triangle soups, so we first weld/split them,
+# replace each meaningful shell with its outer hull. This preserves the CAD
+# silhouette and leaves about 20k faces per arm (roughly 50x smaller).
+FACTR_MESH_DECIMATION_FACTOR = 50
+_MESH_CACHE_VERSION = 3
+_MIN_COMPONENT_VOLUME_FRACTION = 0.001
 
-@lru_cache(maxsize=64)
-def _load_mesh(path: Path):
+
+def _mesh_cache_path(path: Path, decimation_factor: int) -> Path:
+    """Content-versioned cache path for one display-only simplified mesh."""
+    override = os.environ.get("DFC_VISER_MESH_CACHE", "").strip()
+    if override:
+        root = Path(override).expanduser()
+    else:
+        xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+        root = (
+            Path(xdg).expanduser()
+            if xdg else Path.home() / ".cache"
+        ) / "dual-flexiv-control" / "viser-meshes"
+    stat = path.stat()
+    identity = "\0".join((
+        str(path.resolve()), str(stat.st_size), str(stat.st_mtime_ns),
+        str(decimation_factor), str(_MESH_CACHE_VERSION),
+    ))
+    digest = hashlib.sha256(identity.encode()).hexdigest()[:20]
+    return root / f"{path.stem}-{digest}.npz"
+
+
+def _read_simplified_cache(path: Path, decimation_factor: int):
     import trimesh
 
-    loaded = trimesh.load(path, force="mesh", process=False)
+    cache_path = _mesh_cache_path(path, decimation_factor)
+    if not cache_path.is_file():
+        return None
+    try:
+        with np.load(cache_path, allow_pickle=False) as payload:
+            vertices = np.asarray(payload["vertices"], dtype=np.float32)
+            faces = np.asarray(payload["faces"], dtype=np.uint32)
+        if vertices.ndim != 2 or vertices.shape[1] != 3:
+            raise ValueError(f"invalid cached vertex shape {vertices.shape}")
+        if faces.ndim != 2 or faces.shape[1] != 3:
+            raise ValueError(f"invalid cached face shape {faces.shape}")
+        return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    except Exception as exc:  # noqa: BLE001 - regenerate a damaged local cache
+        log.warning("ignoring invalid simplified mesh cache %s: %s", cache_path, exc)
+        return None
+
+
+def _write_simplified_cache(path: Path, decimation_factor: int, mesh) -> None:
+    cache_path = _mesh_cache_path(path, decimation_factor)
+    temporary: Path | None = None
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            dir=cache_path.parent, prefix=".mesh-", suffix=".npz", delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+        np.savez_compressed(
+            temporary,
+            vertices=np.asarray(mesh.vertices, dtype=np.float32),
+            faces=np.asarray(mesh.faces, dtype=np.uint32),
+        )
+        os.replace(temporary, cache_path)
+        temporary = None
+    except Exception as exc:  # noqa: BLE001 - cache failure must not kill viewer
+        log.warning("could not cache simplified viewer mesh %s: %s", path, exc)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _repair_for_viewer(mesh):
+    """Turn multi-shell CAD tessellation into a bounded low-poly display mesh."""
+    import trimesh
+
+    parts = list(mesh.split(only_watertight=False))
+    total_volume = sum(abs(float(part.volume)) for part in parts)
+    volume_floor = max(total_volume * _MIN_COMPONENT_VOLUME_FRACTION, 1e-15)
+    meaningful = [part for part in parts if abs(float(part.volume)) >= volume_floor]
+    if not meaningful:
+        meaningful = [max(parts, key=lambda part: len(part.faces))]
+    hulls = [part.convex_hull for part in meaningful]
+
+    # Hull construction is the topology-safe reduction step. Further support-
+    # point resampling was visually too aggressive and could erase recognizable
+    # leader-arm detail even though its bounds remained valid.
+    simplified = trimesh.util.concatenate(hulls)
+
+    if not len(simplified.faces) or not np.isfinite(simplified.vertices).all():
+        raise ValueError("topology repair produced empty or non-finite geometry")
+    if not np.allclose(simplified.extents, mesh.extents, rtol=0.03, atol=1e-6):
+        raise ValueError(
+            f"topology repair changed bounds {mesh.extents} -> {simplified.extents}"
+        )
+    return simplified
+
+
+@lru_cache(maxsize=64)
+def _load_mesh(path: Path, decimation_factor: int = 1):
+    import trimesh
+
+    path = Path(path)
+    decimation_factor = max(1, int(decimation_factor))
+    if decimation_factor > 1:
+        cached = _read_simplified_cache(path, decimation_factor)
+        if cached is not None:
+            return cached
+    # Processing welds each STL's three-vertices-per-triangle export into the
+    # closed shells needed by the topology repair. Normal follower meshes keep
+    # their original material-friendly, unprocessed representation.
+    loaded = trimesh.load(
+        path, force="mesh", process=decimation_factor > 1
+    )
     if not isinstance(loaded, trimesh.Trimesh):
         raise ValueError(f"{path} did not load as a triangle mesh")
+    if decimation_factor > 1 and len(loaded.faces) > 4:
+        original_faces = len(loaded.faces)
+        try:
+            loaded = _repair_for_viewer(loaded)
+        except Exception as exc:  # noqa: BLE001 - never make the arm disappear
+            log.warning(
+                "could not repair/simplify viewer mesh %s; using full CAD: %s",
+                path, exc,
+            )
+            return loaded
+        log.info(
+            "repaired viewer mesh %s: %d -> %d triangles (%.1fx)",
+            path.name, original_faces, len(loaded.faces),
+            original_faces / max(1, len(loaded.faces)),
+        )
+        _write_simplified_cache(path, decimation_factor, loaded)
     return loaded
 
 
@@ -43,6 +171,7 @@ class RobotModel:
         color: tuple[int, int, int] | None = None,
         opacity: float | None = None,
         scale: float = 1.0,
+        mesh_decimation: int = 1,
         follower_gripper: bool = False,
         visible: bool = True,
     ) -> None:
@@ -54,6 +183,7 @@ class RobotModel:
         # by children.  Keep the model scale here and apply it explicitly to link
         # offsets, visual origins, and mesh nodes.
         self.model_scale = float(scale)
+        self.mesh_decimation = max(1, int(mesh_decimation))
         self.root_handle = server.scene.add_frame(
             root,
             show_axes=False,
@@ -95,7 +225,7 @@ class RobotModel:
             wxyz=geometry.xyzw_to_wxyz(geometry.quat_from_rpy(*visual.rpy)),
         )
         try:
-            mesh = _load_mesh(visual.mesh).copy()
+            mesh = _load_mesh(visual.mesh, self.mesh_decimation).copy()
             if color is None:
                 self.server.scene.add_mesh_trimesh(
                     f"{visual_path}/mesh", mesh, scale=mesh_scale
@@ -130,7 +260,9 @@ class RobotModel:
                 geometry.quat_from_rpy(np.pi / 2, 0.0, np.pi / 2)
             ),
         )
-        mesh = _load_mesh(geometry.GRAV_GRIPPER_STL).copy()
+        mesh = _load_mesh(
+            geometry.GRAV_GRIPPER_STL, self.mesh_decimation
+        ).copy()
         mesh_scale = (0.001 * self.model_scale,) * 3
         if color is None:
             self.server.scene.add_mesh_trimesh(
@@ -213,18 +345,21 @@ class RobotScene:
                 color=TARGET_COLOR, opacity=0.34, visible=False,
             )
             factr_chain = self.chain
+            factr_mesh_decimation = 1
             factr_path = (factr_urdfs or {}).get(side)
             if factr_path is not None:
                 try:
                     factr_chain = geometry.localize_factr_base_meshes(
                         geometry.parse_chain(factr_path, "base_link")
                     )
+                    factr_mesh_decimation = FACTR_MESH_DECIMATION_FACTOR
                 except Exception as exc:  # noqa: BLE001
                     log.warning("could not load FACTR %s URDF: %s", side, exc)
             self.factr[side] = RobotModel(
                 server, f"/robot/{side}/factr", factr_chain,
                 geometry.factr_mount(side), color=FACTR_COLOR, opacity=0.45,
                 scale=geometry.FACTR_LIVE_DISPLAY_SCALE, visible=False,
+                mesh_decimation=factr_mesh_decimation,
             )
 
     def update_followers(self, configs: dict[str, np.ndarray]) -> None:

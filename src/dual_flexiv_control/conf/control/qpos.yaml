@@ -2,10 +2,10 @@ defaults:
   - base_control
   - _self_
 
-# Joint position control (async setpoints posted by the brain). flexivrdk 1.8:
-# SwitchMode(NRT_JOINT_POSITION) then SendJointPosition(q_d, dq_d, dq_max, ddq_max).
-# The brain posts q_d (+ dq_d feedforward); dq_max/ddq_max are static, taken from
-# the active phase's control_coeffs (max_joint_vel/acc).
+# Joint position control (latest-wins setpoints posted by the brain). On hardware,
+# arm.rt_streaming hands qpos to the native RDK 1.8 controller, which switches to
+# RT_JOINT_POSITION and calls StreamJointPosition(q_d, dq_d, ddq_d) every 1 ms.
+# Simulation and an explicitly disabled rt_streaming retain the Python NRT path.
 kind: qpos
 mode: NRT_JOINT_POSITION
 send_fn: SendJointPosition

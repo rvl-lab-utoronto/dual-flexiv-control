@@ -442,7 +442,7 @@ class FactrClient:
         silently holding stale/zero actions for the whole recording. In ``sim`` mode
         every server fabricates positions, so this always passes (no hardware
         expected). Requires **all** configured servers to respond — a bimanual rig
-        needs both leaders up; the shipped ``left_only`` default needs just the one.
+        needs both leaders up; a ``left_only`` rig needs just the one.
         """
         failures: list[str] = []
         for side, client in self._servers.items():

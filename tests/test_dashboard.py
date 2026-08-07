@@ -114,22 +114,51 @@ def test_calibration_has_no_viewer_or_rerun_feed():
     assert not hasattr(calibration, "render")
 
 
-def test_viewer_workspace_always_uses_existing_experiment_viewer(monkeypatch):
+def test_viewer_workspace_embeds_viser_scene_and_plotly_dash(monkeypatch):
     from types import SimpleNamespace
 
     from dual_flexiv_control.dashboard import app
 
+    class Column:
+        def __init__(self, name):
+            self.name = name
+
+        def __enter__(self):
+            active_column.append(self.name)
+
+        def __exit__(self, *_args):
+            active_column.pop()
+
+    active_column = []
+    column_calls = []
     iframes = []
-    monkeypatch.setattr(app.st, "iframe", lambda url, **kwargs: iframes.append(url))
+
+    def columns(spec, **kwargs):
+        column_calls.append((spec, kwargs))
+        return Column("scene"), Column("telemetry")
+
+    monkeypatch.setattr(app.st, "columns", columns)
+    monkeypatch.setattr(
+        app.st,
+        "iframe",
+        lambda url, **kwargs: iframes.append((active_column[-1], url, kwargs)),
+    )
     monkeypatch.setattr(app.st, "caption", lambda *args, **kwargs: None)
     monkeypatch.setattr(app, "_render_skill_bar", lambda registry: None)
     monkeypatch.setattr(app._cameras, "depth_cameras", lambda: [])
     monkeypatch.setattr(app, "_robot_data_status", lambda: None)
 
     servers = SimpleNamespace(web_url="http://127.0.0.1:9090/?url=metrics")
-    app._render_viewer_workspace(servers, object())
+    plots = SimpleNamespace(web_url="http://127.0.0.1:9094")
+    app._render_viewer_workspace(servers, plots, object())
 
-    assert iframes == [servers.web_url]
+    assert column_calls == [
+        ([2, 3], {"gap": "small", "vertical_alignment": "top"})
+    ]
+    assert iframes == [
+        ("scene", servers.web_url, {"height": app.LIVE_VIEWER_HEIGHT_PX}),
+        ("telemetry", plots.web_url, {"height": app.LIVE_VIEWER_HEIGHT_PX}),
+    ]
 
 
 def test_control_workspace_renders_only_selected_mode(monkeypatch):
@@ -472,7 +501,7 @@ def test_discover_camera_views_from_config():
     from dual_flexiv_control.dashboard.cameras import CameraView
     from dual_flexiv_control.dashboard.cameras import discover_camera_views
 
-    set_active_rig("bimanual")  # full camera set (default rig is now left_only)
+    set_active_rig("bimanual")  # full camera set
     cam_mod.reset()
     try:
         views = discover_camera_views()
@@ -489,7 +518,7 @@ def test_discover_arms_uses_config_names():
     from dual_flexiv_control.dashboard.arms import discover_arms
     from dual_flexiv_control.dashboard.arms import set_active_rig
 
-    set_active_rig("bimanual")  # two-arm rig (shipped default is now left_only)
+    set_active_rig("bimanual")  # two-arm rig
     try:
         by_side = {a.side: a for a in discover_arms()}
         assert {"left", "right"} <= set(by_side)
@@ -505,7 +534,7 @@ def test_discover_arms_carries_serials_for_the_probe():
     from dual_flexiv_control.dashboard.arms import discover_arms
     from dual_flexiv_control.dashboard.arms import set_active_rig
 
-    set_active_rig("bimanual")  # two-arm rig (shipped default is now left_only)
+    set_active_rig("bimanual")  # two-arm rig
     try:
         by_side = {a.side: a for a in discover_arms()}
         assert by_side["left"].serial == "Rizon4s-062841"

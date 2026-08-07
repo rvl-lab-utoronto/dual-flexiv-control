@@ -119,12 +119,9 @@ def test_flexiv_interface_uses_fake_source_when_streams_dummy(tmp_path):
         node.close_source()
 
 
-def test_default_rig_is_left_only():
-    # The shipped default matches the plugged-in hardware (left arm + left FACTR
-    # leader), so a collection run's launch-time teleop preflight is satisfiable.
+def test_default_rig_is_bimanual():
     obj = OmegaConf.to_object(_compose())
-    assert set(obj.arms) == {"left"}
-    assert set(obj.factr.servers) == {"left"}
+    assert set(obj.arms) == {"left", "right"}
 
 
 def test_composes_to_typed_objects_and_pickles():

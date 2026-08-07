@@ -37,7 +37,7 @@ from dual_flexiv_control.system import run_system
 def _make_config(tmp_path, *overrides: str) -> Config:
     register_configs()
     base = [
-        "rig=bimanual",  # exercise the full two-arm system (shipped default is now left_only)
+        "rig=bimanual",  # keep the two-arm fixture independent of the default
         "runtime.sim=true",
         f"runtime.runtime_dir={tmp_path}",
     ]

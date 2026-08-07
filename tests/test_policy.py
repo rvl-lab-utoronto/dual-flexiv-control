@@ -26,8 +26,8 @@ from dual_flexiv_control.streams.ring import Samples
 
 
 def _config(*overrides: str):
-    # These fixtures exercise the full two-arm setup, so pin the bimanual rig (the
-    # shipped default is now the single-arm left_only — see conf/config.yaml).
+    # Pin the full two-arm setup explicitly so this fixture is independent of the
+    # shipped default.
     register_configs()
     with initialize_config_module(config_module="dual_flexiv_control.conf", version_base=None):
         cfg = compose(config_name="config", overrides=["rig=bimanual", *overrides])

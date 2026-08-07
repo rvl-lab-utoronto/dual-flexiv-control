@@ -2,25 +2,23 @@
 
 Read-only by default (``control_enabled=false``): it declares its proprio streams
 and runs the base producer loop, publishing states and never touching the robot's
-control. With ``control_enabled=true`` it becomes **producer + consumer** in the
-same process — the single ``flexivrdk.Robot`` connection per arm forces the control
-loop to live here, sharing that one handle. It then also attaches the brain's
-control channels, drives the robot to the first commanded target, and tracks the
-latest-wins setpoint mailbox (with a deadman) until asked to stop.
+control. With ``control_enabled=true`` it also consumes the brain's control
+channels. Simulation and non-RT control run in this process. Hardware qpos hands
+the robot connection and the already-published stream segments to the native RDK
+1.8 controller for the duration of the session; that process calls the otherwise
+unbound ``StreamJointPosition`` API at 1 kHz.
 
 A control-enabled arm is an **idle ↔ control state machine**:
 
 * **IDLE** — connected read-only, publishing telemetry + status at ``arm.rate_hz``;
   no control action of any kind (the session's VIEWING mode).
 * **CONTROL** — entered on an :class:`EnterControl` message (which carries the
-  selected policy's controller plus the active phase's coefficients): enable
-  servos (eagerly, overlapping the
-  consumer's own startup — ``arm.control_eager_enable`` reverts to enabling
-  after the channels attach), attach the brain's channels, bootstrap to the
-  first setpoint, then run the merged telemetry+control loop at
-  ``arm.control_rate_hz``. *Every* exit (STOP command, deadman, fault, safety
-  halt, aborted bootstrap) routes through ``robot.Stop()`` back to IDLE — the
-  connection and the published streams survive across control sessions.
+  selected policy's controller plus the active phase's coefficients): attach the
+  brain's channels, bootstrap to the first setpoint, then run either the Python
+  NRT loop or the native 1 kHz RT loop. *Every* exit (STOP command, deadman,
+  fault, safety halt, aborted bootstrap) routes through ``robot.Stop()`` back to
+  IDLE. The published streams survive across control sessions; native sessions
+  reconnect the Python read-only client after handing the robot back.
 
 Two hosting modes select how sessions arrive: a **session queue** (``session_q``,
 from the long-lived session daemon) delivers any number of :class:`EnterControl`
@@ -62,6 +60,9 @@ from .source import FakeFlexivSource
 from .source import FlexivSource
 from .source import SafetyHalt
 from .states import map_states
+from .native_rt import controller_args
+from .native_rt import find_controller
+from .native_rt import run_controller
 
 log = logging.getLogger(__name__)
 
@@ -320,6 +321,7 @@ class FlexivInterface(StreamProducerNode):
         sp_reader: StreamReader | None = None
         cmd_cursor: CommandCursor | None = None
         grip_reader: StreamReader | None = None
+        grip_entry = None
         self._control_active = True
         try:
             # 0. Eager servo-on (config-gated): Enable/brake release takes seconds
@@ -329,7 +331,8 @@ class FlexivInterface(StreamProducerNode):
             #    still routes through the finally's robot.Stop() → IDLE. Tradeoff:
             #    a consumer that dies before publishing its channels leaves the
             #    arm enabled-but-idle for the attach timeout (motion-safe).
-            if self.arm.control_eager_enable:
+            native_rt = self._uses_native_rt(ctrl)
+            if self.arm.control_eager_enable and not native_rt:
                 self._source.enter_control()
 
             # 1. Wait for the brain's control channels and attach (consumer). The
@@ -349,7 +352,8 @@ class FlexivInterface(StreamProducerNode):
             if self.arm.gripper.enabled:
                 grip_entry = control_reg.get(gripper_channel_name(self.side))
                 if grip_entry is not None:
-                    grip_reader = StreamReader.attach(grip_entry)
+                    if not native_rt:
+                        grip_reader = StreamReader.attach(grip_entry)
                 else:
                     log.info(
                         "[%s] gripper enabled but no gripper channel this session "
@@ -363,6 +367,20 @@ class FlexivInterface(StreamProducerNode):
             #    poll drain commands via this predicate — which also ticks
             #    telemetry, keeping status/proprio fresh (dashboard + the session
             #    supervisor's freshness watchdog) through the multi-second MoveJ.
+            if native_rt:
+                first = self._await_first_setpoint(sp_reader, stop_event, cmd_cursor)
+                if first is None:
+                    return
+                self._run_native_rt(
+                    stop_event,
+                    ctrl,
+                    coeffs,
+                    entries[sp_name].shm_name,
+                    entries[cmd_name].shm_name,
+                    grip_entry.shm_name if grip_entry is not None else None,
+                )
+                return
+
             if not self.arm.control_eager_enable:
                 self._source.enter_control()
 
@@ -493,6 +511,53 @@ class FlexivInterface(StreamProducerNode):
                     except Exception:  # noqa: BLE001
                         log.exception("[%s] error closing control reader", self.name)
             log.info("[%s] control stopped", self.name)
+
+    def _uses_native_rt(self, ctrl: ControlCfg) -> bool:
+        """True only for the hardware qpos mode supported by the RDK 1.8 sidecar."""
+        return bool(
+            self.arm.rt_streaming
+            and not self.sim
+            and isinstance(self._source, FlexivSource)
+            and ctrl.kind == "qpos"
+            and ctrl.mode == "NRT_JOINT_POSITION"
+        )
+
+    def _run_native_rt(
+        self,
+        stop_event,
+        control: ControlCfg,
+        coeffs: ControlCoeffsCfg,
+        setpoint_shm: str,
+        command_shm: str,
+        gripper_shm: str | None,
+    ) -> None:
+        """Hand the robot connection to the C++ 1 kHz controller for one session."""
+        executable = find_controller()
+        telemetry_shm = {
+            signal: self._writers[f"{self.side}/{signal}"].shm_name
+            for signal in (*self.arm.streams.keys(), STATUS_SIGNAL)
+        }
+        args = controller_args(
+            executable,
+            side=self.side,
+            arm=self.arm,
+            control=control,
+            coeffs=coeffs,
+            setpoint_shm=setpoint_shm,
+            command_shm=command_shm,
+            telemetry_shm=telemetry_shm,
+            gripper_shm=gripper_shm,
+        )
+        log.info("[%s] handing robot to native RT controller", self.name)
+        # Destroy the Python RDK client before the native process connects. The
+        # telemetry SHM writers remain allocated; only their producer changes.
+        self.close_source()
+        try:
+            run_controller(args, stop_event)
+        finally:
+            # Return to the long-lived IDLE state even after a native failure.
+            self.open_source()
+        log.info("[%s] native RT controller returned robot ownership", self.name)
 
     def _await_channels(self, control_reg: StreamRegistry, stop_event):
         """Wait for this arm's control channels, ticking telemetry meanwhile.

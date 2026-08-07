@@ -51,6 +51,11 @@ class StreamWriter:
     def name(self) -> str:
         return self.spec.name
 
+    @property
+    def shm_name(self) -> str:
+        """POSIX name (used by the time-disjoint native producer during handoff)."""
+        return self._ring.name
+
     def write(self, vec: np.ndarray, t_ns: int | None = None) -> int:
         """Publish one sample. If ``t_ns`` is omitted, stamps with the monotonic clock.
 

@@ -83,16 +83,28 @@ def entry_matches(route: StreamRoute, entry) -> bool:
     return True
 
 
-def default_stream_names(
+def scene_stream_names(
     sides: tuple[str, ...] = SIDES,
     camera_names: tuple[str, ...] = (),
 ) -> list[str]:
-    """Every typed stream used by the live viewer.
+    """Typed streams needed to pose the live Viser scene.
 
-    This includes all follower proprioception and all FACTR telemetry, not only
-    the fields currently used to pose a model.  Camera RGB/depth names are added
-    from composed rig metadata by the service.
+    Viser deliberately does not attach plot-only telemetry.  Joint positions,
+    TCP position, leader/model position, policy horizons, and RGB-D are the
+    minimal inputs required by the 3D scene.
     """
+    names = []
+    for side in sides:
+        names.extend((f"{side}/q", f"{side}/eef", f"factr/{side}"))
+        names.append(f"factr/telemetry/{side}/model_q_rad")
+        names.extend((f"eval/{side}/q_horizon", f"eval/{side}/eef_horizon"))
+    for camera in camera_names:
+        names.extend((f"cam/{camera}/left", f"cam/{camera}/depth"))
+    return names
+
+
+def plot_stream_names(sides: tuple[str, ...] = SIDES) -> list[str]:
+    """Typed streams consumed by the Plotly Dash live-plot service."""
     names = [f"{side}/{signal}" for side in sides for signal in PROPRIO_SIGNALS]
     for side in sides:
         names.extend((f"factr/{side}", f"factr/raw/{side}"))
@@ -100,11 +112,25 @@ def default_stream_names(
             f"factr/telemetry/{side}/{field}"
             for field in TELEMETRY_VECTOR_FIELDS + TELEMETRY_SCALAR_FIELDS
         )
-        names.extend((f"eval/{side}/q_horizon", f"eval/{side}/eef_horizon"))
     names.append("eval/policy_comm")
-    for camera in camera_names:
-        names.extend((f"cam/{camera}/left", f"cam/{camera}/depth"))
     return names
+
+
+def default_stream_names(
+    sides: tuple[str, ...] = SIDES,
+    camera_names: tuple[str, ...] = (),
+) -> list[str]:
+    """Every typed stream used by either live visualization consumer.
+
+    This includes all follower proprioception and all FACTR telemetry, not only
+    the fields used to pose the Viser scene. Camera RGB/depth names are added
+    from composed rig metadata. The stable union is retained for callers that
+    need the complete visualization contract.
+    """
+    return list(dict.fromkeys((
+        *plot_stream_names(sides),
+        *scene_stream_names(sides, camera_names),
+    )))
 
 
 def plot_title(route: StreamRoute) -> str:

@@ -29,7 +29,7 @@ def _build_dataset(root, repo_id, n_episodes, frames_per_ep):
     GlobalHydra.instance().clear()
     with initialize_config_module(config_module="dual_flexiv_control.conf", version_base=None):
         cfg = compose(config_name="config", overrides=[
-            "rig=bimanual",  # two-arm fixture (shipped default is now left_only)
+            "rig=bimanual",  # keep the two-arm fixture independent of the default
             "cameras.wrist_left.width=32", "cameras.wrist_left.height=24",
             f"recording.root={root}", f"task.collection.repo_id={repo_id}",
             "task.collection.frequency_hz=15",

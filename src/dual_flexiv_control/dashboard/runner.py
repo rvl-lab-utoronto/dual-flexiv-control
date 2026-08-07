@@ -109,10 +109,12 @@ class RunRegistry:
         return self.manager.view()
 
     def restart_mirror(self) -> None:
-        """Deprecated compatibility alias: restart the independent Viser service."""
+        """Deprecated compatibility alias: restart both visualization services."""
+        from ..plotly_dash.service import restart_service as restart_plots
         from ..viser.service import restart_service
 
         restart_service()
+        restart_plots()
 
     # -- run state -----------------------------------------------------------------
 

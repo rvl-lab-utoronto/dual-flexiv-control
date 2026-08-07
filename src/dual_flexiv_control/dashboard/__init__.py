@@ -2,11 +2,12 @@
 
 A small Streamlit app whose left column drives experiments — pick a task from the
 ``conf/task`` group, then launch **collection** (teleop demos) or **eval** (policy
-rollouts) — and whose right side embeds a live `Viser <https://viser.studio>`_
-viewer that consumes the system's shared-memory streams at 3 Hz.
+rollouts) — and whose right side embeds Viser for 3D plus Plotly Dash for live
+plots. Both consume the system's shared-memory streams at 3 Hz.
 
-Viser is deliberately non-authoritative: Streamlit hosts controls, while an
-isolated ``ProcessNode`` discovers producer streams and owns the scene/plots.
+Visualization is deliberately non-authoritative: Streamlit hosts controls,
+while isolated ``ProcessNode`` consumers discover producer streams and own the
+scene and plots respectively.
 
 Layering (kept import-light so :mod:`~.tasks` works without Rerun/Streamlit):
 

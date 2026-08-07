@@ -420,6 +420,9 @@ class FactrTransformCfg:
 class FactrLeaderCfg:
     """All arm calibration and direction ownership for one FACTR leader."""
 
+    dynamixel_id_start: int = 1
+    """First physical Dynamixel ID for this eight-servo leader (1 or 9)."""
+
     raw_to_dfc: JointConventionCfg = field(default_factory=JointConventionCfg)
     home_q_rad: List[float] = field(default_factory=list)
     """The leader's calibration/home pose in canonical DFC/Rizon coordinates."""
@@ -510,6 +513,8 @@ class ArmCfg:
                                          # run start. Off: enable only after the channels
                                          # attach (the arm is never enabled for a consumer
                                          # that dies before publishing them).
+    rt_streaming: bool = True            # real qpos: hand off to RDK 1.8 C++ StreamJointPosition
+    rt_priority: int = 0                 # SCHED_FIFO priority; 0 = best-effort normal scheduling
     gripper: GripperCfg = field(default_factory=GripperCfg)   # follower gripper (opt-in)
 
 

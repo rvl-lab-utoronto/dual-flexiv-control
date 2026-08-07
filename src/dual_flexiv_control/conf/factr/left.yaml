@@ -12,6 +12,7 @@ servers:
 
 leaders:
   left:
+    dynamixel_id_start: 9
     raw_to_dfc:
       offsets_deg: [-78.05, 96.68, 97.47, 152.23, 1.32, 89.56, 75.94]
       sign_flip_joints: [5]

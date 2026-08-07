@@ -102,10 +102,6 @@ class ViserConsumer(ProcessNode):
         newest: dict[str, tuple[np.ndarray, int]] = {}
         horizon_paths: dict[str, np.ndarray] = {}
         next_discovery = 0.0
-        policy_state = {
-            "ring": None, "next_seq": 0, "sent": 0,
-            "received": 0, "errors": 0,
-        }
         period = 1.0 / self.rate_hz
 
         try:
@@ -133,9 +129,6 @@ class ViserConsumer(ProcessNode):
                             newest.clear()
                             horizon_paths.clear()
                             last_seq.clear()
-                            policy_state.update(
-                                ring=None, next_seq=0, sent=0, received=0, errors=0
-                            )
                             view.attach_run(run_id)
                         self._sync_readers(readers, entries, newest, last_seq)
 
@@ -143,9 +136,6 @@ class ViserConsumer(ProcessNode):
                 for name, reader in list(readers.items()):
                     route = self.routes[name]
                     try:
-                        if route.kind == "policy":
-                            self._consume_policy(reader, view, policy_state)
-                            continue
                         samples = reader.latest()
                     except Exception as exc:  # noqa: BLE001 - producer may be exiting
                         log.debug("Viser consumer lost %s: %s", name, exc)
@@ -161,7 +151,6 @@ class ViserConsumer(ProcessNode):
                     newest[name] = value, t_ns
                     if route.kind == "horizon" and route.signal == "q_horizon":
                         horizon_paths[route.side] = self._latest_timestamp_group(reader)
-                    view.update_stream(name, route, value, t_ns)
 
                 for name in lost:
                     reader = readers.pop(name)
@@ -253,33 +242,6 @@ class ViserConsumer(ProcessNode):
         if samples.n == 0:
             return np.empty((0, reader.dim))
         return np.asarray(samples.data[samples.t_ns == samples.t_ns[-1]]).copy()
-
-    @staticmethod
-    def _consume_policy(reader, view, state) -> None:
-        samples = reader.last(reader.capacity)
-        if samples.n == 0:
-            return
-        ring = reader.entry.shm_name
-        if state["ring"] != ring or int(samples.seq[-1]) + 1 < state["next_seq"]:
-            state.update(ring=ring, next_seq=0, sent=0, received=0, errors=0)
-        fresh = samples.seq >= state["next_seq"]
-        from ..policy.client import COMM_RECV
-        from ..policy.client import COMM_SENT
-
-        for row, t_ns in zip(samples.data[fresh], samples.t_ns[fresh]):
-            kind, latency_s = float(row[0]), float(row[2])
-            if kind == COMM_SENT:
-                state["sent"] += 1
-                view.update_policy_series("sent", state["sent"], int(t_ns))
-                view.update_policy_series("in_flight", 1.0, int(t_ns))
-            else:
-                key = "received" if kind == COMM_RECV else "errors"
-                state[key] += 1
-                view.update_policy_series(key, state[key], int(t_ns))
-                view.update_policy_series("in_flight", 0.0, int(t_ns))
-                if kind == COMM_RECV:
-                    view.update_policy_series("latency_ms", latency_s * 1000.0, int(t_ns))
-        state["next_seq"] = int(samples.seq[-1]) + 1
 
     def _drain_commands(self, view) -> None:
         while True:

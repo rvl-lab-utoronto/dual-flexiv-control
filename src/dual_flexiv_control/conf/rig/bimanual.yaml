@@ -9,8 +9,8 @@
 defaults:
   - /arm@arms.left: flexiv
   - /arm@arms.right: flexiv
-  - /camera@cameras.wrist_left: realsense_rgbd
-  - /camera@cameras.wrist_right: realsense_rgbd
+  # - /camera@cameras.wrist_left: realsense_rgbd
+  # - /camera@cameras.wrist_right: realsense_rgbd
   - /camera@cameras.static: zed2_static
   - /factr: bimanual
   - _self_
@@ -55,12 +55,12 @@ cameras:
   # Set distinct serials when two RealSense devices are connected. Empty serials
   # let each source use its first available device and are useful for simulation
   # or single-camera bring-up, but should not be used for a two-camera run.
-  wrist_left:
-    placement: wrist_left
-    serial: ""
-  wrist_right:
-    placement: wrist_right
-    serial: ""
+  # wrist_left:
+  #   placement: wrist_left
+  #   serial: ""
+  # wrist_right:
+  #   placement: wrist_right
+  #   serial: ""
   static:
     placement: static
     serial: ""

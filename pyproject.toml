@@ -23,8 +23,10 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
-# Experiment dashboard (Streamlit control panel + embedded Viser stream viewer).
+# Experiment dashboard (Streamlit controls + Viser 3D + Plotly Dash plots).
 dashboard = [
+    "dash>=3.0,<5.0",
+    "scipy>=1.14,<2",
     "streamlit>=1.40",
     "viser>=1.0,<1.1",
 ]
@@ -59,6 +61,7 @@ dfc-cleanup-shm = "dual_flexiv_control.streams.registry:cleanup_cli"
 dfc-dashboard = "dual_flexiv_control.dashboard.launch:main"
 dfc-session = "dual_flexiv_control.session:main"
 dfc-viser = "dual_flexiv_control.viser.service:main"
+dfc-plotly = "dual_flexiv_control.plotly_dash.service:main"
 dfc-rerun = "dual_flexiv_control.rerun.service:main"
 
 [tool.hatch.build.targets.wheel]

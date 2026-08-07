@@ -18,12 +18,9 @@ defaults:
   - task: default          # active manipulation task (switch with `task=<name>`)
   - control_coeffs@task.eval.coeffs: compliant  # match eval dynamics to teleop collection
   - policy: openpi         # eval policy-server client (used when runtime.phase=eval)
-  - rig: left_only         # the hardware: arms/cameras/FACTR + serials (`rig=<name>`).
-                           # Defaults to the single-arm rig that matches the plugged-in
-                           # hardware (left Rizon + left FACTR leader on :5000), so a
-                           # collection run's launch-time preflight (every configured
-                           # leader must respond) is satisfiable. Use `rig=bimanual` once
-                           # the right leader (:5001) is served.
+  - rig: bimanual          # the hardware: arms/cameras/FACTR + serials (`rig=<name>`).
+                           # Defaults to the full two-arm rig. Use `rig=left_only` or
+                           # `rig=right_only` for single-arm operation.
   - _self_                 # this file's values win over the groups above
 
 hydra:

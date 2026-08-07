@@ -1,0 +1,11 @@
+defaults:
+  - base_task
+  - _self_
+
+# Pick-and-place task for the moose object. Select with `task=moose`.
+language_instruction: "Pick up the moose and place it in the target area."
+collection:
+  repo_id: dfc/moose_pick_place
+  num_episodes: 50
+eval:
+  num_timesteps: 400

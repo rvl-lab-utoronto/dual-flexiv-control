@@ -105,7 +105,7 @@ def start_service(
         runtime_dir = os.path.abspath(
             runtime_dir or os.environ.get("DFC_RUNTIME_DIR") or cfg.runtime.runtime_dir
         )
-        stream_names = schema.default_stream_names(camera_names=tuple(cameras))
+        stream_names = schema.scene_stream_names(camera_names=tuple(cameras))
         env_host, env_port = endpoint_from_env()
         host, port = host or env_host, int(port or env_port)
         consumer = start_consumer(

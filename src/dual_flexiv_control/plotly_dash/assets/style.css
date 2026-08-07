@@ -1,0 +1,82 @@
+:root {
+  color-scheme: dark;
+  background: #0e1117;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+html, body, #react-entry-point {
+  margin: 0;
+  min-height: 100%;
+  background: #0e1117;
+}
+
+.plot-app {
+  position: relative;
+  box-sizing: border-box;
+  min-height: 100vh;
+  padding: 0 4px 12px;
+  background: #0e1117;
+}
+
+.stream-status {
+  position: absolute;
+  z-index: 4;
+  top: 11px;
+  right: 14px;
+  color: #8794a8;
+  font-size: 11px;
+  pointer-events: none;
+}
+
+.plot-tabs-parent {
+  width: 100%;
+}
+
+.plot-tabs {
+  height: 42px;
+  border-bottom: 1px solid #2a3444;
+  background: #0e1117;
+}
+
+.plot-tab {
+  display: flex !important;
+  align-items: center;
+  justify-content: center;
+  max-width: 160px;
+  padding: 10px 24px !important;
+  color: #aab5c4 !important;
+  background: #0e1117 !important;
+  border: 0 !important;
+  border-bottom: 2px solid transparent !important;
+}
+
+.plot-tab.selected {
+  color: #e9eef6 !important;
+  border-bottom-color: #4ea1ff !important;
+}
+
+.plot-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  align-items: start;
+  padding-top: 8px;
+}
+
+.plot-card {
+  height: 270px;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid #202a39;
+  border-radius: 7px;
+  background: #111722;
+}
+
+/* The dashboard intentionally gives plots the wider side of a split viewer.
+   Preserve the established left/right plot pairing there; only collapse to a
+   single plot column on genuinely narrow/mobile embeds. */
+@media (max-width: 600px) {
+  .stream-status { display: none; }
+  .plot-grid { grid-template-columns: 1fr; }
+  .plot-tab { max-width: none; }
+}

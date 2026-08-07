@@ -34,7 +34,7 @@ def main() -> None:
     elif os.environ.get(RIG_ENV_VAR):
         _validate_rig(os.environ[RIG_ENV_VAR])
 
-    _prebind_viser_service()
+    _prebind_visual_services()
 
     app_path = str(Path(__file__).resolve().parent / "app.py")
     # --server.headless skips the first-run email prompt and browser auto-open;
@@ -90,16 +90,23 @@ def _validate_rig(rig: str) -> None:
         )
 
 
-def _prebind_viser_service() -> None:
-    """Start the isolated 3 Hz stream consumer before Streamlit boots."""
+def _prebind_visual_services() -> None:
+    """Start both isolated 3 Hz visualization consumers before Streamlit."""
+    from dual_flexiv_control.plotly_dash.service import start_service as start_plots
     from dual_flexiv_control.viser.service import start_service
 
     start_service()
+    start_plots()
+
+
+def _prebind_viser_service() -> None:
+    """Compatibility alias for integrations using the former private hook."""
+    _prebind_visual_services()
 
 
 # Kept for launch integrations that imported the old private hook. It no longer
 # starts or imports Rerun.
-_prebind_rerun_servers = _prebind_viser_service
+_prebind_rerun_servers = _prebind_visual_services
 
 
 if __name__ == "__main__":
