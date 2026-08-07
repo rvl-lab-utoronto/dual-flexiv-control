@@ -240,7 +240,9 @@ def _plot_server() -> PlotlyDashService:
     # A running Streamlit process may outlive code/assets in the Dash child.
     # Roll only that non-authoritative consumer when its component layout
     # revision is stale; the robot session and Viser remain untouched.
-    expected_revision = 2
+    # Keep this literal in the Streamlit script: source reruns reload this file
+    # while already-imported service modules remain cached in the parent.
+    expected_revision = 4
     if getattr(service, "view_revision", 0) < expected_revision:
         stop_plot_service()
         service = start_plot_service()
@@ -2008,7 +2010,10 @@ def _render_viewer_workspace(
         )
         st.iframe(scene_url, height=LIVE_VIEWER_HEIGHT_PX)
     with telemetry:
-        st.iframe(_browser_url(plots.web_url), height=LIVE_VIEWER_HEIGHT_PX)
+        plot_url = _browser_url(plots.web_url)
+        separator = "&" if "?" in plot_url else "?"
+        plot_url = f"{plot_url}{separator}dfc_plot=4"
+        st.iframe(plot_url, height=LIVE_VIEWER_HEIGHT_PX)
     _render_skill_bar(registry)
     st.caption(
         "Experiment: solid = measured · translucent = command · purple = target. "

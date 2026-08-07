@@ -15,8 +15,12 @@ from ..visualization import schema
 HISTORY_LENGTH = 1024
 # Increment when a live Dash process must be rebuilt rather than merely picking
 # up an asset file.  The dashboard uses this to roll only the plot consumer.
-PLOT_VIEW_REVISION = 2
+PLOT_VIEW_REVISION = 4
 PLOT_HEIGHT_PX = 270
+# This is a live viewer, not a recorder.  Bound each client catch-up response
+# so a slow remote browser drops display frames instead of repeatedly pulling
+# a multi-megabyte backlog faster than it can render it.
+MAX_CATCHUP_SAMPLES = 3
 COLORS = (
     "#4ea1ff", "#ff8c50", "#55c97a", "#d783ff", "#ffd15c",
     "#49d6cf", "#ff6685", "#aab5c4",
@@ -218,6 +222,7 @@ class PlotStore:
                 fresh = [point for point in buffer.points if point[0] > cursor]
                 if not fresh:
                     continue
+                fresh = fresh[-MAX_CATCHUP_SAMPLES:]
                 series[key] = {
                     "version": fresh[-1][0],
                     "x": [point[1] for point in fresh],
@@ -350,8 +355,10 @@ def create_dash_app(store: PlotStore, rate_hz: float):
         Output("stream-status", "children"),
         Input("plot-tick", "n_intervals"),
         State("plot-cursors", "data"),
+        running=[(Output("plot-tick", "disabled"), True, False)],
     )
     def update_plots(_tick, cursor_state):
+        initial_load = cursor_state is None
         cursor_state = cursor_state or {"epoch": None, "versions": {}}
         snapshot = store.snapshot(cursor_state.get("versions"))
         status = (
@@ -366,7 +373,14 @@ def create_dash_app(store: PlotStore, rate_hz: float):
             for tab in TAB_EMPTY_MESSAGES
         ]
         if cursor_state.get("epoch") != snapshot["epoch"]:
-            figures = [empty_figure(spec) for spec in PLOT_SPECS]
+            # The layout already contains empty figures on a new page.  Sending
+            # all of them again costs ~87 KB and can make a slow 3 Hz client
+            # queue duplicate initialization callbacks before state advances.
+            figures = (
+                [no_update] * len(PLOT_SPECS)
+                if initial_load
+                else [empty_figure(spec) for spec in PLOT_SPECS]
+            )
             return [
                 *figures,
                 *([no_update] * len(PLOT_SPECS)),

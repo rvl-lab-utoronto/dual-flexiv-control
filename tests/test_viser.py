@@ -295,6 +295,26 @@ def test_plot_store_returns_only_incremental_samples_and_resets_per_run():
     assert reset["series"] == {}
 
 
+def test_plot_store_bounds_live_viewer_catchup():
+    from dual_flexiv_control.plotly_dash.view import MAX_CATCHUP_SAMPLES
+    from dual_flexiv_control.plotly_dash.view import PlotStore
+
+    store = PlotStore()
+    store.attach("run")
+    for index in range(MAX_CATCHUP_SAMPLES + 5):
+        assert store.append(
+            "leader/left/q", np.full(7, index), 1_000_000_000 + index
+        )
+
+    series = store.snapshot()["series"]["leader/left/q"]
+    assert len(series["x"]) == MAX_CATCHUP_SAMPLES
+    assert series["version"] == MAX_CATCHUP_SAMPLES + 5
+    np.testing.assert_array_equal(
+        series["y"][:, 0],
+        np.arange(5, MAX_CATCHUP_SAMPLES + 5),
+    )
+
+
 def test_one_factr_ring_feeds_leader_q_and_gripper_plots():
     from dual_flexiv_control.plotly_dash.consumer import PlotlyDashConsumer
     from dual_flexiv_control.plotly_dash.view import PlotStore

@@ -161,7 +161,11 @@ def test_viewer_workspace_embeds_viser_scene_and_plotly_dash(monkeypatch):
             f"{servers.web_url}&dfc_view={app.VISER_VIEW_REVISION}",
             {"height": app.LIVE_VIEWER_HEIGHT_PX},
         ),
-        ("telemetry", plots.web_url, {"height": app.LIVE_VIEWER_HEIGHT_PX}),
+        (
+            "telemetry",
+            f"{plots.web_url}?dfc_plot=4",
+            {"height": app.LIVE_VIEWER_HEIGHT_PX},
+        ),
     ]
 
 
