@@ -1,4 +1,4 @@
-"""Drive the session daemon from the dashboard and feed the embedded Rerun viewer.
+"""Drive the session daemon from the dashboard.
 
 The dashboard owns one long-lived **session daemon** (see
 :mod:`dual_flexiv_control.session`) via :class:`~.session.SessionManager`: the
@@ -7,12 +7,11 @@ VIEWING ↔ COLLECTION ↔ EVAL state machine. This module is the glue:
 
 * :class:`RunRegistry` — the UI-facing facade: launch/stop are JSON commands to
   the daemon; run state, outcomes, and alerts come from its ``session.json``.
-* :class:`SessionMirror` — ONE persistent background thread that mirrors the live
-  shared-memory streams (arm proprio, ``factr/<side>`` leaders, the 3D robot
-  scene, eval horizon ghosts) into the metrics Rerun recording, in every mode. In
-  VIEWING the streams are published by the idle (read-only) arms and the FACTR
-  producer, so the viewer is live *before* any run starts. It never opens a robot
-  or HTTP connection — shared memory only.
+The primary viewer is now the independent :mod:`dual_flexiv_control.viser`
+``ProcessNode``.  It discovers and consumes the producer streams itself at 3 Hz;
+this UI facade neither reads telemetry nor owns the viewer's polling loop.  The
+old :class:`SessionMirror` remains below only as a deprecated Rerun compatibility
+implementation and is never constructed by :class:`RunRegistry`.
 
 A run is **one episode** (collection = one teleop demo, eval = one policy
 rollout); launch one at a time, matching the single bimanual rig. Stopping is
@@ -27,12 +26,9 @@ import os
 import threading
 import time
 from dataclasses import dataclass
+from importlib import import_module
 
 import numpy as np
-import rerun as rr
-
-from . import blueprints
-from . import robot_view
 from .session import RUN_STATES
 from .session import SessionManager
 from .session import SessionView
@@ -40,10 +36,31 @@ from .tasks import TaskInfo
 
 log = logging.getLogger(__name__)
 
+
+class _LazyModule:
+    """Keep deprecated Rerun code importable without loading it in the dashboard."""
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._module = None
+
+    def _load(self):
+        if self._module is None:
+            self._module = import_module(self._name)
+        return self._module
+
+    def __getattr__(self, name):
+        return getattr(self._load(), name)
+
+
+rr = _LazyModule("rerun")
+blueprints = _LazyModule("dual_flexiv_control.dashboard.blueprints")
+robot_view = _LazyModule("dual_flexiv_control.dashboard.robot_view")
+
 PHASES = ("collection", "eval", "skill")
 
-#: Mirror loop rate (matches the recording rate; leader streams read per tick).
-_MIRROR_HZ = 15.0
+#: Deprecated Rerun compatibility mirror rate. Primary Viser uses the same rate.
+_MIRROR_HZ = 3.0
 #: Trailing daemon-log lines surfaced in the UI when a run errors out.
 _ERROR_TAIL_LINES = 25
 
@@ -78,7 +95,6 @@ class RunRegistry:
     def __init__(self, manager: SessionManager | None = None) -> None:
         self._lock = threading.Lock()
         self.manager = manager or SessionManager()
-        self._mirror = SessionMirror(self.manager)
         self._history: list[RunRecord] = []
         #: run_seq of the newest outcome already surfaced as an alert.
         self._seen_seq = 0
@@ -86,23 +102,17 @@ class RunRegistry:
     # -- session lifecycle -------------------------------------------------------
 
     def ensure_session(self, rig: str | None, sim: bool) -> None:
-        """Make the daemon match (rig, sim); (re)start the mirror after a respawn.
-
-        Called every app rerun — a no-op when nothing changed. A rig/sim change
-        respawns the daemon (refused while a run is active) and restarts the mirror
-        so its FACTR client + conventions follow the new rig.
-        """
-        if self.manager.ensure(rig, sim):
-            self._mirror.restart()
-        else:
-            self._mirror.start()  # idempotent: first call spins the thread up
+        """Make the daemon match ``(rig, sim)``; visualization is independent."""
+        self.manager.ensure(rig, sim)
 
     def session_view(self) -> SessionView:
         return self.manager.view()
 
     def restart_mirror(self) -> None:
-        """Restart the mirror thread (after *Reset services* rebinds the viewers)."""
-        self._mirror.restart()
+        """Deprecated compatibility alias: restart the independent Viser service."""
+        from ..viser.service import restart_service
+
+        restart_service()
 
     # -- run state -----------------------------------------------------------------
 
@@ -342,14 +352,15 @@ def log_welcome() -> None:
 
 
 def reset_viewer() -> None:
-    """Return the metrics viewer to its idle welcome state (blueprint + README).
+    """Clear transient overlays in the independent Viser consumer."""
+    from ..viser.service import service_if_started
 
-    The Rerun servers themselves keep their bound ports (they are process
-    singletons); only the recording's blueprint + README are reset. The session
-    mirror re-sends the mode's layout on its next state tick.
-    """
-    rr.send_blueprint(blueprints.welcome_blueprint())
-    log_welcome()
+    service = service_if_started()
+    if service is not None:
+        service.send({"kind": "reset"})
+    if rr._module is not None:  # explicitly launched deprecated backend
+        rr.send_blueprint(blueprints.welcome_blueprint())
+        log_welcome()
     _log_event("services reset — viewers returned to idle")
 
 
@@ -376,7 +387,14 @@ def _log_mode_readme(state: str, task: str | None) -> None:
 
 
 def _log_event(message: str) -> None:
-    rr.log(blueprints.EVENTS, rr.TextLog(message, level="INFO"))
+    """Forward UI lifecycle events without making the dashboard a data emitter."""
+    from ..viser.service import service_if_started
+
+    service = service_if_started()
+    if service is not None:
+        service.log_event(message)
+    if rr._module is not None:  # explicitly launched deprecated backend
+        rr.log(blueprints.EVENTS, rr.TextLog(message, level="INFO"))
 
 
 def _style_eef_pos_series(sides) -> None:
@@ -633,8 +651,9 @@ def _send_layout(view: SessionView) -> None:
 
 
 def activate_metrics_view(view: SessionView) -> None:
-    """Make the shared Rerun viewer select the live experiment recording again."""
-    _send_layout(view)
+    """Compatibility hook; Viser follows ``session.json`` without UI authority."""
+    if rr._module is not None:  # explicitly launched deprecated backend
+        _send_layout(view)
 
 
 class SessionMirror:

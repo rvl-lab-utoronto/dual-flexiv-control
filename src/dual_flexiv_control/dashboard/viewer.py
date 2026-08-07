@@ -1,4 +1,7 @@
-"""Start (once) the Rerun servers the dashboard embeds.
+"""Deprecated Rerun server implementation retained for ``dfc-rerun``.
+
+The primary dashboard does not import this module; see
+:mod:`dual_flexiv_control.viser`.
 
 Two cooperating servers, both hosted inside the Streamlit process:
 

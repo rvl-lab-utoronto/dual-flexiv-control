@@ -1,4 +1,6 @@
-"""Replay a recorded LeRobot episode into a dedicated Rerun viewer (Storage tab).
+"""Deprecated Rerun replay implementation retained for compatibility tests/tools.
+
+The dashboard uses :mod:`dual_flexiv_control.viser.replay`.
 
 "Show everything" for one demo on a single scrubbable timeline:
 

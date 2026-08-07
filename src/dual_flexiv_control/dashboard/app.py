@@ -7,10 +7,10 @@ The left column switches between Experiment and Calibration controls. The right
 column independently switches between Viewer, Cameras, Storage, and Logs. Both
 control modes keep the same experiment viewer visible.
 
-Streamlit reruns this module top-to-bottom on every interaction, so the Rerun
-servers and the run registry are created once behind ``st.cache_resource`` (one
-instance per server process, shared across reruns and browser sessions). The
-embedded viewer updates itself from the gRPC stream independently of these reruns.
+Streamlit reruns this module top-to-bottom on every interaction, so the Viser
+stream service and run registry are created once behind ``st.cache_resource``.
+The embedded viewer is an isolated 3 Hz consumer process and updates directly
+from shared-memory streams, independently of Streamlit reruns.
 """
 
 from __future__ import annotations
@@ -26,14 +26,11 @@ import streamlit.components.v1 as components
 # context), so relative imports would fail here. The package itself is installed,
 # so its submodules resolve normally.
 from dual_flexiv_control.dashboard import arms as _arms
-from dual_flexiv_control.dashboard import blueprints
 from dual_flexiv_control.dashboard import calibration as _calibration
 from dual_flexiv_control.dashboard import cameras as _cameras
 from dual_flexiv_control.dashboard import downloads as _downloads
 from dual_flexiv_control.dashboard import factr_servers as _factr_srv
 from dual_flexiv_control.dashboard import logs as _logs
-from dual_flexiv_control.dashboard import replay as _replay
-from dual_flexiv_control.dashboard import robot_view as _robot
 from dual_flexiv_control.dashboard import runner as _runner
 from dual_flexiv_control.dashboard import skills as _skills
 from dual_flexiv_control.dashboard import storage as _storage
@@ -58,10 +55,11 @@ from dual_flexiv_control.dashboard.tasks import TaskInfo
 from dual_flexiv_control.dashboard.tasks import discover_policies
 from dual_flexiv_control.dashboard.tasks import discover_rigs
 from dual_flexiv_control.dashboard.tasks import discover_tasks
-from dual_flexiv_control.dashboard.viewer import RerunServers
-from dual_flexiv_control.dashboard.viewer import ports_from_env
-from dual_flexiv_control.dashboard.viewer import start_servers
-from dual_flexiv_control.dashboard.viewer import teardown as _teardown_servers
+from dual_flexiv_control.viser import replay as _replay
+from dual_flexiv_control.viser.service import ViserService
+from dual_flexiv_control.viser.service import start_service
+from dual_flexiv_control.viser.service import stop_service
+from dual_flexiv_control.visualization import geometry as _geometry
 
 VIEWER_HEIGHT_PX = 1400
 CONTROL_MODES = ("Experiment", "Calibration")
@@ -70,6 +68,24 @@ CONTENT_VIEWS = ("Viewer", "Cameras", "Storage", "Logs")
 CAMERA_REFRESH = "0.15s"
 #: Logs-view tail cadence while "Follow" is on (a running system logs a beat every ~2s).
 LOG_REFRESH = "2s"
+
+
+class _ViewerOverlays:
+    """Low-rate UI commands; live geometry/data remain owned by the consumer."""
+
+    @staticmethod
+    def show_calibration_target(side: str, q) -> None:
+        _servers().show_calibration_target(side, q)
+
+    @staticmethod
+    def clear_calibration_targets() -> None:
+        _servers().clear_calibration_targets()
+
+    # Compatibility for callers/tests that use the established pose helper.
+    camera_world_pose = staticmethod(_geometry.camera_world_pose)
+
+
+_robot = _ViewerOverlays()
 
 #: Trim the default top padding and enlarge per-episode action icons in Storage
 #: (scoped via the ``st-key-stor_rows`` container class).
@@ -171,7 +187,7 @@ def _apply_mode_background(view) -> None:
     ALWAYS emits exactly one markdown element (empty ``<style>`` when there is
     no tint): Streamlit identifies elements by their position in the tree, so a
     conditionally-present element here would shift everything below it on every
-    viewing ↔ run transition — remounting the tabs and the embedded Rerun
+    viewing ↔ run transition — remounting the tabs and the embedded Viser
     viewer iframe, i.e. a full viewer reload on every mode change.
     """
     color = _MODE_BG.get(view.phase if view.state == "saving" else view.state)
@@ -187,12 +203,10 @@ def _apply_mode_background(view) -> None:
 def _browser_url(url: str) -> str:
     """Rewrite loopback viewer URLs to the host the browser used for this page.
 
-    The Rerun handles report ``127.0.0.1`` (their own bind view), but the iframe
+    Viewer handles report ``127.0.0.1`` (their own bind view), but the iframe
     is resolved by the *user's* browser — over Tailscale/LAN that loopback points
     at the user's machine and the viewers come up blank. All viewer ports bind
-    ``0.0.0.0``, so the host serving Streamlit also serves them: reuse it. The
-    replace also rewrites the percent-encoded ``?url=`` gRPC URI (host chars are
-    not escaped by ``quote``), so the viewer fetches data from the right host too.
+    ``0.0.0.0``, so the host serving Streamlit also serves them: reuse it.
     """
     host = (st.context.headers.get("host") or "").split(":")[0]
     if host and host not in ("127.0.0.1", "localhost"):
@@ -201,32 +215,15 @@ def _browser_url(url: str) -> str:
 
 
 @st.cache_resource
-def _servers() -> RerunServers:
-    """Reuse (or start) the Rerun servers; load the idle README on first start.
-
-    The launcher usually pre-binds these (``dashboard.launch``); ``start_servers``
-    is idempotent, so this returns the existing handle. When the app is run
-    directly (``streamlit run app.py``) it starts them here instead. The robot scene
-    is attached to this same recording so it fills the metrics viewer's 3D panel.
-    """
-    import rerun as rr
-
-    grpc_port, web_port = ports_from_env()
-    servers = start_servers(grpc_port=grpc_port, web_port=web_port)
-    _robot.attach()  # log the robot scene into the metrics recording (shared 3D panel)
-    rr.send_blueprint(blueprints.welcome_blueprint())
-    _runner.log_welcome()
-    return servers
+def _servers() -> ViserService:
+    """Reuse the isolated Viser server whose core is a stream consumer."""
+    return start_service()
 
 
 @st.cache_resource
 def _replay_viewer() -> _replay.ReplayViewer:
-    """Start (once) the replay gRPC data server, embedded in the shared web viewer.
-
-    Reuses the metrics web-viewer host (no second ``serve_web_viewer``), pointed at
-    replay's own gRPC server so episode recordings stay isolated from live metrics.
-    """
-    return _replay.start_replay_viewer(web_port=_servers().web_port)
+    """Start the separate Viser episode-replay viewer lazily."""
+    return _replay.start_replay_viewer()
 
 
 @st.cache_resource
@@ -248,16 +245,11 @@ def _reset_services(registry: _runner.RunRegistry) -> bool:
     1. Refuse while a run is active — resetting would kill the in-flight episode;
        the operator stops the run first (returns False, surfaced as a warning).
     2. Shut the session daemon down gracefully (arms + cameras released) and stop
-       the metrics mirror, so nothing logs into the recording while it is torn down.
+       the viewer consumer.
     3. Drop the cached Hydra composes so arms + cameras re-read ``conf`` (and any
        changed ``runtime.sim``) on next use.
-    4. Gracefully tear down the Rerun gRPC data servers (metrics + replay) and
-       drop their recordings via :func:`~.viewer.teardown`, then reset dependents
-       that cached dead recordings and clear their ``st.cache_resource`` handles.
-    5. Re-serve the metrics gRPC server, re-attach the robot scene, and send the idle
-       welcome layout; respawn the daemon (fresh robot connections) + the mirror.
-       The web-viewer HTTP host is reused throughout (it cannot be rebound
-       in-process); the replay server rebinds lazily on the next ▶.
+    4. Stop the Viser live/replay servers and clear their cached handles.
+    5. Re-spawn the 3 Hz viewer consumer and session daemon. Replay remains lazy.
     """
     if registry.session_view().run_active:
         return False
@@ -267,15 +259,14 @@ def _reset_services(registry: _runner.RunRegistry) -> bool:
     _cameras.reset()
     _storage.reset()
     _skills.reset()
-    _teardown_servers()          # rerun_shutdown: releases metrics + replay gRPC ports
-    _robot.reset()               # forget the dead metrics recording
-    _replay.reset()              # forget the (now released) replay server
+    stop_service()
+    _replay.reset()
     _calibration.reset()         # close the cached leader client
     _servers.clear()             # st.cache_resource: re-run start_servers on next call
     _replay_viewer.clear()
-    _servers()                   # re-serve metrics gRPC + re-attach robot scene + welcome
-    _runner.reset_viewer()       # idle welcome blueprint + README + reset event log
-    # Fresh daemon on the (possibly re-read) rig/sim; ensure restarts the mirror too.
+    _servers()
+    _runner.reset_viewer()
+    # Fresh daemon on the (possibly re-read) rig/sim; the viewer discovers it.
     registry.ensure_session(_arms.active_rig(), _arms.runtime_is_sim())
     return True
 
@@ -1214,20 +1205,8 @@ def _camera_feed(by_key: dict[str, CameraView]) -> None:
 
 @st.fragment(run_every="0.5s")
 def _depth_overlay_feed(camera: str) -> None:
-    """Push the latest RGB-D cloud into the robot scene, whenever one is live.
-
-    Reads the camera's ``left`` + ``depth`` shm streams, back-projects to a
-    coloured point cloud (:func:`~.cameras.depth_point_cloud`), poses it with
-    the camera extrinsics from ``conf/camera`` (:func:`~.robot_view.camera_world_pose`),
-    and logs it into the robot recording. There is no on/off control here —
-    show/hide the cloud via the entity's visibility in the Rerun sidebar.
-    """
-    cloud = _cameras.depth_point_cloud(camera)
-    if cloud is None:
-        return
-    pts_cam, colors = cloud
-    rot, t = _robot.camera_world_pose(_cameras.camera_cfg(camera))
-    _robot.log_depth_points(pts_cam @ rot.T + t, colors)
+    """Deprecated no-op: RGB-D is consumed inside the Viser stream process."""
+    del camera
 
 
 def _render_skill_bar(registry: _runner.RunRegistry) -> None:
@@ -1857,8 +1836,8 @@ def _render_storage_tab(registry: _runner.RunRegistry) -> None:
 def _render_replay_panel(ds) -> None:
     """Embedded replay viewer for the episode picked via a row's ▶ button.
 
-    Logs the episode into the dedicated replay recording only when the target
-    changes (Streamlit reruns this on every interaction), then embeds the viewer.
+    Loads the episode into the dedicated Viser replay server only when the target
+    changes (Streamlit reruns this on every interaction), then embeds it.
     """
     target = st.session_state.get("replay_target")
     if not target or target[0] != ds.repo_id:
@@ -1979,27 +1958,19 @@ def _render_control_workspace(
         _render_controls(tasks, rig, registry)
 
 
-def _render_viewer_workspace(servers: RerunServers, registry: _runner.RunRegistry) -> None:
-    """The shared Rerun viewer and its experiment overlays/status."""
+def _render_viewer_workspace(servers: ViserService, registry: _runner.RunRegistry) -> None:
+    """The 3 Hz Viser stream viewer and experiment status."""
     st.iframe(_browser_url(servers.web_url), height=VIEWER_HEIGHT_PX)
-    # The robot 3D scene shares this viewer's left panel (it replaced the old EEF
-    # trace); its controls + status sit below so the viewer leads.
     _render_skill_bar(registry)
-    depth_cams = _cameras.depth_cameras()
-    for name in depth_cams:
-        # Cheap static re-log each rerun: keeps the frustum in sync with conf/camera
-        # pose edits after a "Reset services".
-        _robot.log_camera_frustum(name, _cameras.camera_cfg(name))
-    if depth_cams:
-        # Streams whenever live RGB-D exists; show/hide the cloud from the Rerun
-        # sidebar (entity visibility) rather than a dashboard control.
-        _depth_overlay_feed(depth_cams[0])
-    st.caption("Experiment: solid = measured · translucent ghost = command.")
+    st.caption(
+        "Experiment: solid = measured · translucent = command · purple = target. "
+        "Viewer sampling: 3 Hz (non-authoritative)."
+    )
     _robot_data_status()
 
 
 def _render_content_workspace(
-    servers: RerunServers,
+    servers: ViserService,
     cameras: list[CameraView],
     registry: _runner.RunRegistry,
 ) -> None:

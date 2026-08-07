@@ -259,7 +259,7 @@ dual-flexiv-control --cfg job        # print the fully composed config and exit
 
 ## Dashboard
 
-A dark-mode [Rerun](https://rerun.io)-backed experiment dashboard, coupled to a
+A dark-mode [Viser](https://viser.studio)-backed experiment dashboard, coupled to a
 long-lived **session daemon** (`dfc-session`, `session.py`) that holds the rig
 for the dashboard's whole lifespan and runs a three-mode state machine:
 
@@ -284,7 +284,7 @@ The **left column** drives experiments — pick a **rig** (`conf/rig`) and a
 **task** (`conf/task`), ✏️ open either YAML in VSCode, then launch **Collection**
 or **Eval**. Switching the rig restarts the session onto that hardware set (and
 re-points the arm-status rows, camera tab, and storage root). The **right area**
-is tabbed: **📊 Viewer** embeds a live Rerun web viewer (live in every mode,
+is tabbed: **📊 Viewer** embeds a live Viser web viewer (live in every mode,
 including VIEWING) topped by the teach-and-repeat bar (pick a taught skill,
 **▶ Repeat**, ✏️ rename, 🗑 delete); **📷 Camera** shows a live view of any camera stream
 (`cam/<camera>/<view>`, streaming continuously while the session is up);
@@ -293,17 +293,22 @@ replay, teach, and (bulk) delete. Downloads stream the finalized files from disk
 instead of buffering copies in the dashboard process.
 
 ```bash
-pip install -e ".[dashboard]"     # adds rerun-sdk + streamlit
+pip install -e ".[dashboard]"     # adds Viser + Streamlit
 dfc-dashboard                      # streamlit run; open the URL it prints
-# ports configurable: DFC_DASHBOARD_GRPC_PORT / DFC_DASHBOARD_WEB_PORT
+# live viewer: DFC_VISER_PORT (default 9090); replay: DFC_VISER_REPLAY_PORT (9093)
 # MP4 downloads: DFC_DOWNLOAD_PORT (default 9092)
 ```
 
-Rerun's viewer is a visualization layer and can't host the dropdown/launch
-buttons itself, so Streamlit hosts the controls and serves the version-matched
-Rerun web viewer (`serve_grpc` + `serve_web_viewer`) to embed alongside. The
-viewer streams live over gRPC, so metrics update in the browser without a
-Streamlit rerun.
+The live viewer is an isolated, read-only stream consumer. It polls newest
+shared-memory samples at **3 Hz**, owns the robot scene and plots, and reads
+`session.json` only for display state. It is deliberately lossy and
+non-authoritative: control and recording remain at their producer/native rates.
+Streamlit only embeds its URL and sends low-rate display commands such as a
+calibration target. Episode replay uses a separate Viser server on port 9093.
+
+The former Rerun implementation is retained but detached and deprecated. Install
+`.[rerun]` and launch `dfc-rerun` explicitly if it is needed during migration;
+the normal dashboard neither imports nor starts it.
 
 ```
  ┌──────────────┬─[ 📊 Viewer ]──[ 📷 Camera ]─[ 💾 Storage ]─┐
@@ -317,7 +322,7 @@ Streamlit rerun.
 ```
 
 **Collection** and **Eval** run the real consumers inside the session; the
-Viewer tab mirrors live proprio/FACTR/3D-scene in every mode, and run outcomes
+Viewer tab consumes live proprio/FACTR/policy/RGB-D streams in every mode, and run outcomes
 surface as popups (episode saved / crash with log tail). Stop is asynchronous —
 the consumer gets `runtime.save_grace_s` to finalize the episode video while the
 arms return to VIEWING. The one-shot CLI (`dual-flexiv-control
@@ -371,9 +376,11 @@ src/dual_flexiv_control/
     zed/        source.py (real pyzed + sim) · interface.py (ZedInterface)
     factr/      backend.py (black-box skeleton) · interface.py
   brain/        brain.py (Brain + BrainNode)
-  dashboard/    Streamlit control panel + embedded Rerun viewer:
-                app.py · tasks.py · blueprints.py · viewer.py · runner.py ·
-                session.py (daemon client) · launch.py
+  visualization/ backend-neutral typed viewer schema + robot geometry/FK
+  viser/        primary 3 Hz stream consumer + live scene + episode replay
+  rerun/        deprecated detached stream-viewer compatibility service
+  dashboard/    Streamlit controls + session facade + Viser embedding:
+                app.py · tasks.py · runner.py · session.py · launch.py
   process.py    RateLimiter · ProcessNode · StreamProducerNode · run_node
   configs.py    structured config schema (StreamCfg, ArmCfg, CameraCfg, ControlCfg, …)
   conf/         Hydra YAML tree (rig/task/recording/runtime/brain/factr/arm/camera/control)

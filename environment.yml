@@ -17,7 +17,7 @@ dependencies:
       - numpy>=2.0
       - flexivrdk==1.8.0
       - dynamixel-sdk>=3.7
-      # Install this package with the dashboard extra (rerun-sdk + streamlit),
+      # Install this package with the dashboard extra (Viser + Streamlit),
       # the policy extra (msgpack for eval rollouts; websockets is core), and the dev
       # extra (pytest) so the full system + tests run from a fresh env.
       - -e .[dashboard,policy,dev]
@@ -42,7 +42,7 @@ dependencies:
 #   2. ZED SDK 5.x — download + run the Stereolabs installer for your platform
 #      (https://www.stereolabs.com/developers/release). Use 5.x, NOT 4.x:
 #      pyzed 5.0 requires `numpy>=2,<3` (compatible with this env), whereas
-#      pyzed 4.2 pins `numpy<2` and conflicts with numpy>=2 / rerun-sdk.
+#      pyzed 4.2 pins `numpy<2` and conflicts with this project's numpy>=2.
 #      Headless silent install (skip the AI module + system python):
 #        sudo ./ZED_SDK_*.run -- silent skip_python skip_od_module
 #      (If the outer installer tries to open a GUI terminal with no TTY, extract

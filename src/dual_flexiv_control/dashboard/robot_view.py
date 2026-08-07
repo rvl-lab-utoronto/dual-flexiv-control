@@ -1,4 +1,4 @@
-"""Robot visualization: two Rizon 4s arms on the Vention pedestal, in Rerun.
+"""Deprecated Rerun robot adapter retained for the explicit legacy service.
 
 A 3D scene logged into the dashboard's **metrics** recording (see :func:`attach`),
 so the Metrics viewer shows the arms in the 3D panel that replaced the old

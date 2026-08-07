@@ -1,4 +1,4 @@
-"""Rerun blueprints: the metric layout shown for a run.
+"""Deprecated Rerun blueprints retained for the explicit legacy service.
 
 A run (collection or eval) is **one episode** and its placeholder metrics are
 **proprioception** — the same per-arm signals the Flexiv interfaces stream
