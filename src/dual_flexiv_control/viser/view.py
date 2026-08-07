@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from collections import deque
 
+from .client import HIDDEN_PANEL_LABEL
 from .scene import RobotScene
 
 
@@ -26,7 +27,7 @@ class ViserLiveView:
             control_layout="fixed", control_width="small", dark_mode=True,
             show_logo=False, show_share_button=False, brand_color=(80, 160, 255),
         )
-        server.gui.set_panel_label(None)
+        server.gui.set_panel_label(HIDDEN_PANEL_LABEL)
         with server.gui.add_folder("Session", expand_by_default=False, order=-1.0):
             self._status = server.gui.add_markdown("")
             self._event_log = server.gui.add_markdown("")

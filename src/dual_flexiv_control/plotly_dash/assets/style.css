@@ -63,6 +63,20 @@ html, body, #react-entry-point {
   padding-top: 8px;
 }
 
+.tab-empty-state {
+  margin: 12px 4px 4px;
+  padding: 12px 14px;
+  color: #d6deea;
+  background: #151d29;
+  border: 1px solid #344258;
+  border-radius: 7px;
+  font-size: 13px;
+}
+
+.tab-empty-state.hidden {
+  display: none;
+}
+
 .plot-card {
   height: 270px;
   min-width: 0;

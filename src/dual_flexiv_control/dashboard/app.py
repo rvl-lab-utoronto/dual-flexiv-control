@@ -59,6 +59,7 @@ from dual_flexiv_control.plotly_dash.service import PlotlyDashService
 from dual_flexiv_control.plotly_dash.service import start_service as start_plot_service
 from dual_flexiv_control.plotly_dash.service import stop_service as stop_plot_service
 from dual_flexiv_control.viser import replay as _replay
+from dual_flexiv_control.viser.client import VISER_VIEW_REVISION
 from dual_flexiv_control.viser.service import ViserService
 from dual_flexiv_control.viser.service import start_service
 from dual_flexiv_control.viser.service import stop_service
@@ -221,7 +222,15 @@ def _browser_url(url: str) -> str:
 @st.cache_resource
 def _servers() -> ViserService:
     """Reuse the isolated Viser 3D stream consumer."""
-    return start_service()
+    service = start_service()
+    # Roll only the display-only Viser child when its web-client layout is
+    # stale.  The robot session and Plotly consumer are independent and stay up.
+    expected_revision = VISER_VIEW_REVISION
+    if getattr(service, "view_revision", 0) < expected_revision:
+        stop_service()
+        service = start_service()
+        service.view_revision = expected_revision
+    return service
 
 
 @st.cache_resource
@@ -231,7 +240,7 @@ def _plot_server() -> PlotlyDashService:
     # A running Streamlit process may outlive code/assets in the Dash child.
     # Roll only that non-authoritative consumer when its component layout
     # revision is stale; the robot session and Viser remain untouched.
-    expected_revision = 1
+    expected_revision = 2
     if getattr(service, "view_revision", 0) < expected_revision:
         stop_plot_service()
         service = start_plot_service()
@@ -1992,7 +2001,12 @@ def _render_viewer_workspace(
         [2, 3], gap="small", vertical_alignment="top"
     )
     with scene:
-        st.iframe(_browser_url(servers.web_url), height=LIVE_VIEWER_HEIGHT_PX)
+        scene_url = _browser_url(servers.web_url)
+        separator = "&" if "?" in scene_url else "?"
+        scene_url = (
+            f"{scene_url}{separator}dfc_view={VISER_VIEW_REVISION}"
+        )
+        st.iframe(scene_url, height=LIVE_VIEWER_HEIGHT_PX)
     with telemetry:
         st.iframe(_browser_url(plots.web_url), height=LIVE_VIEWER_HEIGHT_PX)
     _render_skill_bar(registry)

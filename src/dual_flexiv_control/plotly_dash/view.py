@@ -15,7 +15,7 @@ from ..visualization import schema
 HISTORY_LENGTH = 1024
 # Increment when a live Dash process must be rebuilt rather than merely picking
 # up an asset file.  The dashboard uses this to roll only the plot consumer.
-PLOT_VIEW_REVISION = 1
+PLOT_VIEW_REVISION = 2
 PLOT_HEIGHT_PX = 270
 COLORS = (
     "#4ea1ff", "#ff8c50", "#55c97a", "#d783ff", "#ffd15c",
@@ -25,6 +25,11 @@ FOLLOWER_GRID_SIGNALS = ("eef", "q", "dq", "tau", "tau_ext", "wrench", "eef_vel"
 LEADER_GRID_SIGNALS = tuple(schema.FACTR_TITLES)
 POLICY_GRID_SIGNALS = ("packets", "latency_ms")
 POLICY_COUNTER_LABELS = ("sent", "received", "errors", "in flight")
+TAB_EMPTY_MESSAGES = {
+    "leader": "No leader samples yet — waiting for the FACTR streams.",
+    "follower": "No follower samples — the Flexiv arms may be disconnected.",
+    "policy": "No policy samples yet — these streams appear during evaluation.",
+}
 PROPRIO_DIMS = {
     "q": 7, "dq": 7, "tau": 7, "tau_ext": 7,
     "wrench": 6, "eef": 3, "eef_vel": 6,
@@ -221,6 +226,9 @@ class PlotStore:
             return {
                 "epoch": self._epoch,
                 "run_id": self._run_id,
+                "available": [
+                    key for key, buffer in self._series.items() if buffer.points
+                ],
                 "series": series,
             }
 
@@ -296,6 +304,16 @@ def create_dash_app(store: PlotStore, rate_hz: float):
             )
         ], className="plot-grid")
 
+    def tab_contents(tab: str):
+        return html.Div([
+            html.Div(
+                TAB_EMPTY_MESSAGES[tab],
+                id=f"{tab}-empty-state",
+                className="tab-empty-state",
+            ),
+            grid(tab),
+        ])
+
     interval_ms = max(1, round(1000.0 / float(rate_hz)))
     app.layout = html.Div([
         dcc.Store(id="plot-cursors", storage_type="memory"),
@@ -306,15 +324,15 @@ def create_dash_app(store: PlotStore, rate_hz: float):
             parent_className="plot-tabs-parent", className="plot-tabs",
             children=[
                 dcc.Tab(
-                    label="Leader", value="leader", children=grid("leader"),
+                    label="Leader", value="leader", children=tab_contents("leader"),
                     className="plot-tab", selected_className="plot-tab selected",
                 ),
                 dcc.Tab(
-                    label="Follower", value="follower", children=grid("follower"),
+                    label="Follower", value="follower", children=tab_contents("follower"),
                     className="plot-tab", selected_className="plot-tab selected",
                 ),
                 dcc.Tab(
-                    label="Policy", value="policy", children=grid("policy"),
+                    label="Policy", value="policy", children=tab_contents("policy"),
                     className="plot-tab", selected_className="plot-tab selected",
                 ),
             ],
@@ -327,6 +345,7 @@ def create_dash_app(store: PlotStore, rate_hz: float):
     @app.callback(
         *figure_outputs,
         *extend_outputs,
+        *(Output(f"{tab}-empty-state", "className") for tab in TAB_EMPTY_MESSAGES),
         Output("plot-cursors", "data"),
         Output("stream-status", "children"),
         Input("plot-tick", "n_intervals"),
@@ -339,11 +358,19 @@ def create_dash_app(store: PlotStore, rate_hz: float):
             f"stream {snapshot['run_id']} · {rate_hz:g} Hz · incremental"
             if snapshot["run_id"] else f"waiting for streams · {rate_hz:g} Hz"
         )
+        available = set(snapshot["available"])
+        empty_classes = [
+            "tab-empty-state hidden"
+            if any(spec.key in available for spec in PLOT_SPECS if spec.tab == tab)
+            else "tab-empty-state"
+            for tab in TAB_EMPTY_MESSAGES
+        ]
         if cursor_state.get("epoch") != snapshot["epoch"]:
             figures = [empty_figure(spec) for spec in PLOT_SPECS]
             return [
                 *figures,
                 *([no_update] * len(PLOT_SPECS)),
+                *empty_classes,
                 {"epoch": snapshot["epoch"], "versions": {}},
                 status,
             ]
@@ -369,6 +396,7 @@ def create_dash_app(store: PlotStore, rate_hz: float):
         return [
             *([no_update] * len(PLOT_SPECS)),
             *extensions,
+            *empty_classes,
             {"epoch": snapshot["epoch"], "versions": versions},
             status,
         ]

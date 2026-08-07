@@ -156,7 +156,11 @@ def test_viewer_workspace_embeds_viser_scene_and_plotly_dash(monkeypatch):
         ([2, 3], {"gap": "small", "vertical_alignment": "top"})
     ]
     assert iframes == [
-        ("scene", servers.web_url, {"height": app.LIVE_VIEWER_HEIGHT_PX}),
+        (
+            "scene",
+            f"{servers.web_url}&dfc_view={app.VISER_VIEW_REVISION}",
+            {"height": app.LIVE_VIEWER_HEIGHT_PX},
+        ),
         ("telemetry", plots.web_url, {"height": app.LIVE_VIEWER_HEIGHT_PX}),
     ]
 

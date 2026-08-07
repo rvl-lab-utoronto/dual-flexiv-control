@@ -12,6 +12,7 @@ import yaml
 
 from ..session import compose_config
 from ..visualization import schema
+from .client import VISER_VIEW_REVISION
 from .consumer import DEFAULT_VIEWER_RATE_HZ
 from .consumer import ViserConsumerHandle
 from .consumer import start_consumer
@@ -64,6 +65,7 @@ class ViserService:
     stream_names: list[str]
     consumer: ViserConsumerHandle
     viewer_rate_hz: float = DEFAULT_VIEWER_RATE_HZ
+    view_revision: int = VISER_VIEW_REVISION
 
     @property
     def web_url(self) -> str:

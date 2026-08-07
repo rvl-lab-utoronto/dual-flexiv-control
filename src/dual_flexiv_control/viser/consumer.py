@@ -23,6 +23,8 @@ from ..streams import StreamReader
 from ..streams import StreamRegistry
 from ..visualization import geometry
 from ..visualization import schema
+from .client import HIDDEN_PANEL_LABEL
+from .client import create_live_server
 from .view import ViserLiveView
 
 log = logging.getLogger(__name__)
@@ -82,9 +84,10 @@ class ViserConsumer(ProcessNode):
         try:
             import viser
 
-            server = viser.ViserServer(
+            server = create_live_server(
+                viser,
                 host=self.host, port=self.port,
-                label="dual-flexiv live view", verbose=False,
+                label=HIDDEN_PANEL_LABEL, verbose=False,
             )
             view = ViserLiveView(
                 server, self.rate_hz, factr_urdfs=self.factr_urdfs,

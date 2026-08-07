@@ -17,6 +17,25 @@ def test_primary_viewer_rate_is_three_hz():
     assert DEFAULT_PLOT_RATE_HZ == 3.0
 
 
+def test_live_viser_client_hides_only_the_control_panel(tmp_path):
+    from dual_flexiv_control.viser.client import HIDDEN_PANEL_LABEL
+    from dual_flexiv_control.viser.client import _hidden_client_root
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "index.html").write_text(
+        "<html><head></head><body><div id='root'></div></body></html>"
+    )
+    (source / "future-asset.js").write_text("export {};")
+
+    root = _hidden_client_root(source, tmp_path / "cache")
+    html = (root / "index.html").read_text()
+    assert HIDDEN_PANEL_LABEL in html
+    assert "MutationObserver" in html
+    assert 'setProperty("display", "none", "important")' in html
+    assert (root / "future-asset.js").read_text() == "export {};"
+
+
 def test_visualization_contract_covers_all_follower_and_factr_telemetry():
     from dual_flexiv_control.interfaces.factr.interface import TELEMETRY_SCALAR_FIELDS
     from dual_flexiv_control.interfaces.factr.interface import TELEMETRY_VECTOR_FIELDS
@@ -264,6 +283,7 @@ def test_plot_store_returns_only_incremental_samples_and_resets_per_run():
     first = store.snapshot()
     point = first["series"]["follower/left/q"]
     assert point["version"] == 1
+    assert "follower/left/q" in first["available"]
     np.testing.assert_array_equal(point["y"], np.arange(7)[None, :])
     assert "follower/left/q" not in store.snapshot({"follower/left/q": 1})["series"]
 
@@ -271,6 +291,7 @@ def test_plot_store_returns_only_incremental_samples_and_resets_per_run():
     reset = store.snapshot()
     assert reset["epoch"] != first["epoch"]
     assert reset["run_id"] == "run-b"
+    assert reset["available"] == []
     assert reset["series"] == {}
 
 
